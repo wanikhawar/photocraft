@@ -24,21 +24,18 @@ permissions:
   contents: read
 
 jobs:
-  linux:
-    name: Linux x86_64
-    runs-on: ubuntu-22.04
-    timeout-minutes: 90
-    env:
-      CARGO_TERM_COLOR: always
-      CARGO_INCREMENTAL: 0
-      RUST_BACKTRACE: 1
+  # The same gate as release.yml's: an RC holds other people's PRs, so check that none of them
+  # pulls a git dependency from outside storytold or overrides a source in cargo config. A job of
+  # its own on ubuntu-latest because it needs Python 3.11's tomllib, which ubuntu-22.04 lacks.
+  git-sources:
+    name: Git dependencies come from storytold
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
           persist-credentials: false
-      # The same gate as release.yml's: an RC holds other people's PRs, so check that none of them
-      # pulls a git dependency from outside storytold or overrides a source in cargo config.
       - name: Git dependencies come from storytold
         run: |
           set -euo pipefail
@@ -66,6 +63,22 @@ jobs:
               print("Git dependencies outside github.com/storytold:", *bad, sep="\n")
               sys.exit(1)
           PY
+
+  linux:
+    name: Linux x86_64
+    needs: git-sources
+    # 22.04 like the release job, so the AppImage runs on distros with an older glibc.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
       # Read from the built ref's release.yml, so the fonts follow whatever the RC pins.
       - id: fonts
         name: craft-fonts pin
