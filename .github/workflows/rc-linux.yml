@@ -1,0 +1,114 @@
+name: RC Linux build
+
+# Fork only, not for upstream. Builds the Linux x86_64 packages (AppImage, deb, rpm, tar.gz) of any
+# branch, so a release candidate can be tested by hand without release.yml's full matrix (whose
+# macOS leg needs a paid larger runner). The steps follow the Linux job of the release workflow in
+# storytold/craft-common-actions that release.yml calls. It lives on the default branch because
+# workflow_dispatch only sees workflows there; `ref` picks what gets built, so RC branches carry
+# nothing but their PRs.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or SHA to build, e.g. rc/perf-1"
+        required: true
+        type: string
+      version:
+        description: "Version to stamp, e.g. 0.15.1-rc.1 (empty: Cargo.toml)"
+        type: string
+        default: ""
+
+run-name: RC Linux build of ${{ inputs.ref }}
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      # The same gate as release.yml's: an RC holds other people's PRs, so check that none of them
+      # pulls a git dependency from outside storytold or overrides a source in cargo config.
+      - name: Git dependencies come from storytold
+        run: |
+          set -euo pipefail
+          test -f Cargo.lock || { echo "Cargo.lock is missing"; exit 1; }
+          python3 - <<'PY'
+          import os, sys, tomllib
+          for path in (".cargo/config", ".cargo/config.toml"):
+              if not os.path.exists(path):
+                  continue
+              config = tomllib.load(open(path, "rb"))
+              replaced = [name for name, source in config.get("source", {}).items()
+                          if isinstance(source, dict) and "replace-with" in source]
+              if replaced or "patch" in config or "paths" in config:
+                  print(f"{path} replaces, patches or overrides a source")
+                  sys.exit(1)
+          PY
+          cargo metadata --locked --format-version 1 > /dev/null
+          python3 - <<'PY'
+          import sys, tomllib
+          lock = tomllib.load(open("Cargo.lock", "rb"))
+          bad = sorted({p["source"] for p in lock.get("package", [])
+                        if p.get("source", "").startswith("git+")
+                        and not p["source"].startswith("git+https://github.com/storytold/")})
+          if bad:
+              print("Git dependencies outside github.com/storytold:", *bad, sep="\n")
+              sys.exit(1)
+          PY
+      # Read from the built ref's release.yml, so the fonts follow whatever the RC pins.
+      - id: fonts
+        name: craft-fonts pin
+        run: |
+          set -euo pipefail
+          ref=$(sed -n 's/^ *craft-fonts-ref: *//p' .github/workflows/release.yml | head -n1)
+          test -n "$ref" || { echo "no craft-fonts-ref in release.yml"; exit 1; }
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      - name: Check out craft-fonts
+        uses: storytold/craft-common-actions/actions/checkout-craft-fonts@main
+        with:
+          ref: ${{ steps.fonts.outputs.ref }}
+      - name: Check out craft-i18n
+        uses: storytold/craft-common-actions/actions/checkout-craft-i18n@main
+      - uses: storytold/craft-common-actions/actions/install-linux-deps@main
+        with:
+          deb-arch: amd64
+          nfpm-version: "2.47.0"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: rc-linux-x86_64
+      - name: Apply version override
+        if: inputs.version != ''
+        env:
+          VERSION: ${{ inputs.version }}
+        run: cargo xtask version set "${VERSION#v}"
+      # packaging/env.sh takes the version from Cargo.toml and stamps HEAD's commit and today's date.
+      - name: Build and package (AppImage, deb, rpm, tar.gz)
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CRAFT_FONTS_REQUIRED: "1"
+        run: packaging/linux/package.sh
+      - name: Check the AppImage starts
+        run: |
+          for appimage in dist/release/*.AppImage; do
+            chmod +x "$appimage"
+            APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --version
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rc-linux-x86_64
+          path: dist/release/*
+          if-no-files-found: error
