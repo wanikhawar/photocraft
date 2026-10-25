@@ -9,7 +9,7 @@ use crate::state::DialogKind;
 /// Dialogs and unsaved-changes prompts block edits, but allow the four view-navigation
 /// commands also usable through shortcuts. Camera Raw and the full-window workspaces
 /// (`distort_ui::modal_workspace`) block menu commands entirely, and a pending crop blocks the
-/// commands Photoshop greys during one (`crop_ui::blocks`).
+/// commands greyed during one (`crop_ui::blocks`).
 pub(crate) fn modal_allows(app: &PhotocraftApp, id: &str) -> bool {
     if app.camera_raw.is_some() || crate::distort_ui::modal_workspace(app).is_some() || crate::crop_ui::blocks(app, id) {
         return false;
