@@ -1863,28 +1863,30 @@ fn live_dab_tiled_preview_matches_dense_mix_at_each_batch() {
 #[test]
 fn live_dab_large_tiled_preview_matches_dense_mix() {
     let rect = Rect::new(-32, -16, 1504, 1392);
-    assert!(u64::from(rect.width()) * u64::from(rect.height()) >= PARALLEL_DAB_PREVIEW_PIXELS);
+    assert!(large_dab_region(rect));
     for depth in DEPTHS {
-        for target in ["pixels", "mask"] {
-            let mut s = session(1504, 1392, depth, "rgb");
-            s.execute("layer.new.layer", json!({})).unwrap();
-            if target == "mask" {
-                s.execute("layer.layerMask.revealAll", json!({})).unwrap();
+        for mode in ["rgb", "gray", "cmyk", "lab"] {
+            for target in ["pixels", "mask"] {
+                let mut s = session(1504, 1392, depth, mode);
+                s.execute("layer.new.layer", json!({})).unwrap();
+                if target == "mask" {
+                    s.execute("layer.layerMask.revealAll", json!({})).unwrap();
+                }
+                let params = json!({"points":[[10,10]],"size":3,"hardness":100,"opacity":63,"target":target});
+                let mut live = LiveDab::begin(&s, "paint.dodge", &params).unwrap();
+                let mut changed = Region::new(rect, live.pre_surf.channels());
+                for (i, value) in changed.data.iter_mut().enumerate() {
+                    *value = 0.113579 + (i % 17) as f32 * 0.013;
+                }
+                live.work.write(&live.pre_surf, &changed, rect);
+                let mut expected = live.pre_surf.clone();
+                photocraft_paint::retouch::mix_back(&mut expected, &Region::read(&live.pre_surf, rect), &changed, rect, live.opacity, None, false);
+                live.show(rect, None).unwrap();
+                let mut doc = (*live.doc).clone();
+                let (actual, _) = crate::channel_cmds::target_surface(&mut doc, live.id, &params).unwrap();
+                let check = rect.inflate(3);
+                assert!(actual.read_region(check) == expected.read_region(check), "large {mode} {target} preview, {depth}-bit");
             }
-            let params = json!({"points":[[10,10]],"size":3,"hardness":100,"opacity":63,"target":target});
-            let mut live = LiveDab::begin(&s, "paint.dodge", &params).unwrap();
-            let mut changed = Region::new(rect, live.pre_surf.channels());
-            for (i, value) in changed.data.iter_mut().enumerate() {
-                *value = 0.113579 + (i % 17) as f32 * 0.013;
-            }
-            live.work.write(&live.pre_surf, &changed, rect);
-            let mut expected = live.pre_surf.clone();
-            photocraft_paint::retouch::mix_back(&mut expected, &Region::read(&live.pre_surf, rect), &changed, rect, live.opacity, None, false);
-            live.show(rect, None).unwrap();
-            let mut doc = (*live.doc).clone();
-            let (actual, _) = crate::channel_cmds::target_surface(&mut doc, live.id, &params).unwrap();
-            let check = rect.inflate(3);
-            assert_eq!(actual.read_region(check), expected.read_region(check), "large {target} preview, {depth}-bit");
         }
     }
 }

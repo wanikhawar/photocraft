@@ -1155,10 +1155,13 @@ fn dab_cmd(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
 /// Side of the tiles a live sequential-dab stroke keeps its working pixels in ([`WorkTiles`]).
 const WORK_TILE: i32 = 128;
 
-/// Small preview jobs between Blur's parallel effect passes can slow the whole stroke down.
-/// Keep their scratch allocations on the caller; spread only large previews over the pool.
-#[cfg(any(not(target_arch = "wasm32"), test))]
-const PARALLEL_DAB_PREVIEW_PIXELS: u64 = 2 * 1024 * 1024;
+/// Small per-tile allocations can slow subsequent Blur passes even with serial previews.
+/// Retain the dense scratch layout below this size; tile only large regions.
+const TILED_DAB_PIXELS: u64 = 2 * 1024 * 1024;
+
+fn large_dab_region(rect: Rect) -> bool {
+    u64::from(rect.width()).saturating_mul(u64::from(rect.height())) >= TILED_DAB_PIXELS
+}
 
 /// The working copy of a live sequential-dab stroke: the target's native channels as `f32`, in
 /// tiles copied from the pre-stroke surface the first time a dab writes to them. Unlike a
@@ -1398,7 +1401,11 @@ impl LiveDab {
             }
             let mut region = self.work.read(&self.pre_surf, self.neighborhood.read_rect(r, d));
             (self.effect)(&mut region, &ctx.footprint(d, self.done.saturating_add(k)));
-            self.work.write(&self.pre_surf, &region, r);
+            if large_dab_region(r) {
+                self.work.write(&self.pre_surf, &region, r);
+            } else {
+                self.work.write(&self.pre_surf, &region.crop(r), r);
+            }
             dmg = dmg.union(&r);
         }
         self.done += new.len();
@@ -1410,6 +1417,18 @@ impl LiveDab {
     fn show(&mut self, r: Rect, tail: Option<&Region>) -> Result<()> {
         let (surf, _) = crate::channel_cmds::target_surface(std::sync::Arc::make_mut(&mut self.doc), self.id, &self.params)?;
         let (work, pre, sel, opacity, lock) = (&self.work, &self.pre_surf, self.sel.as_ref(), self.opacity, self.lock);
+        if !large_dab_region(r) {
+            let stored;
+            let working = match tail {
+                Some(region) => region,
+                None => {
+                    stored = work.read(pre, r);
+                    &stored
+                }
+            };
+            photocraft_paint::retouch::mix_back(surf, &Region::read(pre, r), working, r, opacity, sel, lock);
+            return Ok(());
+        }
         let fmt = surf.format();
         let render = |(coord, tile): (photocraft_geom::TileCoord, std::sync::Arc<photocraft_raster::Tile>)| {
             let part = r.intersect(&coord.rect());
@@ -1431,11 +1450,7 @@ impl LiveDab {
         };
         let tiles = surf.take_tiles(r);
         #[cfg(not(target_arch = "wasm32"))]
-        let tiles: Vec<_> = if u64::from(r.width()).saturating_mul(u64::from(r.height())) >= PARALLEL_DAB_PREVIEW_PIXELS {
-            tiles.into_par_iter().flat_map_iter(render).collect()
-        } else {
-            tiles.into_iter().flat_map(render).collect()
-        };
+        let tiles: Vec<_> = tiles.into_par_iter().flat_map_iter(render).collect();
         #[cfg(target_arch = "wasm32")]
         let tiles: Vec<_> = tiles.into_iter().flat_map(render).collect();
         surf.put_tiles(tiles);
