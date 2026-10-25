@@ -1769,6 +1769,95 @@ fn live_dodge_matches_the_commit_across_cells() {
     assert!(worst <= 2e-4, "live and commit differ by {worst}");
 }
 
+/// A dab stores its write rectangle, not its sampling halo, and never rounds float working
+/// pixels to the surface's depth between dabs. Exercise negative and partial working tiles.
+#[test]
+fn work_tiles_write_subrect_preserves_halo_and_float_precision() {
+    use photocraft_color::{PixelFormat, SampleType};
+    for mode in [ColorMode::Rgb, ColorMode::Grayscale, ColorMode::Cmyk, ColorMode::Lab] {
+        for sample in [SampleType::U8, SampleType::U16, SampleType::F32] {
+            let fmt = PixelFormat { mode, sample, alpha: true };
+            let pre = Surface::with_default(fmt, &vec![0.375; fmt.channels()]);
+            let bounds = Rect::new(-140, -135, 145, 140);
+            let mut expected = Region::read(&pre, bounds);
+            let mut work = WorkTiles::new(pre.channels());
+            for (i, rect) in [Rect::new(-129, -128, 3, 2), Rect::new(-5, -3, 130, 129), Rect::EMPTY].into_iter().enumerate() {
+                let mut region = Region::new(rect.inflate(4), pre.channels());
+                region.data.fill(0.1234567 + i as f32 * 0.01);
+                work.write(&pre, &region, rect);
+                for y in rect.y0..rect.y1 {
+                    for x in rect.x0..rect.x1 {
+                        expected.px_mut(x, y).copy_from_slice(region.px(x, y));
+                    }
+                }
+                assert_eq!(work.read(&pre, bounds), expected, "{fmt:?}, write {rect:?}");
+            }
+        }
+    }
+}
+
+/// Preview every batch through both the tiled path and the old dense mix. Cross both kinds of
+/// tile boundary, double back, select fractionally and retain a shared preview snapshot.
+#[test]
+fn live_dab_tiled_preview_matches_dense_mix_at_each_batch() {
+    let points =
+        [StrokePoint::new(-10.0, -7.0, 0.6), StrokePoint::new(128.0, 130.0, 1.0), StrokePoint::new(260.0, 257.0, 0.8), StrokePoint::new(125.0, 127.0, 0.9)];
+    for depth in DEPTHS {
+        for mode in ["rgb", "gray", "cmyk", "lab"] {
+            for (cmd, extra) in dab_cases() {
+                if mode != "rgb" && cmd != "paint.blur" {
+                    continue;
+                }
+                for lock in [false, true] {
+                    let mut s = session(280, 270, depth, mode);
+                    s.execute("layer.new.layer", json!({})).unwrap();
+                    paint_layer(&mut s, |x, y| {
+                        let mut c = texture(x, y);
+                        c[3] = if (x / 23 + y / 17) % 4 == 0 { 0.0 } else { 0.37 };
+                        c
+                    });
+                    s.edit("selection and lock", |doc, active| {
+                        doc.layer_mut(active.unwrap()).unwrap().locks.transparency = lock;
+                        let mut selection = Surface::new(photocraft_color::PixelFormat::new(ColorMode::Grayscale, photocraft_color::SampleType::F32, false));
+                        selection.fill_rect(Rect::new(0, 0, 145, 270), &[0.3]);
+                        selection.fill_rect(Rect::new(145, 0, 280, 270), &[0.8]);
+                        doc.selection = Some(selection);
+                        Ok(())
+                    })
+                    .unwrap();
+                    let mut params = dab_opts(&[[-10.0, -7.0]], 0, &extra);
+                    params["size"] = json!(150);
+                    params["opacity"] = json!(63);
+                    let mut live = LiveDab::begin(&s, cmd, &params).unwrap();
+                    for point in &points[1..] {
+                        let snapshot = live.doc.clone();
+                        let id = live.id.unwrap();
+                        let saved_bounds = Rect::new(-150, -150, 410, 410);
+                        let saved = snapshot.layer(id).unwrap().surface().unwrap().read_region(saved_bounds);
+                        live.push(&[*point]).unwrap();
+                        // The immutable snapshot must retain the previous update's native tiles.
+                        assert_eq!(snapshot.layer(id).unwrap().surface().unwrap().read_region(saved_bounds), saved);
+                        let rect = live.bounds().inflate(3);
+                        let mut expected = live.pre_surf.clone();
+                        let work = live.work.read(&live.pre_surf, rect);
+                        photocraft_paint::retouch::mix_back(
+                            &mut expected,
+                            &Region::read(&live.pre_surf, rect),
+                            &work,
+                            rect,
+                            live.opacity,
+                            live.sel.as_ref(),
+                            live.lock,
+                        );
+                        let actual = live.doc.layer(id).unwrap().surface().unwrap();
+                        assert_eq!(actual.read_region(rect), expected.read_region(rect), "{cmd} {depth}-bit {mode}, lock {lock}, {point:?}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The sequential-dab tools' options for the live hand-off tests.
 fn dab_cases() -> [(&'static str, Value); 6] {
     [
@@ -1845,6 +1934,9 @@ fn live_dab_strokes_commit_their_pixels_and_they_are_the_commands() {
                 assert!(layer_pixels(&s) == want, "{cmd} at {depth}-bit, hardness {hardness}: the live pixels aren't the command's");
                 s.execute("edit.undo", json!({})).unwrap();
                 assert!(layer_pixels(&s) == before, "{cmd} {depth} {hardness}: undo restores the layer");
+                s.execute("edit.redo", json!({})).unwrap();
+                assert!(layer_pixels(&s) == want, "{cmd} {depth} {hardness}: redo restores the stroke");
+                s.execute("edit.undo", json!({})).unwrap();
             }
         }
     }

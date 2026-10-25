@@ -1208,9 +1208,9 @@ impl WorkTiles {
         out
     }
 
-    /// Store `region` as the working pixels of its rectangle.
-    fn write(&mut self, pre: &Surface, region: &Region) {
-        let (r, n) = (region.rect, self.ch);
+    /// Store only `r` from `region`, without allocating a cropped copy of the dab's pixels.
+    fn write(&mut self, pre: &Surface, region: &Region, r: Rect) {
+        let (r, n) = (r.intersect(&region.rect), self.ch);
         for c in Self::coords(r) {
             let tr = Self::tile_rect(c);
             let tile = self.tiles.entry(c).or_insert_with(|| pre.read_region(tr));
@@ -1393,17 +1393,43 @@ impl LiveDab {
             }
             let mut region = self.work.read(&self.pre_surf, self.neighborhood.read_rect(r, d));
             (self.effect)(&mut region, &ctx.footprint(d, self.done + k));
-            self.work.write(&self.pre_surf, &region.crop(r));
+            self.work.write(&self.pre_surf, &region, r);
             dmg = dmg.union(&r);
         }
         self.done += new.len();
         dmg
     }
 
-    /// Mix the working pixels of `r` back over the original into the shown document.
-    fn show(&mut self, r: Rect, work: &Region) -> Result<()> {
+    /// Mix disjoint surface tiles using bounded scratch regions. Only a finishing tail needs
+    /// a separate working region; normal updates read the float working tiles directly.
+    fn show(&mut self, r: Rect, tail: Option<&Region>) -> Result<()> {
         let (surf, _) = crate::channel_cmds::target_surface(std::sync::Arc::make_mut(&mut self.doc), self.id, &self.params)?;
-        photocraft_paint::retouch::mix_back(surf, &Region::read(&self.pre_surf, r), work, r, self.opacity, self.sel.as_ref(), self.lock);
+        let (work, pre, sel, opacity, lock) = (&self.work, &self.pre_surf, self.sel.as_ref(), self.opacity, self.lock);
+        let fmt = surf.format();
+        let render = |(coord, tile): (photocraft_geom::TileCoord, std::sync::Arc<photocraft_raster::Tile>)| {
+            let part = r.intersect(&coord.rect());
+            let stored;
+            let working = match tail {
+                Some(region) => region,
+                None => {
+                    stored = work.read(pre, part);
+                    &stored
+                }
+            };
+            let orig = Region::read(pre, part);
+            // Reuse the native tile and the existing blend/encoding path, including its
+            // untouched-pixel shortcut. The full tile preserves pixels outside `part`.
+            let mut shown = Surface::new(fmt);
+            shown.put_tiles([(coord, tile)]);
+            photocraft_paint::retouch::mix_back(&mut shown, &orig, working, part, opacity, sel, lock);
+            shown.take_tiles(part)
+        };
+        let tiles = surf.take_tiles(r);
+        #[cfg(not(target_arch = "wasm32"))]
+        let tiles: Vec<_> = if tiles.len() >= 4 { tiles.into_par_iter().flat_map_iter(render).collect() } else { tiles.into_iter().flat_map(render).collect() };
+        #[cfg(target_arch = "wasm32")]
+        let tiles: Vec<_> = tiles.into_iter().flat_map(render).collect();
+        surf.put_tiles(tiles);
         Ok(())
     }
 
@@ -1427,7 +1453,7 @@ impl LiveDab {
                 for (k, d) in ds.iter().enumerate() {
                     (self.effect)(&mut region, &ctx.footprint(d, self.done + k));
                 }
-                tail = Some((r, region.crop(r)));
+                tail = Some((r, region));
             }
         }
         // Back to the stroke without the previous tail.
@@ -1439,11 +1465,10 @@ impl LiveDab {
         }
         self.bounds = self.bounds.union(&dmg).union(&tail_rect);
         if !shown.is_empty() {
-            let work = self.work.read(&self.pre_surf, shown);
-            self.show(shown, &work)?;
+            self.show(shown, None)?;
         }
         if let Some((r, work)) = tail {
-            self.show(r, &work)?;
+            self.show(r, Some(&work))?;
             self.tail = r;
         }
         Ok(shown.union(&tail_rect))
@@ -1466,8 +1491,7 @@ impl LiveDab {
         let dmg = self.run_new_dabs();
         let shown = dmg.union(&self.tail);
         if !shown.is_empty() {
-            let work = self.work.read(&self.pre_surf, shown);
-            self.show(shown, &work)?;
+            self.show(shown, None)?;
         }
         self.bounds = self.bounds.union(&dmg);
         let (surf, _) = crate::channel_cmds::target_surface(std::sync::Arc::make_mut(&mut self.doc), self.id, &self.params)?;
