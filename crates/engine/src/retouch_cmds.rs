@@ -1155,6 +1155,11 @@ fn dab_cmd(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
 /// Side of the tiles a live sequential-dab stroke keeps its working pixels in ([`WorkTiles`]).
 const WORK_TILE: i32 = 128;
 
+/// Small preview jobs between Blur's parallel effect passes can slow the whole stroke down.
+/// Keep their scratch allocations on the caller; spread only large previews over the pool.
+#[cfg(any(not(target_arch = "wasm32"), test))]
+const PARALLEL_DAB_PREVIEW_PIXELS: u64 = 2 * 1024 * 1024;
+
 /// The working copy of a live sequential-dab stroke: the target's native channels as `f32`, in
 /// tiles copied from the pre-stroke surface the first time a dab writes to them. Unlike a
 /// `Surface`, it isn't rounded to the document's depth between dabs, so each dab sees what the
@@ -1426,7 +1431,11 @@ impl LiveDab {
         };
         let tiles = surf.take_tiles(r);
         #[cfg(not(target_arch = "wasm32"))]
-        let tiles: Vec<_> = if tiles.len() >= 4 { tiles.into_par_iter().flat_map_iter(render).collect() } else { tiles.into_iter().flat_map(render).collect() };
+        let tiles: Vec<_> = if u64::from(r.width()).saturating_mul(u64::from(r.height())) >= PARALLEL_DAB_PREVIEW_PIXELS {
+            tiles.into_par_iter().flat_map_iter(render).collect()
+        } else {
+            tiles.into_iter().flat_map(render).collect()
+        };
         #[cfg(target_arch = "wasm32")]
         let tiles: Vec<_> = tiles.into_iter().flat_map(render).collect();
         surf.put_tiles(tiles);
