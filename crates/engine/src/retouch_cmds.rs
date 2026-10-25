@@ -1392,7 +1392,7 @@ impl LiveDab {
                 continue;
             }
             let mut region = self.work.read(&self.pre_surf, self.neighborhood.read_rect(r, d));
-            (self.effect)(&mut region, &ctx.footprint(d, self.done + k));
+            (self.effect)(&mut region, &ctx.footprint(d, self.done.saturating_add(k)));
             self.work.write(&self.pre_surf, &region, r);
             dmg = dmg.union(&r);
         }

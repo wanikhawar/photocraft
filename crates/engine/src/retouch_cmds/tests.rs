@@ -1935,7 +1935,7 @@ fn live_dab_strokes_commit_their_pixels_and_they_are_the_commands() {
                 s.execute("edit.undo", json!({})).unwrap();
                 assert!(layer_pixels(&s) == before, "{cmd} {depth} {hardness}: undo restores the layer");
                 s.execute("edit.redo", json!({})).unwrap();
-                assert!(layer_pixels(&s) == want, "{cmd} {depth} {hardness}: redo restores the stroke");
+                assert_eq!(layer_pixels(&s), want, "{cmd} {depth} {hardness}: redo restores the live commit");
                 s.execute("edit.undo", json!({})).unwrap();
             }
         }
