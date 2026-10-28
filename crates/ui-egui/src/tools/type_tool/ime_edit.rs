@@ -298,7 +298,7 @@ pub(super) fn ime_update(app: &mut PhotocraftApp, s: &str, commit: bool) {
     let before = if commit { ime_committed(app, &ed) } else { None };
     let len = s.chars().count();
     crate::type_transform::finish(app);
-    if app.run("type.edit", json!({"layer": ed.layer, "replace": {"start": start, "end": end, "text": s}, "coalesce": ed.session})).is_err() {
+    if !insertion_style::replace(app, start, end, &s) {
         return;
     }
     let mut after_ed = ed.clone();

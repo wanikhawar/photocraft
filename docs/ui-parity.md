@@ -171,6 +171,7 @@ Triangle and Curvature Pen (minus legacy Rounded Rectangle and Targeted Adjustme
 | Geometry precision | partial | `geom::Point` f64, paths f64; paint internals mostly f32 |
 | Numeric fields: arithmetic, scrubby labels | partial | units in expressions and double-click reset missing (UI-217-13) |
 | Wheel steps a value field, ⇧ ×10: clicked into, wherever the pointer is; not clicked, a gesture that starts over it | partial | `field_wheel.rs` (#5473, #4061). Photoshop: a field takes the wheel once clicked into (shortcut guides, user reports); whether the pointer must stay over it is unconfirmed. Stepping on hover alone is Photopea's, kept deliberately |
+| Font-name field: click selects the full name; typing searches in place | done | `type_tool.rs` `family_picker_in`, `type_font_picker_tests.rs` (#9338): one editable name above the list; unmatched queries show a compact message; Enter or a row applies to the selected characters even when the family matches their representative; both controls show the selected span and leave mixed families blank; caret font choices affect subsequent typing; Ctrl/Cmd+Enter accepts a valid pending font query and commits from a focused field; Escape/outside click discards pending text; existing navigation and previews retained |
 | Type options bar: drag the "T" icon to change the font size | done | `type_tool.rs` `options_bar`: the icon scrubs the size field like the Character panel's icons (Shift x10, Alt fine), at layer or selection scope, one history step per drag, within 1–1296 pt (#6437) |
 
 ## Navigation
@@ -320,6 +321,8 @@ Paragraph; the rest open as in-app floating windows.
 | 2026-10-14 | minor | A colour picked in the Color or Swatches panel or the Color Picker recolours the selected type layers (Type tool) or shape fills (shape, Pen and path selection tools) |
 | 2026-10-15 | minor | Color panel: Photoshop's panel-menu modes, colour ramp and copy commands; the theme no longer picks the panel's layout (UI-217-17 done, #2569, #6000) |
 | 2026-10-23 | minor | ⌥ + an adjustment's shortcut (⌥⌘L Levels, ⌥⌘M Curves) opens its dialog at the settings of its last OK, as in Photoshop (#8900); no percentage changed |
+| 2026-10-25 | minor | Shared font-family fields support direct name editing and search, with full-name selection on entry, explicit acceptance and cancellation, plus a compact no-match result (#9338); no percentage changed |
+| 2026-10-25 | minor | RC2 follow-up: selection-aware font family/style display, explicit keyboard application to mixed selections, pending caret fonts for typing/paste/IME, and Ctrl/Cmd+Enter from focused Type fields (`type_font_commit_tests.rs`); no percentage changed |
 | 2026-10-14 | minor | ⇧⌥ + letter blend mode keys for the painting tool or every selected layer; ⇧+ / ⇧− now step every selected layer and include Clear for Brush and Pencil |
 | 2026-10-15 | minor | ⇧⌥ blend mode letters work while a Free Transform box is open, without picking a tool |
 | 2026-10-14 | minor | Mode dropdowns for Clone Stamp, Pattern Stamp, History Brush, Healing and Paint Bucket; the blend mode keys reach them, and tools without a blend mode (not Dodge, Burn or Sponge) pass the keys to the layers |

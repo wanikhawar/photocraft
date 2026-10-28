@@ -229,7 +229,7 @@ fn type_sections(app: &mut PhotocraftApp, ui: &mut egui::Ui, character: bool, pa
     if character && section(ui, "character", tl!("Character")) {
         let full = ui.available_width();
         let w = field_width(full, 2, LABEL_W);
-        let mut fam = c.font_family.clone();
+        let mut fam = shown_family(app, &c);
         let mut ready = true;
         row(ui, &mut |ui| {
             ready = fonts_ready(ui, full);
@@ -250,7 +250,8 @@ fn type_sections(app: &mut PhotocraftApp, ui: &mut egui::Ui, character: bool, pa
                 return;
             }
             let mut style = selected_style(&c);
-            let opts: Vec<(String, String)> = styles(&fam).into_iter().map(|s| (s.clone(), style_label(&s))).collect();
+            let opts: Vec<(String, String)> =
+                styles(if fam.is_empty() { &c.font_family } else { &fam }).into_iter().map(|s| (s.clone(), style_label(&s))).collect();
             let opts_ref: Vec<(String, &str)> = opts.iter().map(|(a, b)| (a.clone(), b.as_str())).collect();
             if crate::widgets::dropdown(ui, "props-type-style", tl!("Style"), &mut style, &opts_ref, full) {
                 apply(app, ui.ctx(), json!({"fontStyle": style}));

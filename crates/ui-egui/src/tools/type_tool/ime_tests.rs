@@ -1051,12 +1051,16 @@ fn reset_harness(app: PhotocraftApp) -> egui_kittest::Harness<'static, ResetHarn
                             photocraft_engine::prefs::FontPreview::Medium,
                             &mut FontLibrary::default(),
                         );
-                        let search = ui.scope_id().with(("font-search", "reset-font"));
-                        state.search = ui.data(|d| d.get_temp::<String>(search)).unwrap_or_default();
-                        let input = search.with("input");
-                        state.search_input = Some(input);
-                        state.search_focused = ui.memory(|m| m.has_focus(input));
-                        state.search_height = ui.data(|d| d.get_temp::<egui::Rect>(search.with("body"))).map(|r| r.height());
+                        // The editable font field takes focus like a click; its edit state holds
+                        // the query and measured popup height used by the reset pass.
+                        if !ui.memory(|m| m.has_focus(button)) {
+                            ui.memory_mut(|m| m.request_focus(button));
+                        }
+                        let edit = ui.data(|d| d.get_temp::<FontFieldEdit>(button.with("edit")));
+                        state.search = edit.as_ref().map(|e| e.text.clone()).unwrap_or_default();
+                        state.search_input = Some(button);
+                        state.search_focused = ui.memory(|m| m.has_focus(button));
+                        state.search_height = edit.and_then(|e| e.menu_height);
                     });
                 }
                 if state.picker_button {
@@ -1099,7 +1103,8 @@ fn actual_font_search_owns_stock_input_without_a_speculative_custom_request() {
     );
     h.input_mut().events = vec![completed(first), egui::Event::Text("Family".into())];
     h.step();
-    assert_eq!(h.state().search, "Family", "the actual font picker keeps its text event");
+    // The field opens holding the current family, so the typed text lands after it.
+    assert_eq!(h.state().search, "Family 00Family", "the actual font picker keeps its text event");
     assert_eq!(layer_text(&h.state().app), before);
     assert_eq!(pending(&h.state().app), None);
     let stock = h.output().platform_output.ime.as_ref().expect("stock output survives finalization");

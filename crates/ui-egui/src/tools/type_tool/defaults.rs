@@ -204,6 +204,10 @@ pub(super) fn apply_defaults(app: &mut PhotocraftApp, props: &serde_json::Value)
 /// Apply only the supplied properties to the text-edit scope or selected type layers; without
 /// a type target, prepare the defaults for the next layer instead.
 pub(super) fn apply(app: &mut PhotocraftApp, ctx: &egui::Context, props: serde_json::Value) {
+    if insertion_style::set_font(app, &props) {
+        return;
+    }
+    app.ui.type_insertion_style = None;
     let Some(mut p) = formatting_params(app) else {
         apply_defaults(app, &props);
         return;
