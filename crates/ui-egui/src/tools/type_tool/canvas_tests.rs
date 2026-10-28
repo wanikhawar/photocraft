@@ -2305,9 +2305,9 @@ mod multi_layer_formatting {
         let pick = super::super::styles("Inter").into_iter().find(|s| s != "Regular" && s != "Bold Italic").expect("Inter has several styles");
         assert_ne!(app.ui.tool_options.type_style, pick);
         let mut h = controls(app, true);
-        h.get_all_by_role(Role::ComboBox).next().unwrap().click();
+        h.get_all_by_role(Role::TextInput).next().unwrap().click();
         h.run();
-        h.get_all_by_role(Role::TextInput).find(|n| n.is_focused()).expect("the search field has the focus").type_text("Inter");
+        h.get_all_by_role(Role::TextInput).find(|n| n.is_focused()).expect("the font field has the focus").type_text("Inter");
         h.run();
         h.get_all_by_label("Show Styles").next().unwrap().click();
         h.run();
