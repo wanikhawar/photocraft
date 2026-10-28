@@ -340,6 +340,7 @@ pub(super) fn font_picker(app: &mut PhotocraftApp, ui: &mut egui::Ui, current: &
 
 /// Maximum height of the font menu: room for the search/filter bar over the font list, so only
 /// the list scrolls.
+#[cfg(test)]
 pub(super) const FONT_MENU_HEIGHT: f32 = 520.0;
 /// The font list's height (it scrolls inside the menu, under the fixed search field).
 const FONT_LIST_HEIGHT: f32 = 440.0;
