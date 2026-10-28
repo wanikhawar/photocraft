@@ -1,6 +1,7 @@
 use super::defaults::{apply, formatting_params, open_color_picker, shown_scale, target, target_doc, type_unit};
-use super::editing::{cancel, commit_with};
+use super::editing::{cancel, commit_with, selected_styles};
 use super::fonts::{font_picker, fonts_ready, selected_style, style_label, styles};
+use super::insertion_style;
 use super::keys::is_vertical;
 use super::{Color32, LayerId, PhotocraftApp, Stroke, byte_of, json, text_layer};
 

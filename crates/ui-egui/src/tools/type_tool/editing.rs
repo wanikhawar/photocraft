@@ -1,7 +1,11 @@
+use super::defaults::apply;
+use super::fonts::{FontFieldEdit, accept_row, families, font_labels_id, font_menu_rows};
 use super::ime::interrupt_incoming;
 use super::ime_edit::note_ime_application_change;
+use super::insertion_style;
 use super::layout::{hit_layer, hit_offset, shows_own_layout};
 use super::{LayerId, PhotocraftApp, TextEdit, TextLayer, active_doc_id, byte_range, current_text, json, selected_range, session_key, text_layer};
+use std::{collections::HashMap, sync::Arc};
 
 /// Start editing an existing type layer. Like Photoshop, editing shows the text as the type
 /// engine lays it out, so a PSD layer is re-rendered first (inside the edit session's history

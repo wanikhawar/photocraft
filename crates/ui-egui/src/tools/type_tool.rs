@@ -32,12 +32,12 @@ mod overlay;
 mod panel;
 mod pointer;
 
+#[cfg(test)]
 use defaults::apply;
 #[cfg(test)]
 use defaults::{default_style_params, default_styles, shown_scale};
 pub use defaults::{foreground_changed, open_color_picker};
-pub(crate) use defaults::{formatting_params, target, target_text, type_unit, with_target};
-use editing::selected_styles;
+pub(crate) use defaults::{formatting_params, target, target_text, type_unit};
 #[cfg(test)]
 pub(crate) use editing::{CharToggle, step_char_metric, toggle_char_style, toggle_hyphenate};
 pub use editing::{cancel, commit, commit_with, edit_active, edit_at, end_if_left};
@@ -47,8 +47,7 @@ use editing::{insert, insert_typed, smart_quotes};
 #[cfg(test)]
 pub(crate) use fonts::{Axis, axis_value, slider_axes};
 #[cfg(test)]
-use fonts::{FONT_MENU_HEIGHT, font_labels_id, font_menu_rows, font_picker_in, preview_text, style_names, wheel_family_index};
-use fonts::{FontFieldEdit, accept_row};
+use fonts::{FONT_MENU_HEIGHT, FontFieldEdit, font_labels_id, font_menu_rows, font_picker_in, preview_text, style_names, wheel_family_index};
 pub(crate) use fonts::{FontLibrary, family_picker_in, fonts_ready, selected_style};
 pub use fonts::{families, style_label, styles, sync_font_names, warm_fonts};
 pub(crate) use ime::{ImeState, controls_only, finish_reset_logic, finish_reset_pass, in_ui_pass, install_reset_hooks};
@@ -65,7 +64,6 @@ pub(crate) use layout::{hit_layer, offset_at, shows_own_layout};
 #[cfg(test)]
 use options_bar::num_field;
 pub use options_bar::options_bar;
-use options_bar::shown_family;
 pub(crate) use options_bar::styles_at;
 #[cfg(test)]
 pub(crate) use options_bar::{kerning_label, parse_kerning};

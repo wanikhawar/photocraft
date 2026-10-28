@@ -505,7 +505,7 @@ fn preflight_keys(app: &mut PhotocraftApp, ctx: &egui::Context) -> bool {
     // off the bar first and runs, as with a native menu bar (#6573).
     crate::menu_keys::leave_for_shortcut(ctx);
     if app.ui.dialogs.is_empty() && app.discard.is_none() && crate::type_tool::commit_shortcut(app, ctx) {
-        return;
+        return false;
     }
     if crate::menu_nav::is_open(ctx) || crate::menu_keys::is_focused(ctx) || crate::widgets::dropdown_list_open(ctx) {
         return false;

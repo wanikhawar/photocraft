@@ -1,4 +1,5 @@
 use super::editing::edit_home;
+use super::insertion_style;
 use super::{LayerId, PhotocraftApp, TextLayer, hex, json, text_layer};
 
 /// Representative for the displayed properties: the edit layer, else a selected type layer.
