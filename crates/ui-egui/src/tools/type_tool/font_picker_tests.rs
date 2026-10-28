@@ -206,7 +206,7 @@ fn two_fields_keep_their_names_and_queries_independent() {
         |ui, names: &mut [String; 2]| {
             let families = vec!["Family 00".to_string(), "Zeta Sans".to_string()];
             for (i, name) in names.iter_mut().enumerate() {
-                super::family_picker_in(ui, &format!("font-{i}"), name, 170.0, &families, FontPreview::Off, &[]);
+                super::family_picker_in(ui, &format!("font-{i}"), name, 170.0, &families, FontPreview::Off, &mut super::FontLibrary::default());
             }
         },
         ["Family 00".to_string(), "Family 00".to_string()],
