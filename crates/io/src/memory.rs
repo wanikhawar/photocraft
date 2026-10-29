@@ -10,7 +10,7 @@ pub const RESERVE: u64 = 512 << 20;
 
 /// Bytes this process can still use without running out, or `None` where that isn't known. On
 /// Linux: the free RAM the kernel can hand out (`MemAvailable`, capped by the process's cgroup
-/// v2 `memory.max` and those above it) plus free swap (capped by the cgroup's `memory.swap.max`).
+/// v2 `memory.max` and those above it) plus free swap (capped by `memory.swap.max` at each level).
 /// Elsewhere `None`: Windows refuses an allocation past its commit limit, which the importers
 /// already report as an error, and macOS pages to disk as it needs.
 pub fn available() -> Option<u64> {
@@ -66,14 +66,14 @@ mod linux {
     }
 
     /// Memory and swap left under the limits of `dir` and every cgroup above it (`None`: no
-    /// limit). Swap is limited per cgroup only by the process's own one.
+    /// limit).
     pub(super) fn cgroup_room(dir: &Path) -> (Option<u64>, Option<u64>) {
         let room = |d: &Path, max: &str, current: &str| -> Option<u64> {
             let max = std::fs::read_to_string(d.join(max)).ok()?.trim().parse::<u64>().ok()?;
             let current = std::fs::read_to_string(d.join(current)).ok().and_then(|c| c.trim().parse::<u64>().ok()).unwrap_or(0);
             Some(max.saturating_sub(current))
         };
-        let swap = room(dir, "memory.swap.max", "memory.swap.current");
+        let swap = dir.ancestors().take(64).filter_map(|d| room(d, "memory.swap.max", "memory.swap.current")).min();
         let ram = dir.ancestors().take(64).filter_map(|d| room(d, "memory.max", "memory.current")).min();
         (ram, swap)
     }
@@ -117,6 +117,15 @@ mod tests {
         assert_eq!(linux::cgroup_room(&leaf), (Some(6 << 30), Some(1 << 30)), "the parent's limit applies");
         write(&leaf, "memory.max", "1610612736\n");
         assert_eq!(linux::cgroup_room(&leaf).0, Some(512 << 20), "the tighter limit wins");
+        write(&leaf, "memory.swap.max", "max\n");
+        write(&root, "memory.swap.max", "0\n");
+        write(&root, "memory.swap.current", "0\n");
+        assert_eq!(linux::cgroup_room(&leaf), (Some(512 << 20), Some(0)), "the parent's swap limit applies");
+        write(&root, "memory.swap.max", "2147483648\n");
+        write(&root, "memory.swap.current", "1610612736\n");
+        write(&leaf, "memory.swap.max", "1073741824\n");
+        write(&leaf, "memory.swap.current", "268435456\n");
+        assert_eq!(linux::cgroup_room(&leaf).1, Some(512 << 20), "the tightest remaining swap wins");
         std::fs::remove_dir_all(&root).unwrap();
         assert!(available().is_some());
     }
