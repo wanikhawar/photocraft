@@ -93,9 +93,34 @@ fn measure(dir: &str, n: usize) -> R<()> {
     Ok(())
 }
 
+/// One cold decode of a 4096×4096 RGBA8 source (what a smart object's first re-render does).
+fn source() -> R<()> {
+    const SIDE: u32 = 4096;
+    let bytes = png(SIDE, SIDE, 7)?;
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": 8, "height": 8}))?;
+    let fmt = s.active().ok_or("no document")?.doc.pixel_format();
+    reset_peak()?;
+    let before = status_bytes("VmHWM:")?;
+    let t = Instant::now();
+    let img = photocraft_engine::smart_cmds::source_image("big.png", &bytes, fmt)?;
+    let secs = t.elapsed().as_secs_f64();
+    let grown = status_bytes("VmHWM:")?.saturating_sub(before);
+    let px = u64::from(SIDE) * u64::from(SIDE);
+    println!(
+        "source decode {}×{}: {secs:.2} s, peak growth {} MiB ({:.1} B/px)",
+        img.bounds.width(),
+        img.bounds.height(),
+        mib(grown),
+        grown as f64 / px as f64
+    );
+    Ok(())
+}
+
 fn main() -> R<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("source") => source(),
         Some("gen") => generate(args.get(2).ok_or("gen DIR")?),
         Some("measure") => measure(args.get(2).ok_or("measure DIR N")?, args.get(3).ok_or("measure DIR N")?.parse()?),
         _ => Err("usage: measure_10032 gen DIR | measure DIR N".into()),

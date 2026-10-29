@@ -32,6 +32,9 @@ jobs:
         run: cargo build --release --locked -p photocraft-engine --example measure_10032
       - name: Runner memory
         run: free -m
+      - name: Measure one source decode
+        run: |
+          for i in 1 2 3; do target/release/examples/measure_10032 source; done
       - name: Generate PNGs
         run: target/release/examples/measure_10032 gen "$RUNNER_TEMP/png"
       - name: Measure 3 objects
