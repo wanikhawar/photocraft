@@ -189,6 +189,24 @@ fn level_count(w: usize, h: usize, hole: &[bool], r: usize) -> usize {
     levels
 }
 
+/// σ² of the similarity weights from the 75th percentile of the match costs (`cs`, finite, in any
+/// order), as Wexler et al. and the paper; 1 when there are none.
+fn sigma2_of(cs: &mut [f32]) -> f32 {
+    if cs.is_empty() {
+        return 1.0;
+    }
+    let k = (cs.len() * 3 / 4).min(cs.len() - 1);
+    let (_, v, _) = cs.select_nth_unstable_by(k, f32::total_cmp);
+    v.max(1e-6)
+}
+
+/// The weight of a match with cost `c`. It depends on the patch centre's cost and σ² alone, so a
+/// pass computes it once per centre, not once per cell the patch covers.
+#[inline]
+fn similarity(c: f32, sigma2: f32) -> f32 {
+    (-c / (2.0 * sigma2)).exp().max(1e-8)
+}
+
 /// Per-level search and reconstruction state.
 struct Solver<'a> {
     w: usize,
@@ -203,7 +221,38 @@ struct Solver<'a> {
     valid_list: Vec<(i32, i32)>,
     /// Patch centres whose patch overlaps the hole: the patches the energy is summed over.
     targets: Vec<bool>,
+    /// Bounding box `(x0, y0, x1, y1)` (end exclusive) of `targets`: the patch centres that can
+    /// take part in a vote.
+    tbox: (usize, usize, usize, usize),
+    /// Scratch for [`Solver::vote`]: the similarity weight of each cell of `tbox` (row-major, box
+    /// relative), refilled by every non-uniform vote and allocated by the first one.
+    weights: Vec<f32>,
     ctl: &'a Interrupt<'a>,
+}
+
+impl<'a> Solver<'a> {
+    /// The solver for one level, or `None` when it has no fully-known patch to copy from.
+    fn new(level: &'a Level, cha: usize, ch: usize, r: usize, ctl: &'a Interrupt<'a>) -> Option<Self> {
+        let (lw, lh) = (level.w, level.h);
+        let (valid, valid_list) = valid_sources(lw, lh, &level.hole, r);
+        if valid_list.is_empty() {
+            return None;
+        }
+        let r = r as i32;
+        let mut targets = vec![false; lw * lh];
+        let mut tbox = (lw, lh, 0, 0);
+        for (i, _) in level.hole.iter().enumerate().filter(|(_, m)| **m) {
+            let (x, y) = ((i % lw) as i32, (i / lw) as i32);
+            let (x0, y0, x1, y1) = ((x - r).max(0), (y - r).max(0), (x + r).min(lw as i32 - 1), (y + r).min(lh as i32 - 1));
+            tbox = (tbox.0.min(x0 as usize), tbox.1.min(y0 as usize), tbox.2.max(x1 as usize + 1), tbox.3.max(y1 as usize + 1));
+            for ty in y0..=y1 {
+                for tx in x0..=x1 {
+                    targets[ty as usize * lw + tx as usize] = true;
+                }
+            }
+        }
+        Some(Solver { w: lw, h: lh, cha, ch, r, img: level.img.clone(), hole: &level.hole, valid, valid_list, targets, tbox, weights: Vec::new(), ctl })
+    }
 }
 
 impl Solver<'_> {
@@ -355,8 +404,8 @@ impl Solver<'_> {
     }
 
     /// The cells of the patches covering hole cell `(x, y)`: each match's source cell for it, with
-    /// that patch's cost.
-    fn sources(&self, x: usize, y: usize, nnf: &[(i32, i32)], cost: &[f32], mut f: impl FnMut(usize, f32)) {
+    /// that patch's cost and centre.
+    fn sources(&self, x: usize, y: usize, nnf: &[(i32, i32)], cost: &[f32], mut f: impl FnMut(usize, f32, usize)) {
         let (w, h, r) = (self.w as i32, self.h as i32, self.r);
         for dy in -r..=r {
             let ty = y as i32 + dy;
@@ -375,10 +424,58 @@ impl Solver<'_> {
                 let s = nnf[ti];
                 let (sx, sy) = (s.0 - dx, s.1 - dy);
                 if sx >= 0 && sy >= 0 && sx < w && sy < h {
-                    f(sy as usize * self.w + sx as usize, cost[ti]);
+                    f(sy as usize * self.w + sx as usize, cost[ti], ti);
                 }
             }
         }
+    }
+
+    /// The similarity weight of every target with a finite cost, into the box-relative table `wts`
+    /// (`∞` for the others), one `exp` per centre. Refills the whole table, so none of it is stale.
+    fn fill_weights(&self, wts: &mut Vec<f32>, cost: &[f32], sigma2: f32) {
+        let (x0, y0, x1, y1) = self.tbox;
+        let (bw, bh) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
+        // Every entry is written below, so only a change of size needs the table rebuilt.
+        if wts.len() != bw.saturating_mul(bh) {
+            wts.clear();
+            wts.resize(bw.saturating_mul(bh), f32::INFINITY);
+        }
+        if bw == 0 {
+            return;
+        }
+        let row = |(by, out): (usize, &mut [f32])| {
+            let base = (y0 + by) * self.w + x0;
+            let mut n = 0u64;
+            for (bx, o) in out.iter_mut().enumerate() {
+                let ti = base + bx;
+                *o = match cost.get(ti).copied().filter(|c| c.is_finite()) {
+                    Some(c) if self.targets.get(ti).copied().unwrap_or(false) => {
+                        n += 1;
+                        similarity(c, sigma2)
+                    }
+                    _ => f32::INFINITY,
+                };
+            }
+            phase_timing::count_vote_exps(n);
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.w * self.h >= PAR_MIN {
+            use rayon::prelude::*;
+            wts.par_chunks_mut(bw).enumerate().for_each(row);
+            return;
+        }
+        wts.chunks_mut(bw).enumerate().for_each(row);
+    }
+
+    /// The weight of the patch centred at `ti` (cost `c`) from the table, which holds it for every
+    /// participating centre; computed on the spot should the table ever not.
+    #[inline]
+    fn weight_of(&self, wts: &[f32], ti: usize, c: f32, sigma2: f32) -> f32 {
+        let (x0, y0, x1, _) = self.tbox;
+        let bw = x1.saturating_sub(x0);
+        let (x, y) = (ti % self.w.max(1), ti / self.w.max(1));
+        let slot = x.checked_sub(x0).filter(|bx| *bx < bw).zip(y.checked_sub(y0));
+        slot.and_then(|(bx, by)| wts.get(by * bw + bx)).copied().filter(|v| v.is_finite()).unwrap_or_else(|| similarity(c, sigma2))
     }
 
     /// Re-estimate the hole by the similarity-weighted vote of the overlapping matches (`uniform`:
@@ -387,37 +484,30 @@ impl Solver<'_> {
     fn vote(&mut self, nnf: &[(i32, i32)], cost: &[f32], uniform: bool) -> f32 {
         let _t = phase_timing::timer(Phase::Vote);
         let mut cs: Vec<f32> = cost.iter().zip(&self.targets).filter(|(c, t)| **t && c.is_finite()).map(|(c, _)| *c).collect();
-        // σ² from the 75th percentile of the match costs, as Wexler et al. and the paper.
-        let sigma2 = if cs.is_empty() {
-            1.0
-        } else {
-            let k = (cs.len() * 3 / 4).min(cs.len() - 1);
-            let (_, v, _) = cs.select_nth_unstable_by(k, f32::total_cmp);
-            v.max(1e-6)
-        };
+        let sigma2 = sigma2_of(&mut cs);
+        // The weight depends on the centre's cost alone, so each centre's is computed once here and
+        // the (up to (2r+1)²) cells its patch covers read it, rather than recomputing it per cell.
+        let mut wts = std::mem::take(&mut self.weights);
+        if !uniform {
+            self.fill_weights(&mut wts, cost, sigma2);
+        }
         let cha = self.cha;
         let new = self.per_hole_cell(|x, y| {
             let mut v = vec![0.0f32; cha];
             let mut wsum = 0.0f32;
-            let mut exps = 0u64;
-            self.sources(x, y, nnf, cost, |si, c| {
-                let wt = if uniform {
-                    1.0
-                } else {
-                    exps += 1;
-                    (-c / (2.0 * sigma2)).exp().max(1e-8)
-                };
+            self.sources(x, y, nnf, cost, |si, c, ti| {
+                let wt = if uniform { 1.0 } else { self.weight_of(&wts, ti, c, sigma2) };
                 for (o, s) in v.iter_mut().zip(&self.img[si * cha..(si + 1) * cha]) {
                     *o += s * wt;
                 }
                 wsum += wt;
             });
-            phase_timing::count_vote_exps(exps);
             (wsum > 0.0).then(|| {
                 v.iter_mut().for_each(|o| *o /= wsum);
                 v
             })
         });
+        self.weights = wts;
         let (mut change, mut n) = (0.0f64, 0usize);
         for (i, v) in new {
             for (c, nv) in v.iter().enumerate().take(self.ch) {
@@ -435,7 +525,7 @@ impl Solver<'_> {
         let cha = self.cha;
         let picked = self.per_hole_cell(|x, y| {
             let mut best: Option<(usize, f32)> = None;
-            self.sources(x, y, nnf, cost, |si, c| {
+            self.sources(x, y, nnf, cost, |si, c, _| {
                 if best.is_none_or(|(_, bc)| c < bc) {
                     best = Some((si, c));
                 }
@@ -683,7 +773,7 @@ impl Solver<'_> {
         // its own size rather than a scan of the grid).
         let mut unknown: Vec<usize> = (0..w * h).filter(|&i| self.hole[i]).collect();
         let mut centre = vec![false; w * h];
-        let mut layer_cost = vec![f32::INFINITY; w * h];
+        let mut layer_wt = vec![f32::INFINITY; w * h];
         let mut layer_no = 0u64;
         loop {
             self.ctl.check()?;
@@ -762,19 +852,20 @@ impl Solver<'_> {
                 if c.is_finite() {
                     nnf[ci] = s;
                     has[ci] = true;
-                    layer_cost[ci] = c;
                     cs.push(c);
                 }
             }
-            let sigma2 = if cs.is_empty() {
-                1.0
-            } else {
-                let k = (cs.len() * 3 / 4).min(cs.len() - 1);
-                let (_, v, _) = cs.select_nth_unstable_by(k, f32::total_cmp);
-                v.max(1e-6)
-            };
-            let mut values = Vec::with_capacity(layer.len());
+            let sigma2 = sigma2_of(&mut cs);
+            // Each participating centre's weight, once (∞ marks a centre that is not one).
             let mut exps = 0u64;
+            for &(ci, _, c) in &found {
+                if c.is_finite() {
+                    layer_wt[ci] = similarity(c, sigma2);
+                    exps += 1;
+                }
+            }
+            phase_timing::count_onion_exps(exps);
+            let mut values = Vec::with_capacity(layer.len());
             for &i in &layer {
                 let (x, y) = ((i % w) as i32, (i / w) as i32);
                 let mut v = vec![0.0f32; cha];
@@ -782,7 +873,8 @@ impl Solver<'_> {
                 for cy in (y - r).max(0)..=(y + r).min(h as i32 - 1) {
                     for cx in (x - r).max(0)..=(x + r).min(w as i32 - 1) {
                         let ci = cy as usize * w + cx as usize;
-                        if !layer_cost[ci].is_finite() {
+                        let wt = layer_wt[ci];
+                        if !wt.is_finite() {
                             continue;
                         }
                         let s = nnf[ci];
@@ -791,8 +883,6 @@ impl Solver<'_> {
                             continue;
                         }
                         let si = sy as usize * w + sx as usize;
-                        exps += 1;
-                        let wt = (-layer_cost[ci] / (2.0 * sigma2)).exp().max(1e-8);
                         for (o, s) in v.iter_mut().zip(&self.img[si * cha..(si + 1) * cha]) {
                             *o += s * wt;
                         }
@@ -804,9 +894,8 @@ impl Solver<'_> {
                     values.push((i, v));
                 }
             }
-            phase_timing::count_onion_exps(exps);
             for &(ci, _, _) in &found {
-                layer_cost[ci] = f32::INFINITY;
+                layer_wt[ci] = f32::INFINITY;
             }
             if values.is_empty() {
                 // No known patch reaches the layer: leave the rest to the EM iterations.
@@ -858,21 +947,8 @@ pub fn complete_with(w: usize, h: usize, ch: usize, img: &[f32], hole: &[bool], 
     for (li, level) in pyramid.iter().enumerate().rev() {
         ctl.check()?;
         let (lw, lh) = (level.w, level.h);
-        let (valid, valid_list) = valid_sources(lw, lh, &level.hole, r);
-        if valid_list.is_empty() {
-            return Ok(None);
-        }
         let ri = r as i32;
-        let mut targets = vec![false; lw * lh];
-        for (i, _) in level.hole.iter().enumerate().filter(|(_, m)| **m) {
-            let (x, y) = ((i % lw) as i32, (i / lw) as i32);
-            for ty in (y - ri).max(0)..=(y + ri).min(lh as i32 - 1) {
-                for tx in (x - ri).max(0)..=(x + ri).min(lw as i32 - 1) {
-                    targets[ty as usize * lw + tx as usize] = true;
-                }
-            }
-        }
-        let mut s = Solver { w: lw, h: lh, cha, ch, r: ri, img: level.img.clone(), hole: &level.hole, valid, valid_list, targets, ctl };
+        let Some(mut s) = Solver::new(level, cha, ch, r, ctl) else { return Ok(None) };
         let mut nnf = vec![(0i32, 0i32); lw * lh];
         let mut cost = vec![f32::INFINITY; lw * lh];
         let mut rng = Rng::new(p.seed ^ ((li as u64) << 20));
@@ -1029,5 +1105,424 @@ mod tests {
         let cancel = || true;
         let progress = |_: f32| {};
         assert_eq!(complete_with(w, h, 1, &img, &hole, &Params::default(), &Interrupt::new(&cancel, &progress)), Err(Cancelled));
+    }
+
+    // ---- Per-centre similarity weights (#10131): bit-for-bit against the per-contribution code ----
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    fn rect(w: usize, h: usize, (x0, y0, x1, y1): (usize, usize, usize, usize)) -> Vec<bool> {
+        (0..w * h).map(|i| (x0..x1).contains(&(i % w)) && (y0..y1).contains(&(i / w))).collect()
+    }
+
+    /// A level of `ch` colour channels and the two texture channels, deterministic noise.
+    fn noisy_level(w: usize, h: usize, ch: usize, hole: Vec<bool>) -> Level {
+        let cha = ch + 2;
+        let img = (0..w * h * cha).map(|i| noise(i ^ (i >> 5)) * if i % cha >= ch { 0.2 } else { 1.0 }).collect();
+        Level { w, h, img, hole }
+    }
+
+    /// A match field: every target at a pseudo-random fully-known source.
+    fn random_field(s: &Solver, salt: usize) -> Vec<(i32, i32)> {
+        (0..s.w * s.h).map(|i| s.valid_list[(noise(i * 31 + salt) * s.valid_list.len() as f32) as usize % s.valid_list.len()]).collect()
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Costs {
+        /// Varied, with zeros, huge values, ∞ and NaN among the targets.
+        Mixed(usize),
+        Equal,
+        Zero,
+        /// No target has a finite cost (an empty `cs`).
+        Infinite,
+    }
+
+    /// Costs for the targets by `kind`; the cells that are not targets get an arbitrary finite cost,
+    /// which no vote may look at.
+    fn costs(s: &Solver, kind: Costs) -> Vec<f32> {
+        (0..s.w * s.h)
+            .map(|i| {
+                if !s.targets[i] {
+                    return 0.123;
+                }
+                match kind {
+                    Costs::Mixed(salt) => match (i + salt) % 13 {
+                        0 => f32::INFINITY,
+                        1 => f32::NAN,
+                        2 => 0.0,
+                        3 => 1e30,
+                        _ => noise(i * 7 + salt) * 0.3,
+                    },
+                    Costs::Equal => 0.05,
+                    Costs::Zero => 0.0,
+                    Costs::Infinite => f32::INFINITY,
+                }
+            })
+            .collect()
+    }
+
+    /// The cells of the patches covering hole cell `(x, y)` as the vote gathered them before: the
+    /// source cell and the cost of each, row by row.
+    fn gather_reference(s: &Solver, (x, y): (usize, usize), nnf: &[(i32, i32)], cost: &[f32]) -> Vec<(usize, f32)> {
+        let (w, h, r) = (s.w as i32, s.h as i32, s.r);
+        let mut out = Vec::new();
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let (tx, ty) = (x as i32 + dx, y as i32 + dy);
+                if tx < 0 || ty < 0 || tx >= w || ty >= h {
+                    continue;
+                }
+                let ti = ty as usize * s.w + tx as usize;
+                let (sx, sy) = (nnf[ti].0 - dx, nnf[ti].1 - dy);
+                if s.targets[ti] && cost[ti].is_finite() && sx >= 0 && sy >= 0 && sx < w && sy < h {
+                    out.push((sy as usize * s.w + sx as usize, cost[ti]));
+                }
+            }
+        }
+        out
+    }
+
+    /// The vote as it was before the weights were tabled: `exp` for every overlapping contribution.
+    fn vote_reference(s: &mut Solver, nnf: &[(i32, i32)], cost: &[f32], uniform: bool) -> f32 {
+        let mut cs: Vec<f32> = cost.iter().zip(&s.targets).filter(|(c, t)| **t && c.is_finite()).map(|(c, _)| *c).collect();
+        let sigma2 = if cs.is_empty() {
+            1.0
+        } else {
+            let k = (cs.len() * 3 / 4).min(cs.len() - 1);
+            let (_, v, _) = cs.select_nth_unstable_by(k, f32::total_cmp);
+            v.max(1e-6)
+        };
+        let cha = s.cha;
+        let mut new = Vec::new();
+        for i in (0..s.w * s.h).filter(|&i| s.hole[i]) {
+            let mut v = vec![0.0f32; cha];
+            let mut wsum = 0.0f32;
+            for (si, c) in gather_reference(s, (i % s.w, i / s.w), nnf, cost) {
+                let wt = if uniform { 1.0 } else { (-c / (2.0 * sigma2)).exp().max(1e-8) };
+                for (o, sv) in v.iter_mut().zip(&s.img[si * cha..(si + 1) * cha]) {
+                    *o += sv * wt;
+                }
+                wsum += wt;
+            }
+            if wsum > 0.0 {
+                v.iter_mut().for_each(|o| *o /= wsum);
+                new.push((i, v));
+            }
+        }
+        let (mut change, mut n) = (0.0f64, 0usize);
+        for (i, v) in new {
+            for (c, nv) in v.iter().enumerate().take(s.ch) {
+                change += f64::from((nv - s.img[i * cha + c]).abs());
+            }
+            n += s.ch;
+            s.img[i * cha..(i + 1) * cha].copy_from_slice(&v);
+        }
+        if n == 0 { 0.0 } else { (change / n as f64) as f32 }
+    }
+
+    /// Runs the same sequence of votes (non-uniform with changing costs, uniform, empty) on the real
+    /// solver and on the reference and requires identical bits after each one.
+    fn assert_votes_match(w: usize, h: usize, ch: usize, hole: Vec<bool>, r: usize) {
+        let level = noisy_level(w, h, ch, hole);
+        let (mut a, mut b) = (Solver::new(&level, ch + 2, ch, r, &Interrupt::NONE).unwrap(), Solver::new(&level, ch + 2, ch, r, &Interrupt::NONE).unwrap());
+        let nnf = random_field(&a, 1);
+        let steps = [
+            (Costs::Mixed(0), false),
+            (Costs::Mixed(5), false),
+            (Costs::Mixed(5), true),
+            (Costs::Equal, false),
+            (Costs::Mixed(2), false),
+            (Costs::Infinite, false),
+            (Costs::Zero, false),
+            (Costs::Infinite, true),
+            (Costs::Mixed(9), false),
+        ];
+        for (n, (kind, uniform)) in steps.into_iter().enumerate() {
+            let cost = costs(&a, kind);
+            let (ca, cb) = (a.vote(&nnf, &cost, uniform), vote_reference(&mut b, &nnf, &cost, uniform));
+            assert_eq!(ca.to_bits(), cb.to_bits(), "{w}x{h} ch{ch} r{r} step {n} {kind:?} uniform {uniform}: change");
+            assert!(bits(&a.img) == bits(&b.img), "{w}x{h} ch{ch} r{r} step {n} {kind:?} uniform {uniform}: image");
+        }
+    }
+
+    #[test]
+    fn the_vote_is_bit_exact_against_per_contribution_weights() {
+        let hole = |w, h, b| rect(w, h, b);
+        assert_votes_match(40, 32, 3, hole(40, 32, (15, 12, 25, 20)), 3);
+        assert_votes_match(40, 32, 1, hole(40, 32, (15, 12, 25, 20)), 1);
+        assert_votes_match(30, 30, 1, hole(30, 30, (0, 0, 8, 8)), 3);
+        assert_votes_match(30, 30, 4, hole(30, 30, (22, 10, 30, 18)), 2);
+        assert_votes_match(30, 30, 3, hole(30, 30, (10, 22, 20, 30)), 3);
+        let mut two = rect(44, 36, (6, 6, 12, 14));
+        two.iter_mut().zip(rect(44, 36, (28, 20, 40, 32))).for_each(|(a, b)| *a |= b);
+        assert_votes_match(44, 36, 3, two, 3);
+        // A single hole cell, and a hole on every side of the grid's border.
+        assert_votes_match(24, 24, 4, rect(24, 24, (11, 11, 12, 12)), 3);
+    }
+
+    /// Big enough for the parallel paths (`PAR_MIN`).
+    #[test]
+    fn the_vote_is_bit_exact_on_a_grid_that_runs_in_parallel() {
+        assert_votes_match(140, 120, 3, rect(140, 120, (50, 40, 80, 70)), 3);
+    }
+
+    #[test]
+    fn an_all_infinite_vote_leaves_the_image_alone() {
+        let level = noisy_level(30, 30, 3, rect(30, 30, (10, 10, 18, 18)));
+        let mut s = Solver::new(&level, 5, 3, 3, &Interrupt::NONE).unwrap();
+        let nnf = random_field(&s, 3);
+        let before = bits(&s.img);
+        let cost = costs(&s, Costs::Infinite);
+        assert_eq!(s.vote(&nnf, &cost, false), 0.0);
+        assert!(bits(&s.img) == before);
+    }
+
+    /// The table covers exactly the targets' bounding box.
+    #[test]
+    fn the_target_box_bounds_the_targets() {
+        for (w, h, b) in [(40, 32, (15, 12, 25, 20)), (30, 30, (0, 0, 8, 8)), (30, 30, (22, 10, 30, 18))] {
+            let level = noisy_level(w, h, 1, rect(w, h, b));
+            let s = Solver::new(&level, 3, 1, 3, &Interrupt::NONE).unwrap();
+            let (x0, y0, x1, y1) = s.tbox;
+            for i in 0..w * h {
+                let inside = (x0..x1).contains(&(i % w)) && (y0..y1).contains(&(i / w));
+                assert!(inside || !s.targets[i], "target {i} outside the box {:?}", s.tbox);
+            }
+            let hit = |f: &dyn Fn(usize) -> usize, v: usize| (0..w * h).any(|i| s.targets[i] && f(i) == v);
+            assert!(hit(&|i| i % w, x0) && hit(&|i| i % w, x1 - 1) && hit(&|i| i / w, y0) && hit(&|i| i / w, y1 - 1), "the box is tight");
+        }
+    }
+
+    impl Solver<'_> {
+        fn onion_peel_reference(&mut self, nnf: &mut [(i32, i32)], has: &mut [bool], seed: u64) -> Result<(), Cancelled> {
+            let (w, h, r, cha) = (self.w, self.h, self.r, self.cha);
+            let mut known: Vec<bool> = self.hole.iter().map(|m| !*m).collect();
+            // The cells still unknown, and per layer the known centres found (lists, so a layer costs
+            // its own size rather than a scan of the grid).
+            let mut unknown: Vec<usize> = (0..w * h).filter(|&i| self.hole[i]).collect();
+            let mut centre = vec![false; w * h];
+            let mut layer_cost = vec![f32::INFINITY; w * h];
+            let mut layer_no = 0u64;
+            loop {
+                self.ctl.check()?;
+                let neighbour_known = |i: usize, known: &[bool]| {
+                    let (x, y) = (i % w, i / w);
+                    (x > 0 && known[i - 1]) || (x + 1 < w && known[i + 1]) || (y > 0 && known[i - w]) || (y + 1 < h && known[i + w])
+                };
+                let layer: Vec<usize> = unknown.iter().copied().filter(|&i| neighbour_known(i, &known)).collect();
+                if layer.is_empty() {
+                    return Ok(());
+                }
+                // Known centres whose patch reaches into the layer.
+                let mut centres = Vec::new();
+                for &i in &layer {
+                    let (x, y) = ((i % w) as i32, (i / w) as i32);
+                    for cy in (y - r).max(0)..=(y + r).min(h as i32 - 1) {
+                        for cx in (x - r).max(0)..=(x + r).min(w as i32 - 1) {
+                            let ci = cy as usize * w + cx as usize;
+                            if known[ci] && !centre[ci] {
+                                centre[ci] = true;
+                                centres.push(ci);
+                            }
+                        }
+                    }
+                }
+                for &ci in &centres {
+                    centre[ci] = false;
+                }
+                let this = &*self;
+                let known_ref = &known;
+                let (nnf_ref, has_ref) = (&*nnf, &*has);
+                let search = |&ci: &usize| -> (usize, (i32, i32), f32) {
+                    let t = ((ci % w) as i32, (ci / w) as i32);
+                    let mut rng = Rng::new(seed ^ (ci as u64).wrapping_mul(0x9E37_79B9) ^ (layer_no << 48));
+                    let (mut best, mut bc) = ((0, 0), f32::INFINITY);
+                    let try_cand = |cand: (i32, i32), best: &mut (i32, i32), bc: &mut f32| {
+                        if this.is_valid(cand.0, cand.1) {
+                            let d = this.dist(t, cand, *bc, Some(known_ref));
+                            if d < *bc {
+                                (*best, *bc) = (cand, d);
+                            }
+                        }
+                    };
+                    if has_ref[ci] {
+                        try_cand(nnf_ref[ci], &mut best, &mut bc);
+                    }
+                    // Neighbours' matches, shifted (propagation), and a few random sources.
+                    for (ox, oy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                        let (nx, ny) = (t.0 + ox, t.1 + oy);
+                        if nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < h && has_ref[ny as usize * w + nx as usize] {
+                            let s = nnf_ref[ny as usize * w + nx as usize];
+                            try_cand((s.0 - ox, s.1 - oy), &mut best, &mut bc);
+                        }
+                    }
+                    for _ in 0..8 {
+                        try_cand(this.random_source(&mut rng), &mut best, &mut bc);
+                    }
+                    for _ in 0..2 {
+                        let mut rad = w.max(h) as i32;
+                        while rad >= 1 {
+                            try_cand((best.0 + rng.range(-rad, rad), best.1 + rng.range(-rad, rad)), &mut best, &mut bc);
+                            rad /= 2;
+                        }
+                    }
+                    (ci, best, bc)
+                };
+                #[cfg(not(target_arch = "wasm32"))]
+                let found: Vec<(usize, (i32, i32), f32)> = {
+                    use rayon::prelude::*;
+                    centres.par_iter().map(search).collect()
+                };
+                #[cfg(target_arch = "wasm32")]
+                let found: Vec<(usize, (i32, i32), f32)> = centres.iter().map(search).collect();
+                let mut cs = Vec::with_capacity(found.len());
+                for &(ci, s, c) in &found {
+                    if c.is_finite() {
+                        nnf[ci] = s;
+                        has[ci] = true;
+                        layer_cost[ci] = c;
+                        cs.push(c);
+                    }
+                }
+                let sigma2 = if cs.is_empty() {
+                    1.0
+                } else {
+                    let k = (cs.len() * 3 / 4).min(cs.len() - 1);
+                    let (_, v, _) = cs.select_nth_unstable_by(k, f32::total_cmp);
+                    v.max(1e-6)
+                };
+                let mut values = Vec::with_capacity(layer.len());
+                for &i in &layer {
+                    let (x, y) = ((i % w) as i32, (i / w) as i32);
+                    let mut v = vec![0.0f32; cha];
+                    let mut wsum = 0.0f32;
+                    for cy in (y - r).max(0)..=(y + r).min(h as i32 - 1) {
+                        for cx in (x - r).max(0)..=(x + r).min(w as i32 - 1) {
+                            let ci = cy as usize * w + cx as usize;
+                            if !layer_cost[ci].is_finite() {
+                                continue;
+                            }
+                            let s = nnf[ci];
+                            let (sx, sy) = (s.0 + x - cx, s.1 + y - cy);
+                            if sx < 0 || sy < 0 || sx as usize >= w || sy as usize >= h {
+                                continue;
+                            }
+                            let si = sy as usize * w + sx as usize;
+                            let wt = (-layer_cost[ci] / (2.0 * sigma2)).exp().max(1e-8);
+                            for (o, s) in v.iter_mut().zip(&self.img[si * cha..(si + 1) * cha]) {
+                                *o += s * wt;
+                            }
+                            wsum += wt;
+                        }
+                    }
+                    if wsum > 0.0 {
+                        v.iter_mut().for_each(|o| *o /= wsum);
+                        values.push((i, v));
+                    }
+                }
+                for &(ci, _, _) in &found {
+                    layer_cost[ci] = f32::INFINITY;
+                }
+                if values.is_empty() {
+                    // No known patch reaches the layer: leave the rest to the EM iterations.
+                    return Ok(());
+                }
+                for (i, v) in values {
+                    self.img[i * cha..(i + 1) * cha].copy_from_slice(&v);
+                    known[i] = true;
+                }
+                unknown.retain(|&i| !known[i]);
+                layer_no += 1;
+            }
+        }
+    }
+
+    /// The onion peel as it was before the weights were tabled, as the oracle for the new one.
+    #[test]
+    fn the_onion_peel_is_bit_exact_against_per_contribution_weights() {
+        let cases = [
+            (48, 40, 3, (18, 14, 30, 26)),
+            (48, 40, 1, (0, 0, 14, 12)),
+            (48, 40, 4, (36, 20, 48, 34)),
+            (64, 64, 3, (14, 14, 50, 50)),
+            (40, 40, 3, (19, 19, 21, 21)),
+        ];
+        for (w, h, ch, b) in cases {
+            let level = noisy_level(w, h, ch, rect(w, h, b));
+            let mut a = Solver::new(&level, ch + 2, ch, 3, &Interrupt::NONE).unwrap();
+            let mut r = Solver::new(&level, ch + 2, ch, 3, &Interrupt::NONE).unwrap();
+            let (mut nnf_a, mut has_a) = (vec![(0, 0); w * h], vec![false; w * h]);
+            let (mut nnf_r, mut has_r) = (vec![(0, 0); w * h], vec![false; w * h]);
+            for seed in [1u64, 0x0c10_4e00] {
+                a.onion_peel(&mut nnf_a, &mut has_a, seed).unwrap();
+                r.onion_peel_reference(&mut nnf_r, &mut has_r, seed).unwrap();
+                assert!(bits(&a.img) == bits(&r.img), "{w}x{h} ch{ch} seed {seed}: image");
+                assert_eq!((&nnf_a, &has_a), (&nnf_r, &has_r), "{w}x{h} ch{ch} seed {seed}: matches");
+            }
+        }
+    }
+
+    // ---- Determinism across thread counts, and cancellation ----
+
+    /// A textured image of `ch` channels, quantised to `levels` steps (0: not at all).
+    fn textured(w: usize, h: usize, ch: usize, levels: f32) -> Vec<f32> {
+        (0..w * h * ch)
+            .map(|i| {
+                let (c, p) = (i % ch, i / ch);
+                let (x, y) = ((p % w) as f32, (p / w) as f32);
+                let v = (0.5 + 0.25 * (x * 0.21 + c as f32).sin() * (y * 0.17).cos() + 0.2 * (noise(i) - 0.5)).clamp(0.0, 1.0);
+                if levels > 0.0 { (v * levels).round() / levels } else { v }
+            })
+            .collect()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_completion_is_bit_identical_on_one_two_and_four_threads() {
+        let (w, h) = (300, 300);
+        let hole: Vec<bool> = (0..w * h).map(|i| ((i % w) as f32 - 140.0).hypot((i / w) as f32 - 150.0) < 40.0).collect();
+        for ch in [1, 3, 4] {
+            for levels in [255.0, 65535.0, 0.0] {
+                let img = textured(w, h, ch, levels);
+                let run = |threads: usize| {
+                    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+                    pool.install(|| complete_with(w, h, ch, &img, &hole, &Params::default(), &Interrupt::NONE)).unwrap().unwrap()
+                };
+                let one = bits(&run(1));
+                for threads in [2, 4] {
+                    assert!(bits(&run(threads)) == one, "ch {ch}, {levels} levels: {threads} threads differ from 1");
+                }
+            }
+        }
+    }
+
+    /// Cancelling at the k-th check, for any k, is `Ok` or `Err(Cancelled)` and never a panic; once k
+    /// is past the last check the result is the uncancelled one.
+    #[test]
+    fn cancelling_at_any_check_is_clean() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (w, h) = (64, 64);
+        let img: Vec<f32> = (0..w * h).map(noise).collect();
+        let hole: Vec<bool> = (0..w * h).map(|i| (20..40).contains(&(i % w)) && (20..40).contains(&(i / w))).collect();
+        let run = |k: usize| {
+            let calls = AtomicUsize::new(0);
+            let cancel = || calls.fetch_add(1, Ordering::Relaxed) >= k;
+            let progress = |_: f32| {};
+            let r = complete_with(w, h, 1, &img, &hole, &Params::default(), &Interrupt::new(&cancel, &progress));
+            (r, calls.load(Ordering::Relaxed))
+        };
+        let (full, total) = run(usize::MAX);
+        let full = full.unwrap().unwrap();
+        assert!(total > 10, "{total} checks");
+        let step = (total / 60).max(1);
+        for k in (0..total.min(40)).chain((40..total).step_by(step)).chain([total, total + 1, total + 1000]) {
+            match run(k).0 {
+                Ok(Some(out)) if k >= total => assert!(bits(&out) == bits(&full), "k = {k} past the last check"),
+                Ok(Some(_)) | Err(Cancelled) => {}
+                other => panic!("k = {k}: {other:?}"),
+            }
+        }
     }
 }
