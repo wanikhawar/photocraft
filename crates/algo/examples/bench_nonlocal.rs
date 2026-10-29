@@ -93,10 +93,10 @@ fn sample(content: &str, x: usize, y: usize, c: usize, w: usize, h: usize) -> f3
         "textured" => 0.5 + 0.22 * wave(fx * 0.031 + c as f32 * 0.2) * wave(fy * 0.027) + 0.18 * (noise(x, y, c) - 0.5),
         "gradient" => {
             let g = fx / w as f32 * 0.6 + fy / h as f32 * 0.3;
-            if c % 2 == 0 { g } else { 0.9 - g * 0.8 }
+            if c.is_multiple_of(2) { g } else { 0.9 - g * 0.8 }
         }
         _ => {
-            let on = (x / 37 + y / 53) % 2 == 0;
+            let on = (x / 37 + y / 53).is_multiple_of(2);
             (if on { 0.12 } else { 0.86 }) + 0.01 * c as f32 + 0.02 * (noise(x, y, c) - 0.5)
         }
     };
@@ -187,6 +187,9 @@ fn main() {
     }
 }
 
+/// The cached input image's key: content, channels, depth.
+type CaseKey<'a> = (&'a str, usize, &'a str);
+
 fn run() -> Result<(), String> {
     let o = parse()?;
     let (w, h) = (o.w, o.h);
@@ -194,7 +197,7 @@ fn run() -> Result<(), String> {
     let threads = rayon::current_num_threads();
     println!("{w}x{h} ({:.1} MP), {} reps, {threads} rayon threads", (w * h) as f64 / 1e6, o.reps);
     let mut rows: Vec<Value> = Vec::new();
-    let mut cached: Option<((&str, usize, &str), Vec<f32>)> = None;
+    let mut cached: Option<(CaseKey, Vec<f32>)> = None;
     for (content, ch, depth, kind) in cases(o.full || !o.case.is_empty()) {
         let name = format!("{content}/{kind}/ch{ch}/depth{depth}");
         if !o.case.is_empty() && !o.case.iter().any(|c| name.contains(c.as_str())) {
