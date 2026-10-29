@@ -3538,3 +3538,7 @@ curves	Smooth	تنعيم
 # Select and Mask workspace closure reasons
 	Select and Mask was closed: its document is no longer the active one	أُغلقت مساحة التحديد والقناع: لم يعد المستند الخاص بها نشطًا
 	Select and Mask was closed: another layer was selected	أُغلقت مساحة التحديد والقناع: تم تحديد طبقة أخرى
+
+# Pen draft after a refused commit
+	The path was kept as the Work Path	تم الاحتفاظ بالمسار كمسار عمل
+	The path was discarded	تم تجاهل المسار
