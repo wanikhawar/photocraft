@@ -1,0 +1,40 @@
+# Scratch-only measurement for #10032; lives on measure/* branches of the fork, never in a PR.
+name: Measure 10032
+
+on:
+  push:
+    branches: ["measure/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_TERM_COLOR: always
+      # Serial, like the web build.
+      RAYON_NUM_THREADS: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        uses: storytold/craft-common-actions/actions/install-apt-packages@main
+        with:
+          packages: >-
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+            libgtk-3-dev
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Build
+        run: cargo build --release --locked -p photocraft-engine --example measure_10032
+      - name: Runner memory
+        run: free -m
+      - name: Generate PNGs
+        run: target/release/examples/measure_10032 gen "$RUNNER_TEMP/png"
+      - name: Measure 3 objects
+        run: target/release/examples/measure_10032 measure "$RUNNER_TEMP/png" 3
+      - name: Measure 10 objects
+        run: target/release/examples/measure_10032 measure "$RUNNER_TEMP/png" 10
