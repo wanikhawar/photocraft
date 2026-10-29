@@ -623,6 +623,12 @@ photos are public domain, not committed; download them at 1920 px wide into `<di
 size the cases were placed for (Commons rounds it to 1920). Timing on a 24 MP document through the
 command: `cargo run --release -p photocraft-engine --example remove_bench`.
 
+`cargo run --release -p photocraft-algo --example bench_nonlocal -- --size 6000x4000 --hash` times
+`remove_with` over content x hole x channel x depth cases and hashes every output; `--features
+phase-timing` adds the time per phase and the `exp` counts, and `remove_bench` takes `--size`,
+`--mode`, `--reps`, `--hash` and `--json` too. The manual workflow `remove-ab.yml` builds two
+revisions, runs them A B B A at 1, 2, 4 and the default thread count, and fails if any output hash differs.
+
 ## Test corpora
 
 Real files are our best oracles, but they are large binaries, so they never go into this

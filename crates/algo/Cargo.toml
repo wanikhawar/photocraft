@@ -9,6 +9,10 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Per-phase timers and `exp` counters in the non-local completion, for `examples/bench_nonlocal.rs`.
+phase-timing = []
+
 [dependencies]
 photocraft-geom = { workspace = true }
 photocraft-color = { workspace = true }

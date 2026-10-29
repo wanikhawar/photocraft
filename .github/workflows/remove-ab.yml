@@ -1,0 +1,159 @@
+name: Remove Tool A/B
+
+# Compares two revisions of the Remove Tool's completion (`photocraft_algo::remove::remove_with`) with
+# `crates/algo/examples/bench_nonlocal.rs`: timing, peak memory, and the hash of every output. The
+# outputs must be bit-for-bit identical between the revisions and between thread counts, so a speed-up
+# that changes a single pixel fails the run. Manual only; it never runs on a pull request.
+#
+# Both revisions are built with the same toolchain into separate target directories and run one after
+# the other as A B B A (before, after, after, before) for RAYON_NUM_THREADS = 1, 2, 4 and the default,
+# so drift of the shared runner hits both sides alike. One more pass of each revision is built with
+# `--features phase-timing` for the time per phase and the `exp` counts.
+#
+# The "before" revision must itself contain the bench_nonlocal example (and the `phase-timing` feature
+# for the phase table; without it that pass is skipped). The usual use: `base_rev` = the commit that
+# adds the harness, `head_rev` = the commit with the optimisation on top of it.
+#
+# The table goes to the job summary; every run's JSON, `/usr/bin/time -v` output and log are uploaded as
+# the `remove-ab` artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_rev:
+        description: "Git revision of the 'before' build (a commit that contains bench_nonlocal)"
+        required: true
+        type: string
+      head_rev:
+        description: "Git revision of the 'after' build (empty: the revision this workflow runs on)"
+        required: false
+        default: ""
+        type: string
+      reps:
+        description: "Timed runs per case, inside each invocation"
+        required: false
+        default: "5"
+        type: string
+      size:
+        description: "Image size WxH (6000x4000 is 24 MP, 7360x4912 is 36 MP)"
+        required: false
+        default: "6000x4000"
+        type: string
+      cases:
+        description: "Only cases containing one of these comma-separated substrings (empty: the core set)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ab:
+    name: before / after
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out both revisions
+        env:
+          BASE_REV: ${{ inputs.base_rev }}
+          HEAD_REV: ${{ inputs.head_rev }}
+        run: |
+          set -euo pipefail
+          base=$(git rev-parse --verify "${BASE_REV}^{commit}")
+          head=$(git rev-parse --verify "${HEAD_REV:-$GITHUB_SHA}^{commit}")
+          git worktree add --detach ab/base "$base"
+          git worktree add --detach ab/head "$head"
+          {
+            echo "BASE_SHA=$base"
+            echo "HEAD_SHA=$head"
+          } >> "$GITHUB_ENV"
+          git log --oneline -1 "$base"
+          git log --oneline -1 "$head"
+          test -f ab/base/crates/algo/examples/bench_nonlocal.rs \
+            || { echo "::error::base_rev has no bench_nonlocal example (use the commit that adds it)"; exit 1; }
+          test -f ab/head/crates/algo/examples/bench_nonlocal.rs \
+            || { echo "::error::head_rev has no bench_nonlocal example"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            ab/base -> ab/target-base
+            ab/head -> ab/target-head
+          key: remove-ab
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build both revisions
+        run: |
+          set -euo pipefail
+          mkdir -p bin results
+          for rev in base head; do
+            (
+              cd "ab/$rev"
+              export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/ab/target-$rev"
+              cargo build --release -p photocraft-algo --example bench_nonlocal
+              cp "$CARGO_TARGET_DIR/release/examples/bench_nonlocal" "$GITHUB_WORKSPACE/bin/$rev-plain"
+              if cargo build --release -p photocraft-algo --example bench_nonlocal --features phase-timing; then
+                cp "$CARGO_TARGET_DIR/release/examples/bench_nonlocal" "$GITHUB_WORKSPACE/bin/$rev-phase"
+              else
+                echo "::warning::$rev has no phase-timing build; its phase pass is skipped"
+              fi
+            )
+          done
+          ls -l bin
+
+      - name: Run A B B A for each thread count
+        env:
+          REPS: ${{ inputs.reps }}
+          SIZE: ${{ inputs.size }}
+          CASES: ${{ inputs.cases }}
+        run: |
+          set -euo pipefail
+          nproc
+          extra=()
+          if [ -n "$CASES" ]; then extra+=(--case "$CASES"); fi
+          # run <kind> <threads> <seq> <rev>: results/<kind>_t<threads>_<seq>_<rev>.{json,time,log}
+          run() {
+            local kind=$1 threads=$2 seq=$3 rev=$4
+            local tag="${kind}_t${threads}_${seq}_${rev}"
+            [ -x "bin/$rev-$kind" ] || return 0
+            echo "::group::$tag"
+            local envs=()
+            if [ "$threads" != "default" ]; then envs+=("RAYON_NUM_THREADS=$threads"); fi
+            env "${envs[@]}" /usr/bin/time -v -o "results/$tag.time" \
+              "bin/$rev-$kind" --size "$SIZE" --reps "$REPS" --hash --json "results/$tag.json" "${extra[@]}" \
+              2>&1 | tee "results/$tag.log"
+            echo "::endgroup::"
+          }
+          for threads in 1 2 4 default; do
+            run plain "$threads" 1 base
+            run plain "$threads" 2 head
+            run plain "$threads" 3 head
+            run plain "$threads" 4 base
+          done
+          # One extra pass of each side with the phase timers.
+          run phase default 1 base
+          run phase default 2 head
+          run phase default 3 head
+          run phase default 4 base
+
+      - name: Compare
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/remove_ab_report.py results "$BASE_SHA" "$HEAD_SHA" | tee results/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: remove-ab
+          path: results

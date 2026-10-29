@@ -26,7 +26,10 @@
 //! `w × h` hole mask. Deterministic for a seed, whatever the thread count.
 
 use crate::inpaint::Rng;
+use phase_timing::Phase;
 use photocraft_raster::{Cancelled, Interrupt};
+
+pub mod phase_timing;
 
 /// Below this many grid cells a level runs single-threaded (thread hand-off costs more than it saves).
 #[cfg(not(target_arch = "wasm32"))]
@@ -251,6 +254,7 @@ impl Solver<'_> {
 
     /// One PatchMatch pass over the targets, in parallel row bands (propagation stays in a band).
     fn patchmatch(&self, nnf: &mut [(i32, i32)], cost: &mut [f32], pass: usize, seed: u64, radius: i32) {
+        let _t = phase_timing::timer(Phase::PatchMatch);
         const BAND: usize = 16;
         let w = self.w;
         let reverse = pass % 2 == 1;
@@ -316,6 +320,7 @@ impl Solver<'_> {
 
     /// Refresh every target's distance to its current match (hole cells change between iterations).
     fn refresh_costs(&self, nnf: &[(i32, i32)], cost: &mut [f32]) {
+        let _t = phase_timing::timer(Phase::RefreshCosts);
         let one = |(i, c): (usize, &mut f32)| {
             *c = if self.targets[i] { self.dist(((i % self.w) as i32, (i / self.w) as i32), nnf[i], f32::INFINITY, None) } else { f32::INFINITY };
         };
@@ -380,6 +385,7 @@ impl Solver<'_> {
     /// all weights equal, for a field fresh from the coarser level whose costs mean nothing yet).
     /// Returns the mean absolute change of the colour channels.
     fn vote(&mut self, nnf: &[(i32, i32)], cost: &[f32], uniform: bool) -> f32 {
+        let _t = phase_timing::timer(Phase::Vote);
         let mut cs: Vec<f32> = cost.iter().zip(&self.targets).filter(|(c, t)| **t && c.is_finite()).map(|(c, _)| *c).collect();
         // σ² from the 75th percentile of the match costs, as Wexler et al. and the paper.
         let sigma2 = if cs.is_empty() {
@@ -393,13 +399,20 @@ impl Solver<'_> {
         let new = self.per_hole_cell(|x, y| {
             let mut v = vec![0.0f32; cha];
             let mut wsum = 0.0f32;
+            let mut exps = 0u64;
             self.sources(x, y, nnf, cost, |si, c| {
-                let wt = if uniform { 1.0 } else { (-c / (2.0 * sigma2)).exp().max(1e-8) };
+                let wt = if uniform {
+                    1.0
+                } else {
+                    exps += 1;
+                    (-c / (2.0 * sigma2)).exp().max(1e-8)
+                };
                 for (o, s) in v.iter_mut().zip(&self.img[si * cha..(si + 1) * cha]) {
                     *o += s * wt;
                 }
                 wsum += wt;
             });
+            phase_timing::count_vote_exps(exps);
             (wsum > 0.0).then(|| {
                 v.iter_mut().for_each(|o| *o /= wsum);
                 v
@@ -663,6 +676,7 @@ impl Solver<'_> {
     /// Each known patch centre next to the layer gets a match by its known cells; each layer cell
     /// is then the weighted vote of those matches. Leaves those matches in `nnf` (`has` marks them).
     fn onion_peel(&mut self, nnf: &mut [(i32, i32)], has: &mut [bool], seed: u64) -> Result<(), Cancelled> {
+        let _t = phase_timing::timer(Phase::OnionPeel);
         let (w, h, r, cha) = (self.w, self.h, self.r, self.cha);
         let mut known: Vec<bool> = self.hole.iter().map(|m| !*m).collect();
         // The cells still unknown, and per layer the known centres found (lists, so a layer costs
@@ -760,6 +774,7 @@ impl Solver<'_> {
                 v.max(1e-6)
             };
             let mut values = Vec::with_capacity(layer.len());
+            let mut exps = 0u64;
             for &i in &layer {
                 let (x, y) = ((i % w) as i32, (i / w) as i32);
                 let mut v = vec![0.0f32; cha];
@@ -776,6 +791,7 @@ impl Solver<'_> {
                             continue;
                         }
                         let si = sy as usize * w + sx as usize;
+                        exps += 1;
                         let wt = (-layer_cost[ci] / (2.0 * sigma2)).exp().max(1e-8);
                         for (o, s) in v.iter_mut().zip(&self.img[si * cha..(si + 1) * cha]) {
                             *o += s * wt;
@@ -788,6 +804,7 @@ impl Solver<'_> {
                     values.push((i, v));
                 }
             }
+            phase_timing::count_onion_exps(exps);
             for &(ci, _, _) in &found {
                 layer_cost[ci] = f32::INFINITY;
             }
@@ -919,6 +936,7 @@ pub fn complete_with(w: usize, h: usize, ch: usize, img: &[f32], hole: &[bool], 
         }
         if li == 0 {
             s.refresh_costs(&nnf, &mut cost);
+            let _t = phase_timing::timer(Phase::Final);
             let copied = s.copy_best(&nnf, &cost);
             ctl.check()?;
             s.blend_seams(&copied, k);
