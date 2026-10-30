@@ -1,0 +1,31 @@
+name: Measure geometry scratch
+on:
+  push:
+    branches: ["measure/geometry-20261030"]
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: 0
+      RAYON_NUM_THREADS: 2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - name: Benchmark before and after
+        run: |
+          set -e
+          cp crates/engine/src/cmd/analysis_cmds.rs /tmp/analysis-fixed.rs
+          git show HEAD~2:crates/engine/src/cmd/analysis_cmds.rs > crates/engine/src/cmd/analysis_cmds.rs
+          cargo build --release --locked -p photocraft-engine --example bench_geometry_measure
+          echo 'BASELINE'
+          for i in 1 2 3; do /usr/bin/time -f 'peak_kib=%M elapsed_seconds=%e' target/release/examples/bench_geometry_measure; done
+          cp /tmp/analysis-fixed.rs crates/engine/src/cmd/analysis_cmds.rs
+          cargo build --release --locked -p photocraft-engine --example bench_geometry_measure
+          echo 'FIXED'
+          for i in 1 2 3; do /usr/bin/time -f 'peak_kib=%M elapsed_seconds=%e' target/release/examples/bench_geometry_measure; done
