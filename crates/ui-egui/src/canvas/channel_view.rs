@@ -150,6 +150,9 @@ fn proxy_matches(doc: &Document) -> bool {
     // A stack, not recursion: groups can nest deeply.
     let mut stack: Vec<&photocraft_doc::Layer> = doc.layers.iter().collect();
     while let Some(l) = stack.pop() {
+        if !l.visible {
+            continue;
+        }
         if photocraft_compose::masks::has_feather(l) {
             return false;
         }

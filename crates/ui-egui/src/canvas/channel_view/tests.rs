@@ -530,6 +530,13 @@ fn feathered_masks_keep_the_full_resolution_composite() {
     inner.mask = Some(mask);
     doc.layers.push(Layer::group("group", vec![inner]));
     assert!(!proxy_matches(&doc));
+    doc.layers.last_mut().unwrap().visible = false;
+    assert!(proxy_matches(&doc), "hidden group and its feathered child do not affect the composite");
+    doc.layers.last_mut().unwrap().visible = true;
+    if let LayerContent::Group(group) = &mut doc.layers.last_mut().unwrap().content {
+        group.children[0].visible = false;
+    }
+    assert!(proxy_matches(&doc), "hidden feathered child does not affect the composite");
 }
 
 /// A pattern fill's tiles keep their size on a proxy, so it would sample other pattern pixels:
