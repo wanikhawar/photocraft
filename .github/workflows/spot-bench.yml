@@ -1,0 +1,54 @@
+# Scratch benchmark for #10249 (fork only, never merged): spot-ink thumbnail, PSD export and
+# canvas overlay timings, before (merge base) vs after (this branch), release, 24 MP.
+name: spot-bench
+on:
+  push:
+    branches: [bench/spot-ink-thumbnail]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      RAYON_NUM_THREADS: "4"
+      BEFORE: 0379569d00341f0c2bef26f2d928db468b0f613f
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install Linux build dependencies
+        uses: storytold/craft-common-actions/actions/install-apt-packages@main
+        with:
+          packages: >-
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+            libgtk-3-dev
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Prepare before and after trees
+        run: |
+          git worktree add ../before "$BEFORE"
+          bench-spot/apply.sh ../before 0
+          bench-spot/apply.sh . 1
+      - name: Build both
+        run: |
+          for t in ../before .; do
+            (cd "$t" && cargo test --release -p photocraft-io --test it --no-run && cargo test --release -p photocraft-ui-egui --lib --no-run)
+          done
+      - name: Run (alternating, two rounds)
+        run: |
+          set -o pipefail
+          for round in 1 2; do
+            for t in before after; do
+              dir=$([ $t = before ] && echo ../before || echo .)
+              (cd "$dir" && cargo test --release -p photocraft-io --test it spot_bench -- --ignored --nocapture --test-threads=1 \
+                && cargo test --release -p photocraft-ui-egui --lib spot_bench -- --ignored --nocapture --test-threads=1) \
+                | grep '^BENCH' | sed "s/^BENCH/$t r$round/" | tee -a bench.txt
+            done
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: spot-bench
+          path: bench.txt
