@@ -1,0 +1,35 @@
+# Scratch benchmark for #10249 (fork only, never merged): where the canvas overlay's first draw
+# spends its time, release, 24 MP.
+name: spot-bench
+on:
+  push:
+    branches: [bench/spot-overlay-breakdown]
+permissions:
+  contents: read
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      RAYON_NUM_THREADS: "4"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        uses: storytold/craft-common-actions/actions/install-apt-packages@main
+        with:
+          packages: >-
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+            libgtk-3-dev
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Build and run
+        run: |
+          set -o pipefail
+          { cat bench-spot/ui_head.rs; echo; cat bench-spot/gen.rs; } >> crates/ui-egui/src/canvas/channel_view/tests.rs
+          cargo test --release -p photocraft-ui-egui --lib spot_bench_breakdown -- --ignored --nocapture --test-threads=1 | grep '^BENCH' | tee bench.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: spot-bench
+          path: bench.txt
