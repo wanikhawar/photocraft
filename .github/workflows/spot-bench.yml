@@ -3,7 +3,7 @@
 name: spot-bench
 on:
   push:
-    branches: [bench/spot-ink-thumbnail]
+    branches: [bench/spot-overlay-proxy]
   workflow_dispatch:
 permissions:
   contents: read
@@ -14,6 +14,7 @@ jobs:
     env:
       RAYON_NUM_THREADS: "4"
       BEFORE: 0379569d00341f0c2bef26f2d928db468b0f613f
+      PR: 1dbf4b3e3
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -30,18 +31,20 @@ jobs:
         run: |
           git worktree add ../before "$BEFORE"
           bench-spot/apply.sh ../before 0
+          git worktree add ../pr "$PR"
+          bench-spot/apply.sh ../pr 1
           bench-spot/apply.sh . 1
       - name: Build both
         run: |
-          for t in ../before .; do
+          for t in ../before ../pr .; do
             (cd "$t" && cargo test --release -p photocraft-io --test it --no-run && cargo test --release -p photocraft-ui-egui --lib --no-run)
           done
       - name: Run (alternating, two rounds)
         run: |
           set -o pipefail
           for round in 1 2; do
-            for t in before after; do
-              dir=$([ $t = before ] && echo ../before || echo .)
+            for t in before pr after; do
+              dir=$(case $t in before) echo ../before;; pr) echo ../pr;; *) echo .;; esac)
               (cd "$dir" && cargo test --release -p photocraft-io --test it spot_bench -- --ignored --nocapture --test-threads=1 \
                 && cargo test --release -p photocraft-ui-egui --lib spot_bench -- --ignored --nocapture --test-threads=1) \
                 | grep '^BENCH' | sed "s/^BENCH/$t r$round/" | tee -a bench.txt
