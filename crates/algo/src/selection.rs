@@ -988,11 +988,6 @@ impl ColorMatcher {
                 opaque_or_semi.push(c);
             }
         }
-        opaque_or_semi.sort_unstable_by(|a, b| {
-            a[0].total_cmp(&b[0]).then_with(|| a[1].total_cmp(&b[1])).then_with(|| a[2].total_cmp(&b[2])).then_with(|| a[3].total_cmp(&b[3]))
-        });
-        opaque_or_semi.dedup_by(|a, b| a == b);
-
         Self { has_transparent, tree: ColorBvh::build(opaque_or_semi), tol: tol.max(0.0) }
     }
 
