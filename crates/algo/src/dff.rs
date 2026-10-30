@@ -915,6 +915,34 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore]
+    fn dff_benchmark_scratch() {
+        use std::time::Instant;
+        let w: usize = std::env::var("DFF_WIDTH").unwrap().parse().unwrap();
+        let h: usize = std::env::var("DFF_HEIGHT").unwrap().parse().unwrap();
+        let mode = std::env::var("DFF_MODE").unwrap();
+        let k = 2usize;
+        let (dw, dh) = (w.div_ceil(k), h.div_ceil(k));
+        let a: Vec<f32> = (0..dw * dh).map(|i| (i % 1009) as f32 / 1009.0 - 0.5).collect();
+        let b: Vec<f32> = (0..dw * dh).map(|i| (i % 1013) as f32 / 1013.0 - 0.5).collect();
+        let guide: Vec<f32> = (0..w * h).map(|i| (i % 1021) as f32 / 1021.0).collect();
+        for iteration in 0..4 {
+            let start = Instant::now();
+            let depth = if mode == "baseline" {
+                let au = upsample_bilinear(&a, dw, dh, w, h, k);
+                let bu = upsample_bilinear(&b, dw, dh, w, h, k);
+                (0..w * h).map(|i| au[i] * guide[i] + bu[i]).collect::<Vec<_>>()
+            } else {
+                upsample_guided(&a, &b, &guide, (dw, dh), (w, h), k)
+            };
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            let fingerprint = depth.iter().fold(0u64, |sum, v| sum.wrapping_mul(31).wrapping_add(v.to_bits() as u64));
+            println!("DFF_BENCH mode={mode} size={w}x{h} iteration={iteration} ms={elapsed:.3} fingerprint={fingerprint}");
+            std::hint::black_box(depth);
+        }
+    }
+
     fn lcg(seed: &mut u64) -> f32 {
         *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         ((*seed >> 33) % 10000) as f32 / 10000.0

@@ -556,7 +556,15 @@ jobs:
       - name: Compare exact outputs and release timings on 36 MP
         run: |
           set -o pipefail
-          cargo test --release -p photocraft-algo --lib gray8_combining_release_comparison -- --ignored --nocapture | tee selection-combining-perf.txt
+          cargo test --release -p photocraft-algo --lib fused_guided_upsampling_matches_separate_planes
+          cargo test --release -p photocraft-algo --lib dff_benchmark_scratch --no-run
+          for dimensions in 6000x4000 6000x6000; do
+            export DFF_WIDTH="${dimensions%x*}" DFF_HEIGHT="${dimensions#*x}"
+            for mode in baseline fused; do
+              export DFF_MODE="$mode"
+              /usr/bin/time -v cargo test --release -p photocraft-algo --lib dff_benchmark_scratch -- --ignored --nocapture 2>&1 | tee -a selection-combining-perf.txt
+            done
+          done
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
