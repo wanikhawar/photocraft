@@ -243,7 +243,9 @@ impl PhotocraftApp {
         for f in files {
             let name = dropped_name(&f);
             if target == DropTarget::Canvas && !crate::preset_files_ui::is_preset_file(&name) {
-                self.drop_places.push_back(DropPlace::File(f));
+                if let Some(st) = self.session.active() {
+                    self.drop_places.push_back((st.doc.id, DropPlace::File(f)));
+                }
                 continue;
             }
             match self.open_dropped_file(&f, &name, slot) {
@@ -311,8 +313,12 @@ impl PhotocraftApp {
     /// by a job: the next one waits until that job has landed and its Free Transform has been
     /// applied (see `jobs_ui::finish_place`).
     pub(crate) fn place_next_dropped(&mut self, ctx: &egui::Context) {
+        let documents = self.session.documents();
+        self.drop_places.retain(|(doc, _)| documents.iter().any(|st| st.doc.id == *doc));
         while self.ui.transform.is_none() && self.jobs.place.is_none() {
-            let Some(next) = self.drop_places.pop_front() else { return };
+            let Some(active) = self.session.active().map(|st| st.doc.id) else { return };
+            let Some(index) = self.drop_places.iter().position(|(doc, _)| *doc == active) else { return };
+            let Some((_, next)) = self.drop_places.remove(index) else { return };
             let (name, placed) = match next {
                 DropPlace::File(f) if f.path().is_absolute() => {
                     (dropped_name(&f), path_text(f.path(), false).and_then(|path| self.run("file.placeEmbedded", serde_json::json!({"path": path}))))

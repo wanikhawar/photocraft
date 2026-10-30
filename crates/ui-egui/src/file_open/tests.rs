@@ -189,8 +189,9 @@ fn web_drops_onto_the_canvas_are_placed_from_their_bytes() {
     at.set(egui::pos2(20.0, 20.0));
     assert_eq!(app.dropped_on_canvas(&ctx, &names), [false, false], "off the canvas: opened");
     let layers = layer_count(&app);
-    app.drop_places.push_back(crate::file_open::DropPlace::Bytes("photo.png".into(), png_bytes(4, 3)));
-    app.drop_places.push_back(crate::file_open::DropPlace::Bytes("bad.png".into(), b"bad".to_vec()));
+    let doc = app.session.active().unwrap().doc.id;
+    app.drop_places.push_back((doc, crate::file_open::DropPlace::Bytes("photo.png".into(), png_bytes(4, 3))));
+    app.drop_places.push_back((doc, crate::file_open::DropPlace::Bytes("bad.png".into(), b"bad".to_vec())));
     app.place_next_dropped(&ctx);
     assert_eq!(layer_count(&app), layers + 1);
     assert_eq!(app.ui.transform.as_ref().and_then(|t| t.made), Some(crate::state::MadeLayer::Place));
@@ -451,6 +452,33 @@ fn layer_count(app: &PhotocraftApp) -> usize {
 
 fn history_steps(app: &PhotocraftApp) -> usize {
     app.session.active().unwrap().history.past_len()
+}
+
+#[test]
+fn queued_drops_wait_for_their_document_and_discard_closed_targets() {
+    let ctx = egui::Context::default();
+    let mut app = app_with_canvas();
+    let first = app.session.active().unwrap().doc.id;
+    app.open_bytes("other.psd", b"x").unwrap();
+    let second = app.session.active().unwrap().doc.id;
+    let layers = layer_count(&app);
+    app.drop_places.push_back((first, DropPlace::Bytes("first.png".into(), png_bytes(2, 2))));
+    app.drop_places.push_back((second, DropPlace::Bytes("second.png".into(), png_bytes(2, 2))));
+    app.place_next_dropped(&ctx);
+    assert_eq!(layer_count(&app), layers + 1);
+    assert_eq!(app.drop_places.len(), 1, "inactive document's drop remains queued");
+    crate::transform_tool::commit(&mut app);
+    assert!(app.session.set_active(0));
+    let first_layers = layer_count(&app);
+    app.place_next_dropped(&ctx);
+    assert_eq!(layer_count(&app), first_layers + 1);
+    crate::transform_tool::commit(&mut app);
+    app.drop_places.push_back((first, DropPlace::Bytes("closed.png".into(), png_bytes(2, 2))));
+    assert!(app.session.close(0).is_some());
+    let second_layers = layer_count(&app);
+    app.place_next_dropped(&ctx);
+    assert_eq!(layer_count(&app), second_layers);
+    assert!(app.drop_places.is_empty());
 }
 
 /// As in the reference app, files dropped on the canvas are placed one at a time, each in Free
