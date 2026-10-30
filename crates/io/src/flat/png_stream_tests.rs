@@ -293,6 +293,21 @@ fn interlaced_and_animated_files_do_not_stream_and_open_as_before() {
 }
 
 #[test]
+fn orientation_before_image_data_skips_decoding_rows() {
+    // Invalid compressed data would fail if the streaming path tried to read a row.
+    let invalid = chunk(b"IDAT", b"not a zlib stream");
+    let rotated = Png::new(300, 20, 2, 8).before(exif(6)).assemble(&invalid);
+    assert!(streamed(&rotated).unwrap().is_none());
+    let upright = Png::new(300, 20, 2, 8).before(exif(1)).assemble(&invalid);
+    assert!(streamed(&upright).is_err());
+    let late = Png::new(300, 20, 2, 8).after(exif(6)).assemble(&invalid);
+    assert!(streamed(&late).is_err());
+    let valid = Png::new(300, 20, 2, 8).before(exif(6)).bytes();
+    assert_same(&forced(&valid).unwrap(), &whole(&valid).unwrap(), "early orientation");
+    assert_streams(&Png::new(300, 20, 2, 8).before(exif(1)).bytes(), "early upright orientation");
+}
+
+#[test]
 fn an_orientation_after_the_image_data_falls_back_to_the_upright_whole_image() {
     for o in [3u8, 6, 8] {
         let bytes = Png::new(300, 20, 2, 8).after(exif(o)).bytes();

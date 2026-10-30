@@ -379,6 +379,9 @@ fn import_png_streamed(name: &str, bytes: &[u8], ctl: &Interrupt, min_bytes: u64
     let state = std::cell::RefCell::new(None::<Stream>);
     let busy = || IoError::Unsupported("the PNG reader re-entered itself".into());
     let mut begin = |header: &codecs::PngHeader| -> Result<bool, IoError> {
+        if header.orientation != 1 {
+            return Ok(false);
+        }
         // Decoded size, from the header; a size that overflows is certainly large enough.
         let bytes = u64::from(header.width)
             .checked_mul(u64::from(header.height))

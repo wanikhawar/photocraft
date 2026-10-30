@@ -151,6 +151,8 @@ pub struct PngHeader {
     pub height: u32,
     pub layout: ChannelLayout,
     pub sample: SampleType,
+    /// Orientation known before image data; later eXIf metadata may change it in `PngExtras`.
+    pub orientation: u16,
 }
 
 /// Where [`decode_rows`] sends rows: the index of the first, then whole rows.
@@ -185,7 +187,8 @@ pub(crate) fn decode_rows<E: From<CodecError>>(
     // The checks `decode` makes of the buffer it allocates for the whole image.
     reader.output_buffer_size().ok_or_else(|| err("image too large"))?;
     let line = reader.output_line_size(width).ok_or_else(|| err("image too large"))?;
-    if !begin(&PngHeader { width, height, layout, sample })? {
+    let orientation = reader.info().exif_metadata.as_deref().map_or(1, crate::orientation::exif_orientation);
+    if !begin(&PngHeader { width, height, layout, sample, orientation })? {
         return Ok(None);
     }
     let mut buf = alloc_zeroed::<u8>(line.checked_mul(ROW_GROUP.min(height) as usize).ok_or_else(|| err("image too large"))?)?;
