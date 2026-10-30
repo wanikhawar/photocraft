@@ -31,6 +31,8 @@ jobs:
           mkdir -p corpus/psd-tools
           curl -fsSL -A Photocraft-dev -o corpus/psd-tools/cmyk-alpha-spot.psd \
             https://raw.githubusercontent.com/psd-tools/psd-tools/96eb134c17b2c65edf4c4151c0f00b802ada86c2/tests/psd_files/cmyk-alpha-spot.psd
-          sha256sum corpus/psd-tools/cmyk-alpha-spot.psd
+          curl -fsSL -A Photocraft-dev -o corpus/psd-tools/cmyk-spot.psd \
+            https://raw.githubusercontent.com/psd-tools/psd-tools/96eb134c17b2c65edf4c4151c0f00b802ada86c2/tests/psd_files/cmyk-spot.psd
+          sha256sum corpus/psd-tools/*.psd
       - name: Probe
         run: cargo test -p photocraft-ui-egui --test spot_ink_probe -- --nocapture --test-threads=1

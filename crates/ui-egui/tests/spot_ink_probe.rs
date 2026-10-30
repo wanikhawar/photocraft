@@ -109,15 +109,17 @@ fn corpus(name: &str) -> Option<Vec<u8>> {
     }
 }
 
-#[test]
-fn p4_photoshop_file() {
-    println!("\n=== P4 Photoshop 24.7 file cmyk-alpha-spot.psd (Photoshop's thumbnail shows LIGHT TEAL ~ (98,124,123) at its darkest)");
-    let Some(bytes) = corpus("cmyk-alpha-spot.psd") else { return };
+fn probe_file(name: &str, probes: &[(i32, i32)]) {
+    let Some(bytes) = corpus(name) else { return };
     let mut s = photocraft_engine::Session::new();
-    photocraft_engine::file_cmds::open_bytes_as(&mut s, "cmyk-alpha-spot.psd", &bytes, None, None).unwrap();
+    let opened = photocraft_engine::file_cmds::open_bytes_as(&mut s, name, &bytes, None, None).unwrap();
+    println!("open result: {opened}");
+    if let Ok(r) = photocraft_io::import(name, &bytes) {
+        println!("io warnings: {:?}", r.warnings);
+    }
     let st = s.active().unwrap();
     let doc = &st.doc;
-    println!("mode {:?} depth {:?} size {:?}x{:?}", doc.mode, doc.pixel_format().sample, doc.bounds().width(), doc.bounds().height());
+    println!("mode {:?} depth {:?} size {}x{} layers {}", doc.mode, doc.pixel_format().sample, doc.bounds().width(), doc.bounds().height(), doc.layers.len());
     for (i, ch) in doc.channels.iter().enumerate() {
         println!(
             "channel {i}: {:?} spot {:?} color {:?} opacity {} indicates {:?} -> ink to_rgb {:?}  visible-after-open {}",
@@ -126,33 +128,64 @@ fn p4_photoshop_file() {
             ch.color,
             ch.opacity,
             ch.indicates,
-            ch.spot.map(|(c, _)| c.to_rgb()),
+            ch.spot.map(|(c, _)| c.to_rgb().map(|v| (v * 255.0).round())),
             st.channel_view.alpha_shown(i)
         );
     }
     println!("channel_view after open: {:?}  is_plain {}", st.channel_view, st.channel_view.is_plain(doc));
-    // The spot plane's ink area (bbox from the merged image data: x 1348..2279, y 1491..1628).
-    let Some(si) = doc.channels.iter().position(|c| c.spot.is_some()) else { return };
-    let area = Rect::from_xywh(1348, 1491, 932, 138);
-    let mut vals = Vec::new();
-    doc.channels[si].surface.read_region_into(area, &mut vals);
-    let n = doc.channels[si].surface.channels();
-    let (k, vmax) = vals.chunks_exact(n).map(|v| v[0]).enumerate().fold((0, f32::MIN), |b, (k, v)| if v > b.1 { (k, v) } else { b });
-    let (kmin, vmin) = vals.chunks_exact(n).map(|v| v[0]).enumerate().fold((0, f32::MAX), |b, (k, v)| if v < b.1 { (k, v) } else { b });
-    let at = |k: usize| (area.x0 + (k as u32 % area.width()) as i32, area.y0 + (k as u32 / area.width()) as i32);
-    let (x, y) = at(k);
-    println!("spot plane value range in its ink area: max {vmax} at {:?}, min {vmin} at {:?}  (PhotoCraft stores 1 = solid ink)", (x, y), at(kmin));
-    let one = Rect::from_xywh(x, y, 1, 1);
-    let flat = photocraft_compose::render(doc, one);
-    println!("composite (flatten) at the ink pixel: {}", rgb8(flat.px[0]));
-    let shown = render(doc, &st.channel_view, one, 1, Look::default(), None);
-    println!("canvas overlay with the view as opened: {}", shown.map(|v| px(v[0])).unwrap_or("None (plain composite: no spot shown)".into()));
-    let mut v = st.channel_view.clone();
-    v.set_alpha_visible(si, true);
-    let shown = render(doc, &v, one, 1, Look::default(), None);
-    println!("canvas overlay with the spot eye on: {}", shown.map(|v| px(v[0])).unwrap_or("None".into()));
+    let mut eyes = st.channel_view.clone();
+    for (i, ch) in doc.channels.iter().enumerate() {
+        if ch.spot.is_some() {
+            eyes.set_alpha_visible(i, true);
+        }
+    }
+    // Probe points: the given ones plus each spot channel's most-inked pixel.
+    let mut points: Vec<(String, i32, i32)> = probes.iter().map(|&(x, y)| ("given".to_string(), x, y)).collect();
+    let b = doc.bounds();
+    for ch in doc.channels.iter().filter(|c| c.spot.is_some()) {
+        let mut vals = Vec::new();
+        ch.surface.read_region_into(b, &mut vals);
+        let n = ch.surface.channels();
+        let (k, vmax) = vals.chunks_exact(n).map(|v| v[0]).enumerate().fold((0, f32::MIN), |acc, (k, v)| if v > acc.1 { (k, v) } else { acc });
+        let (x, y) = (b.x0 + (k as u32 % b.width()) as i32, b.y0 + (k as u32 / b.width()) as i32);
+        points.push((format!("max of {:?} ({vmax})", ch.name), x, y));
+    }
     let thumb = photocraft_compose::thumbnail_buffer(doc, 160);
     let (tw, th) = (thumb.rect.width(), thumb.rect.height());
-    let (tx, ty) = ((x as u32 * tw / 3300) as i32, (y as u32 * th / 5100) as i32);
-    println!("PhotoCraft thumbnail_buffer {tw}x{th} at ({tx},{ty}): {}", rgb8(thumb.get(thumb.rect.x0 + tx, thumb.rect.y0 + ty)));
+    for (label, x, y) in points {
+        let one = Rect::from_xywh(x, y, 1, 1);
+        let vals: Vec<String> = doc
+            .channels
+            .iter()
+            .map(|c| {
+                let mut v = Vec::new();
+                c.surface.read_region_into(one, &mut v);
+                format!("{:.3}", v.first().copied().unwrap_or(f32::NAN))
+            })
+            .collect();
+        let flat = photocraft_compose::render(doc, one);
+        let as_opened = render(doc, &st.channel_view, one, 1, Look::default(), None);
+        let with_eyes = render(doc, &eyes, one, 1, Look::default(), None);
+        let (tx, ty) = ((x as u32 * tw / b.width()) as i32, (y as u32 * th / b.height()) as i32);
+        println!(
+            "@({x},{y}) [{label}] channel values {vals:?}\n    composite {}  overlay as opened {}  overlay with spot eyes on {}  thumbnail {}",
+            rgb8(flat.px[0]),
+            as_opened.map(|v| px(v[0])).unwrap_or("None (plain)".into()),
+            with_eyes.map(|v| px(v[0])).unwrap_or("None (plain)".into()),
+            rgb8(thumb.get(thumb.rect.x0 + tx, thumb.rect.y0 + ty))
+        );
+    }
+}
+
+#[test]
+fn p4_photoshop_file() {
+    println!("\n=== P4 Photoshop 24.7 flat file cmyk-alpha-spot.psd: planes C,M,Y,K,'light teal' spot (solid at 1348,1492), 'Alpha 1' (white at 1441,2571)");
+    println!("Photoshop's own thumbnail shows LIGHT TEAL; merged CMYK there is 255,255,255,255 (no process ink).");
+    probe_file("cmyk-alpha-spot.psd", &[(1348, 1492), (1441, 2571), (100, 100)]);
+}
+
+#[test]
+fn p5_layered_spot_file() {
+    println!("\n=== P5 psd-tools layered CMYK file cmyk-spot.psd with three extra channels");
+    probe_file("cmyk-spot.psd", &[(10, 10)]);
 }
