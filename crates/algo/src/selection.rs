@@ -992,7 +992,7 @@ impl ColorBvh {
     fn matches_node(&self, index: usize, q: &[f32; 4], tol: f32) -> bool {
         match self.nodes.get(index) {
             Some(ColorNode::Leaf { start, end }) => {
-                self.points.get(*start..*end).is_some_and(|pts| pts.iter().any(|p| (0..4).all(|c| (q[c] - p[c]).abs() <= tol + 1e-6)))
+                self.points.get(*start..*end).is_some_and(|pts| pts.iter().any(|p| (0..4).all(|c| (q[c] - p[c]).abs() <= tol)))
             }
             Some(ColorNode::Branch { min, max, left, right }) => {
                 for c in 0..4 {
@@ -1003,7 +1003,7 @@ impl ColorBvh {
                     } else {
                         0.0
                     };
-                    if d > tol + 1e-6 {
+                    if d > tol {
                         return false;
                     }
                 }
@@ -1057,11 +1057,6 @@ impl ColorMatcher {
             }
         }
         drop(seen);
-        opaque_or_semi.sort_unstable_by(|a, b| {
-            a[0].total_cmp(&b[0]).then_with(|| a[1].total_cmp(&b[1])).then_with(|| a[2].total_cmp(&b[2])).then_with(|| a[3].total_cmp(&b[3]))
-        });
-        opaque_or_semi.dedup_by(|a, b| a == b);
-
         Ok(Self { has_transparent, tree: ColorBvh::build(opaque_or_semi)?, tol: tol.max(0.0) })
     }
 

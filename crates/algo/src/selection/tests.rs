@@ -44,6 +44,19 @@ fn color_matcher_preserves_distinct_faint_32f_colors_at_zero_tolerance() {
 }
 
 #[test]
+fn color_matcher_zero_tolerance_excludes_nearby_float_colors() {
+    let color = [0.5, 0.2, 0.3, 1.0];
+    let near = [0.500_000_5, 0.2, 0.3, 1.0];
+    let leaf = ColorMatcher::new([color], 0.0).unwrap();
+    assert!(leaf.matches(color));
+    assert!(!leaf.matches(near));
+    let colors = std::iter::once(color).chain((0..20).map(|i| [0.7 + i as f32 * 0.01, 0.2, 0.3, 1.0]));
+    let tree = ColorMatcher::new(colors, 0.0).unwrap();
+    assert!(tree.matches(color));
+    assert!(!tree.matches(near));
+}
+
+#[test]
 fn color_matcher_coalesces_exact_repeated_colors() {
     let red = [1.0, 0.0, 0.0, 1.0];
     let transparent = [0.0, 0.0, 0.0, 0.0];
@@ -86,7 +99,7 @@ fn color_matcher_tree_matches_brute_force() {
     for i in 0..2000 {
         let t = i as f32 / 1999.0;
         let q = [(t * 3.0).fract(), (t * 5.0).fract(), (t * 11.0).fract(), if i % 7 == 0 { 0.0 } else { 1.0 }];
-        let want = selected.iter().any(|p| (q[3] == 0.0 && p[3] == 0.0) || (0..4).all(|c| (q[c] - p[c]).abs() <= tol + 1e-6));
+        let want = selected.iter().any(|p| (q[3] == 0.0 && p[3] == 0.0) || (0..4).all(|c| (q[c] - p[c]).abs() <= tol));
         assert_eq!(matcher.matches(q), want, "{q:?}");
     }
 }
