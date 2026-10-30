@@ -117,6 +117,35 @@ pub fn upsample_bilinear(g: &[f32], dw: usize, dh: usize, w: usize, h: usize, k:
     out
 }
 
+// Evaluate the guided filter as the coefficients are sampled, without full-size coefficient planes.
+fn upsample_guided(a: &[f32], b: &[f32], guide: &[f32], (dw, dh): (usize, usize), (w, h): (usize, usize), k: usize) -> Vec<f32> {
+    let mut out = vec![0.0; w * h];
+    if dw == 0 || dh == 0 {
+        return out;
+    }
+    let inv = 1.0 / k.max(1) as f32;
+    par_rows(&mut out, w, 1, |y, row| {
+        let fy = ((y as f32 + 0.5) * inv - 0.5).clamp(0.0, (dh - 1) as f32);
+        let y0 = fy as usize;
+        let y1 = (y0 + 1).min(dh - 1);
+        let ty = fy - y0 as f32;
+        let sample = |plane: &[f32], x0: usize, x1: usize, tx: f32| {
+            let (r0, r1) = (&plane[y0 * dw..y0 * dw + dw], &plane[y1 * dw..y1 * dw + dw]);
+            let top = r0[x0] + (r0[x1] - r0[x0]) * tx;
+            let bot = r1[x0] + (r1[x1] - r1[x0]) * tx;
+            top + (bot - top) * ty
+        };
+        for (x, o) in row.iter_mut().enumerate() {
+            let fx = ((x as f32 + 0.5) * inv - 0.5).clamp(0.0, (dw - 1) as f32);
+            let x0 = fx as usize;
+            let x1 = (x0 + 1).min(dw - 1);
+            let tx = fx - x0 as f32;
+            *o = sample(a, x0, x1, tx) * guide[y * w + x] + sample(b, x0, x1, tx);
+        }
+    });
+    out
+}
+
 /// Box means over a `(2r + 1)²` window clamped to the plane (partial windows at the borders use
 /// their own count): a horizontal moving sum per row in parallel, then a vertical moving sum
 /// carried down the rows as one accumulator row.
@@ -857,9 +886,7 @@ pub fn depth_from_focus(luma: &[&[f32]], guide: &[f32], w: usize, h: usize, p: &
         up.filter(&depth_w)
     } else {
         let (a, b) = up.coeffs(&depth_w);
-        let a = upsample_bilinear(&a, dw, dh, w, h, k);
-        let b = upsample_bilinear(&b, dw, dh, w, h, k);
-        (0..w * h).map(|i| a[i] * guide[i] + b[i]).collect()
+        upsample_guided(&a, &b, guide, (dw, dh), (w, h), k)
     };
     let depth = depth.into_iter().map(|v| v.clamp(0.0, max_d)).collect();
     let conf = if k == 1 { conf } else { upsample_bilinear(&conf, dw, dh, w, h, k) };
@@ -869,6 +896,24 @@ pub fn depth_from_focus(luma: &[&[f32]], guide: &[f32], w: usize, h: usize, p: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fused_guided_upsampling_matches_separate_planes() {
+        for (w, h) in [(1usize, 1usize), (1, 19), (23, 1), (23, 17), (256, 257)] {
+            for scale in 1..=8 {
+                let k = 1usize << scale;
+                let (dw, dh) = (w.div_ceil(k), h.div_ceil(k));
+                let mut seed = 17;
+                let a: Vec<_> = (0..dw * dh).map(|_| lcg(&mut seed) - 0.5).collect();
+                let b: Vec<_> = (0..dw * dh).map(|_| lcg(&mut seed) - 0.5).collect();
+                let guide: Vec<_> = (0..w * h).map(|_| lcg(&mut seed)).collect();
+                let au = upsample_bilinear(&a, dw, dh, w, h, k);
+                let bu = upsample_bilinear(&b, dw, dh, w, h, k);
+                let expected: Vec<_> = au.iter().zip(&bu).zip(&guide).map(|((a, b), g)| a * g + b).collect();
+                assert_eq!(upsample_guided(&a, &b, &guide, (dw, dh), (w, h), k), expected, "{w}x{h}, scale {scale}");
+            }
+        }
+    }
 
     fn lcg(seed: &mut u64) -> f32 {
         *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
