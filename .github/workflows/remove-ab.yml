@@ -1,0 +1,232 @@
+name: Remove Tool A/B
+
+# Compares two revisions of the Remove Tool's completion (`photocraft_algo::remove::remove_with`) with
+# `crates/algo/examples/bench_nonlocal.rs`: timing, peak memory, and the hash of every output. The
+# outputs must be bit-for-bit identical between the revisions and between thread counts, so a speed-up
+# that changes a single pixel fails the run. Manual, plus a push to the scratch branch `bench/10131-ab`
+# (base = the pushed commit's parent, head = the pushed commit, 24 MP, default threads, 3 reps, six
+# cases); it never runs on a pull request.
+#
+# Job `build` builds both revisions with the same toolchain into separate target directories (plain,
+# and with `--features phase-timing` for the time per phase and the `exp` counts) and uploads the
+# binaries. Job `run` is a matrix with one runner per pass (one per RAYON_NUM_THREADS value, plus a
+# phase pass): each runs its binaries one after the other as A B B A (before, after, after, before),
+# so drift of the shared runner hits both sides alike, and uploads its own artifact, so a slow pass
+# neither holds up the others nor loses their results. Job `compare` merges whatever the passes
+# produced into the report.
+#
+# The "before" revision must itself contain the bench_nonlocal example (and the `phase-timing` feature
+# for the phase table; without it that pass is skipped). The usual use: `base_rev` = the commit that
+# adds the harness, `head_rev` = the commit with the optimisation on top of it.
+#
+# The table goes to the job summary; every run's JSON, `/usr/bin/time -v` output and log are uploaded as
+# the `remove-ab` artifact.
+
+on:
+  push:
+    branches: [bench/10131-ab]
+  workflow_dispatch:
+    inputs:
+      base_rev:
+        description: "Git revision of the 'before' build (a commit that contains bench_nonlocal)"
+        required: true
+        type: string
+      head_rev:
+        description: "Git revision of the 'after' build (empty: the revision this workflow runs on)"
+        required: false
+        default: ""
+        type: string
+      reps:
+        description: "Timed runs per case, inside each invocation"
+        required: false
+        default: "5"
+        type: string
+      size:
+        description: "Image size WxH (6000x4000 is 24 MP, 7360x4912 is 36 MP)"
+        required: false
+        default: "6000x4000"
+        type: string
+      threads:
+        description: "RAYON_NUM_THREADS values to run, space separated ('default' = all cores)"
+        required: false
+        default: "1 2 4 default"
+        type: string
+      cases:
+        description: "Only cases containing one of these comma-separated substrings (empty: the core set)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build both revisions
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      base_sha: ${{ steps.revs.outputs.base }}
+      head_sha: ${{ steps.revs.outputs.head }}
+      passes: ${{ steps.plan.outputs.passes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out both revisions
+        id: revs
+        env:
+          BASE_REV: ${{ inputs.base_rev }}
+          HEAD_REV: ${{ inputs.head_rev }}
+        run: |
+          set -euo pipefail
+          # On a push there are no inputs: the base is the pushed commit's parent.
+          base=$(git rev-parse --verify "${BASE_REV:-$GITHUB_SHA^}^{commit}")
+          head=$(git rev-parse --verify "${HEAD_REV:-$GITHUB_SHA}^{commit}")
+          git worktree add --detach ab/base "$base"
+          git worktree add --detach ab/head "$head"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          git log --oneline -1 "$base"
+          git log --oneline -1 "$head"
+          test -f ab/base/crates/algo/examples/bench_nonlocal.rs \
+            || { echo "::error::base_rev has no bench_nonlocal example (use the commit that adds it)"; exit 1; }
+          test -f ab/head/crates/algo/examples/bench_nonlocal.rs \
+            || { echo "::error::head_rev has no bench_nonlocal example"; exit 1; }
+
+      - name: Plan the passes
+        id: plan
+        env:
+          THREADS: ${{ inputs.threads || 'default' }}
+        run: |
+          set -euo pipefail
+          passes=$(python3 -c 'import json,os; print(json.dumps([{"kind":"plain","threads":t} for t in os.environ["THREADS"].split()] + [{"kind":"phase","threads":"default"}]))')
+          echo "passes=$passes" >> "$GITHUB_OUTPUT"
+          echo "$passes"
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            ab/base -> ab/target-base
+            ab/head -> ab/target-head
+          key: remove-ab
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build both revisions
+        run: |
+          set -euo pipefail
+          mkdir -p bin
+          for rev in base head; do
+            (
+              cd "ab/$rev"
+              export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/ab/target-$rev"
+              cargo build --release -p photocraft-algo --example bench_nonlocal
+              cp "$CARGO_TARGET_DIR/release/examples/bench_nonlocal" "$GITHUB_WORKSPACE/bin/$rev-plain"
+              if cargo build --release -p photocraft-algo --example bench_nonlocal --features phase-timing; then
+                cp "$CARGO_TARGET_DIR/release/examples/bench_nonlocal" "$GITHUB_WORKSPACE/bin/$rev-phase"
+              else
+                echo "::warning::$rev has no phase-timing build; its phase pass is skipped"
+              fi
+            )
+          done
+          ls -l bin
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: remove-ab-bin
+          path: bin
+          retention-days: 3
+
+  run:
+    name: ${{ matrix.pass.kind }} / ${{ matrix.pass.threads }} threads
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        pass: ${{ fromJSON(needs.build.outputs.passes) }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: remove-ab-bin
+          path: bin
+
+      - name: Run A B B A
+        env:
+          KIND: ${{ matrix.pass.kind }}
+          THREADS: ${{ matrix.pass.threads }}
+          REPS: ${{ inputs.reps || '3' }}
+          SIZE: ${{ inputs.size || '6000x4000' }}
+          # On a push (no inputs): six cases that cover the vote and the onion peel at 24 MP.
+          CASES: ${{ github.event_name == 'push' && 'textured/large/ch3/depth8,textured/small/ch3/depth8,flat/large/ch3/depth8,edges/corner/ch3/depth8,textured/large/ch4/depth8,flat/line/ch3/depth8' || inputs.cases }}
+        run: |
+          set -euo pipefail
+          chmod +x bin/*
+          mkdir -p results
+          nproc
+          extra=()
+          if [ -n "$CASES" ]; then extra+=(--case "$CASES"); fi
+          # run <seq> <rev>: results/<kind>_t<threads>_<seq>_<rev>.{json,time,log}
+          run() {
+            local seq=$1 rev=$2
+            local tag="${KIND}_t${THREADS}_${seq}_${rev}"
+            [ -x "bin/$rev-$KIND" ] || return 0
+            echo "::group::$tag"
+            local envs=()
+            if [ "$THREADS" != "default" ]; then envs+=("RAYON_NUM_THREADS=$THREADS"); fi
+            env "${envs[@]}" /usr/bin/time -v -o "results/$tag.time" \
+              "bin/$rev-$KIND" --size "$SIZE" --reps "$REPS" --hash --json "results/$tag.json" "${extra[@]}" \
+              2>&1 | tee "results/$tag.log"
+            echo "::endgroup::"
+          }
+          run 1 base
+          run 2 head
+          run 3 head
+          run 4 base
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: remove-ab-${{ matrix.pass.kind }}-${{ matrix.pass.threads }}
+          path: results
+          retention-days: 14
+
+  compare:
+    name: compare
+    needs: [build, run]
+    if: ${{ always() && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: remove-ab-*-*
+          path: results
+          merge-multiple: true
+
+      - name: Compare
+        env:
+          BASE_SHA: ${{ needs.build.outputs.base_sha }}
+          HEAD_SHA: ${{ needs.build.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          ls results
+          python3 .github/scripts/remove_ab_report.py results "$BASE_SHA" "$HEAD_SHA" | tee results/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: remove-ab
+          path: results
