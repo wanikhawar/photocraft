@@ -1,0 +1,47 @@
+# Scratch-only measurement for #10463; lives on measure/* branches of the fork, never in a PR.
+name: Measure 10463
+
+on:
+  push:
+    branches: ["measure/10463-**"]
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        uses: storytold/craft-common-actions/actions/install-apt-packages@main
+        with:
+          packages: >-
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+            libgtk-3-dev
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Build
+        run: cargo build --release --locked -p photocraft-engine --example measure_10463
+      - name: Runner
+        run: free -m; nproc; git rev-parse HEAD
+      - name: Generate photos
+        run: target/release/examples/measure_10463 gen "$RUNNER_TEMP/photos" 6
+      - name: Merge
+        run: |
+          # Each merge in a fresh process, capped at 12 GiB with no swap (a 16 GB machine's share).
+          run() {
+            sudo systemd-run --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 --uid="$(id -u)" --gid="$(id -g)" \
+              target/release/examples/measure_10463 merge "$RUNNER_TEMP/photos" "$@" || echo "RESULT photos=$1 layout=$2: exited with status $? (killed at the 12 GiB cap if 137)"
+          }
+          for rep in 1 2; do
+            run 3 reposition
+            run 6 reposition
+          done
+          run 3 cylindrical
+          run 6 reposition false
