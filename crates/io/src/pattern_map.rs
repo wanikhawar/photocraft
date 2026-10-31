@@ -12,7 +12,7 @@ use photocraft_geom::Rect;
 use photocraft_psd::patterns::{PatternBudget, PsdPattern, block_has_user_mask, block_key, mode_channels, parse_pattern_block_with, write_pattern_block};
 use photocraft_raster::Surface;
 
-use crate::pixels::{deinterleave, interleave, max_sample, psd_depth, sample_for_depth, zero_sample};
+use crate::pixels::{deinterleave, max_sample, psd_depth, sample_for_depth, try_interleave, zero_sample};
 
 /// Global block keys holding patterns.
 pub const PATTERN_KEYS: [[u8; 4]; 3] = [*b"Patt", *b"Pat2", *b"Pat3"];
@@ -29,25 +29,46 @@ fn psd_mode(m: ColorMode) -> u32 {
 /// A PSD pattern as a document pattern (indexed patterns become RGB through their palette).
 pub fn from_psd(p: &PsdPattern) -> Option<Pattern> {
     let (w, h) = (p.width as usize, p.height as usize);
-    if w == 0 || h == 0 {
+    if w == 0 || h == 0 || w > 30_000 || h > 30_000 || !matches!(p.depth, 1 | 8 | 16 | 32) {
         return None;
+    }
+    let n = w.checked_mul(h)?;
+    let plane_len = w.checked_mul(usize::from(p.depth))?.div_ceil(8).checked_mul(h)?;
+    if p.channels.iter().chain(p.alpha.iter()).any(|plane| plane.len() != plane_len) {
+        return None;
+    }
+    fn copy_plane(plane: &[u8]) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        out.try_reserve_exact(plane.len()).ok()?;
+        out.extend_from_slice(plane);
+        Some(out)
     }
     // 1-bit patterns: expand to 8-bit grey.
     let (channels, depth): (Vec<Vec<u8>>, u16) = if p.depth == 1 {
         let row = w.div_ceil(8);
-        let expand = |plane: &Vec<u8>| -> Vec<u8> {
-            (0..w * h).map(|i| if plane.get((i / w) * row + (i % w) / 8).is_some_and(|b| b & (0x80 >> (i % w % 8)) != 0) { 0 } else { 255 }).collect()
+        let expand = |plane: &Vec<u8>| -> Option<Vec<u8>> {
+            let mut out = Vec::new();
+            out.try_reserve_exact(n).ok()?;
+            out.extend((0..n).map(|i| if plane.get((i / w) * row + (i % w) / 8).is_some_and(|b| b & (0x80 >> (i % w % 8)) != 0) { 0 } else { 255 }));
+            Some(out)
         };
-        (p.channels.iter().map(expand).collect(), 8)
+        (p.channels.iter().map(expand).collect::<Option<_>>()?, 8)
     } else {
-        (p.channels.clone(), p.depth)
+        (p.channels.iter().map(|plane| copy_plane(plane)).collect::<Option<_>>()?, p.depth)
     };
     let (mode, channels) = match p.mode {
         1 | 8 => (ColorMode::Grayscale, channels),
         2 => {
             let pal = p.palette.as_deref()?;
             let idx = channels.first()?;
-            let ch: Vec<Vec<u8>> = (0..3).map(|c| idx.iter().map(|i| pal.get(usize::from(*i) * 3 + c).copied().unwrap_or(0)).collect()).collect();
+            let ch: Vec<Vec<u8>> = (0..3)
+                .map(|c| {
+                    let mut out = Vec::new();
+                    out.try_reserve_exact(idx.len()).ok()?;
+                    out.extend(idx.iter().map(|i| pal.get(usize::from(*i) * 3 + c).copied().unwrap_or(0)));
+                    Some(out)
+                })
+                .collect::<Option<_>>()?;
             (ColorMode::Rgb, ch)
         }
         4 => (ColorMode::Cmyk, channels),
@@ -69,11 +90,12 @@ pub fn from_psd(p: &PsdPattern) -> Option<Pattern> {
         fill.push(max_sample(s));
         invert.push(false);
     }
-    let mut bytes = interleave(&refs, &fill, w * h, s, &invert);
+    let mut bytes = try_interleave(&refs, &fill, n, s, &invert).ok()?;
     if mode == ColorMode::Lab && s == SampleType::U16 {
         crate::pixels::lab16_chroma(&mut bytes, refs.len(), true);
     }
-    let surface = Surface::from_interleaved(fmt, Rect::new(0, 0, w as i32, h as i32), &bytes);
+    let mut surface = Surface::new(fmt);
+    surface.try_write_interleaved(Rect::new(0, 0, w as i32, h as i32), &bytes).ok()?;
     Some(Pattern { id: p.id.clone(), name: p.name.clone(), width: p.width, height: p.height, surface })
 }
 
@@ -305,5 +327,34 @@ mod unpaintable_tests {
         let warnings = unpaintable_warnings(&patterns);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("Huge float") && warnings[0].contains("would paint nothing") && warnings[0].contains("32 bits"), "{warnings:?}");
+    }
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_dimensions_and_planes_fail_before_conversion() {
+        let mut p = PsdPattern {
+            mode: 1,
+            width: 9,
+            height: 2,
+            name: "Bits".into(),
+            id: "bits".into(),
+            palette: None,
+            depth: 1,
+            channels: vec![vec![0x80, 0, 0, 0x80]],
+            alpha: None,
+        };
+        let converted = from_psd(&p).unwrap();
+        assert_eq!(converted.surface.to_interleaved(converted.rect()), [0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0]);
+        p.channels[0].pop();
+        assert!(from_psd(&p).is_none());
+        p.width = u32::MAX;
+        assert!(from_psd(&p).is_none());
+        p.width = 9;
+        p.depth = 7;
+        assert!(from_psd(&p).is_none());
     }
 }

@@ -1343,7 +1343,9 @@ fn import_decoded_content(import: DecodedImport<'_>, doc: &mut Document, cx: &mu
 fn import_multichannel(file: &PsdFile, merged: &Option<photocraft_psd::Result<Vec<u8>>>, doc: &mut Document, cx: &mut Ctx<'_>) {
     if let Some(Ok(all)) = merged {
         let names = file.resource(1045).map(|r| unicode_names(&r.data)).unwrap_or_default();
-        crate::multichannel_map::import(file, all, doc, &names, &mut cx.warnings);
+        if let Err(error) = crate::multichannel_map::import(file, all, doc, &names, &mut cx.warnings) {
+            cx.fatal_error.get_or_insert(error);
+        }
     }
     if !file.layers().is_empty() {
         cx.warn(format!("Multichannel documents have no layers: {} layer records were not imported", file.layers().len()));
