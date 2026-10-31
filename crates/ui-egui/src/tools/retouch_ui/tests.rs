@@ -850,6 +850,23 @@ fn art_history_brush_opacity_reaches_the_command() {
 }
 
 #[test]
+fn art_history_brush_starts_at_full_opacity_whatever_the_brush_has() {
+    let mut app = app();
+    app.ui.tool = Tool::Brush;
+    crate::paint_mouse::sync_tool_brush(&mut app);
+    app.run("tools.setBrush", json!({"brush": {"opacity": 0.3, "size": 42}})).unwrap();
+    app.ui.tool = Tool::ArtHistoryBrush;
+    crate::paint_mouse::sync_tool_brush(&mut app);
+    assert_eq!(app.session.tools.brush.opacity, 1.0, "Art History starts at 100 %");
+    assert_eq!(app.session.tools.brush.size, 42.0, "other settings still carry over on first use");
+    app.ui.tool = Tool::Brush;
+    crate::paint_mouse::sync_tool_brush(&mut app);
+    app.ui.tool = Tool::CloneStamp;
+    crate::paint_mouse::sync_tool_brush(&mut app);
+    assert_eq!(app.session.tools.brush.opacity, 0.3, "other tools still take the brush's opacity on first use");
+}
+
+#[test]
 fn art_history_brush_keeps_its_own_opacity_and_reset_tool_restores_it() {
     let mut app = app();
     let ctx = egui::Context::default();
