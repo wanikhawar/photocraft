@@ -1,0 +1,14 @@
+name: Issue 8822 evidence (scratch only)
+on:
+  push:
+    branches: [measure/8822-evidence-v3]
+permissions:
+  contents: read
+jobs:
+  evidence:
+    uses: storytold/craft-common-actions/.github/workflows/gate.yml@main
+    with:
+      packages: libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libgtk-3-dev
+      timeout-minutes: 150
+      command: bash evidence-8822/run.sh
+      craft-fonts-ref: b076417b5880bd4154bd22f00695b1d28c6bea83
