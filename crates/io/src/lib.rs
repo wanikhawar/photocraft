@@ -115,6 +115,10 @@ pub enum IoError {
     /// The conservative PSD pixel-storage and workspace estimate exceeded its allowance.
     #[error("PSD import needs an estimated {required} bytes of pixel memory; limit is {limit} bytes")]
     PsdImportBudget { required: u64, limit: u64 },
+    /// A pixel buffer could not be allocated while reading a file: the file may be fine, but
+    /// this machine has no memory for it.
+    #[error("not enough memory: {0}")]
+    OutOfMemory(String),
     /// Codec failure.
     #[error("codec: {0}")]
     Codec(#[from] CodecError),
@@ -423,6 +427,7 @@ fn import_psd(
     }
     let (file, merged) = parsed.map_err(|error| match error {
         PsdError::Read(message) => IoError::Read(message),
+        PsdError::OutOfMemory(message) => IoError::OutOfMemory(message.to_string()),
         error => error.into(),
     })?;
     ctl.check().map_err(|_| IoError::Cancelled)?;

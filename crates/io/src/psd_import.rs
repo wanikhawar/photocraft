@@ -193,7 +193,7 @@ impl Ctx<'_> {
     fn allocation_failed(&mut self, error: impl std::fmt::Display) {
         let message = format!("PSD pixel allocation failed: {error}");
         self.warn(message.clone());
-        self.fatal_error.get_or_insert(crate::IoError::Unsupported(message));
+        self.fatal_error.get_or_insert(crate::IoError::OutOfMemory(message));
     }
 
     fn warn(&mut self, s: impl Into<String>) {
@@ -214,8 +214,8 @@ impl Ctx<'_> {
             self.fatal_error.get_or_insert_with(|| crate::IoError::Read(format!("layer \"{name}\": {msg}")));
             return true;
         }
-        if matches!(e, photocraft_psd::PsdError::LimitExceeded(_)) {
-            self.allocation_failed(e);
+        if let photocraft_psd::PsdError::OutOfMemory(_) = e {
+            self.allocation_failed(format!("layer \"{name}\" channel {id}: {e}"));
             return true;
         }
         self.warn_unreadable_data(format!("layer \"{name}\": channel {id} could not be decoded ({e}); treated as empty"));
@@ -326,7 +326,7 @@ impl Ctx<'_> {
             let mut bytes = match try_interleave(&refs, &fill, w * (b1 - b0), s, &invert) {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    self.allocation_failed(error);
+                    self.allocation_failed(format!("layer \"{name}\": {error}"));
                     return Surface::new(self.fmt);
                 }
             };
@@ -334,7 +334,7 @@ impl Ctx<'_> {
                 crate::pixels::lab16_chroma(&mut bytes, self.cc + 1, true);
             }
             if let Err(error) = surf.try_write_interleaved(Rect::new(r.left, r.top + b0 as i32, r.right, r.top + b1 as i32), &bytes) {
-                self.allocation_failed(error);
+                self.allocation_failed(format!("layer \"{name}\": {error}"));
                 return Surface::new(self.fmt);
             }
         }
@@ -364,12 +364,12 @@ impl Ctx<'_> {
             let bytes = match try_interleave(&[Some(&plane)], &[zero_sample(s)], w * h, s, &[false]) {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    self.allocation_failed(error);
+                    self.allocation_failed(format!("layer \"{name}\" mask: {error}"));
                     return None;
                 }
             };
             if let Err(error) = surface.try_write_interleaved(Rect::new(rect.left, rect.top, rect.right, rect.bottom), &bytes) {
-                self.allocation_failed(error);
+                self.allocation_failed(format!("layer \"{name}\" mask: {error}"));
                 return None;
             }
             surface.prune();
@@ -882,7 +882,7 @@ fn flat_composite(
     match file.composite_rgba8() {
         Ok(img) => return Ok(img),
         // Over the output budget: the fallback below would make the same allocation.
-        Err(e @ PsdError::LimitExceeded(_)) => return Err(e),
+        Err(e @ (PsdError::LimitExceeded(_) | PsdError::OutOfMemory(_))) => return Err(e),
         Err(_) => {}
     }
     let all = match merged {
@@ -899,7 +899,7 @@ fn flat_composite(
         .ok_or(PsdError::LimitExceeded("RGBA output exceeds MAX_DECODED_BYTES"))?;
     let plane = h.row_bytes().checked_mul(hh).ok_or(PsdError::LimitExceeded("plane size overflow"))?;
     let mut data = Vec::new();
-    data.try_reserve_exact(len).map_err(|_| PsdError::LimitExceeded("not enough memory for RGBA output"))?;
+    data.try_reserve_exact(len).map_err(|_| PsdError::OutOfMemory("not enough memory for RGBA output"))?;
     data.resize(len, 255u8);
     for c in 0..3.min(usize::from(h.channels)) {
         let bytes = merged_plane(all, c, plane).ok_or_else(|| PsdError::Invalid("channel size mismatch".into()))?;
@@ -1096,9 +1096,11 @@ pub(crate) fn merged_needed(file: &PsdFile) -> bool {
 }
 
 /// A damaged merged preview need not prevent opening independently stored layers (#6152).
-/// Other modes are imported flattened, so their merged image cannot be discarded.
+/// Other modes are imported flattened, so their merged image cannot be discarded. This is also
+/// the decision the memory budget makes about layer pixels, so it follows [`import_format`]
+/// (an unknown mode imports as RGB) rather than listing modes a second time.
 pub(crate) fn can_recover_layers(file: &PsdFile) -> bool {
-    matches!(file.header.color_mode, PsdMode::Grayscale | PsdMode::Rgb | PsdMode::Cmyk | PsdMode::Lab) && file.header.depth != 1 && !file.layers().is_empty()
+    import_format(file).1 && !file.layers().is_empty()
 }
 
 fn read_initial_metadata(file: &PsdFile, global: &[PsdGlobalBlock], doc: &mut Document, layered: bool, multichannel: bool, warnings: &mut Vec<String>) -> bool {
@@ -1293,8 +1295,8 @@ fn decode_merged(
         }
         ctl.progress(0.1);
         if let Err(error) = &merged {
-            if matches!(error, photocraft_psd::PsdError::LimitExceeded(_)) {
-                cx.allocation_failed(error);
+            if matches!(error, photocraft_psd::PsdError::OutOfMemory(_)) {
+                cx.allocation_failed(format!("merged image: {error}"));
             }
             cx.warn_unreadable_data(format!("merged image could not be decoded: {error}"));
             if can_recover_layers(file) {
@@ -1321,7 +1323,11 @@ fn import_decoded_content(import: DecodedImport<'_>, doc: &mut Document, cx: &mu
     } else {
         import_flattened(import.file, import.merged, import.sizes, import.canvas, import.fmt, doc, cx);
     }
-    import_extra_channels(import, doc, cx);
+    // A layer allocation that failed above makes the whole import fail: more full-size
+    // planes here would only risk the abort the failure was reported to avoid.
+    if cx.fatal_error.is_none() {
+        import_extra_channels(import, doc, cx);
+    }
 }
 
 fn import_multichannel(file: &PsdFile, merged: &Option<photocraft_psd::Result<Vec<u8>>>, doc: &mut Document, cx: &mut Ctx<'_>) {
@@ -1443,6 +1449,7 @@ fn import_flattened(
             doc.layers.push(flat_background(surface));
         }
         Err(_) if matches!(merged, Some(Err(_))) => {}
+        Err(error @ photocraft_psd::PsdError::OutOfMemory(_)) => cx.allocation_failed(format!("flattened image: {error}")),
         Err(error) => cx.warn_unreadable_data(format!("the image could not be read: {error}")),
     }
 }
