@@ -123,6 +123,10 @@ fn topmost_text_layer_is_exported_with_selectable_text_and_vector_outlines() {
         transform: photocraft_geom::Affine::translate(1.0, 1.5),
         ..Default::default()
     };
+    let layout = photocraft_text::TextEngine::new().layout(&text, d.resolution_dpi);
+    let cluster = layout.clusters.first().unwrap();
+    let line = &layout.lines[cluster.line];
+    let origin = text.transform.apply(photocraft_geom::Point::new(f64::from(cluster.x), f64::from(line.baseline)));
     d.layers.push(Layer::new("Text", LayerContent::Text(text)));
     let out = export(&d).unwrap();
     check_structure(&out.bytes);
@@ -136,6 +140,9 @@ fn topmost_text_layer_is_exported_with_selectable_text_and_vector_outlines() {
     assert!(has(&out.bytes, "/ToUnicode"));
     let parsed = lopdf::Document::load_mem(&out.bytes).unwrap();
     assert_eq!(parsed.extract_text(&[1]).unwrap().trim(), "Vector PDF");
+    let matrix = content.lines().find(|line| line.ends_with(" Tm")).unwrap();
+    let operands: Vec<f64> = matrix.split_whitespace().take(6).map(|v| v.parse().unwrap()).collect();
+    assert_eq!(&operands[4..], &[origin.x, origin.y]);
     assert!(content.contains("ET"));
     assert!(content.contains("EMC"));
     assert_eq!(stream_after(&out.bytes, "/Subtype /Image"), vec![255; 4 * 2 * 3]);

@@ -196,6 +196,18 @@ fn layout_ops(
     let mut current_line = None;
     let mut clusters: Vec<_> = layout.clusters.iter().collect();
     clusters.sort_by_key(|cluster| cluster.range.start);
+    // Unrepresented source characters (for example paragraph separators) cannot
+    // be preserved by the cluster selection plane. Keep such layers rasterized.
+    let mut source_end = 0;
+    for cluster in &clusters {
+        if cluster.range.start != source_end {
+            return None;
+        }
+        source_end = cluster.range.end;
+    }
+    if source_end != layer.text.len() {
+        return None;
+    }
     for cluster in clusters {
         let text = layer.text.get(cluster.range.clone())?;
         if text.is_empty() {
@@ -240,6 +252,21 @@ fn layout_ops(
 mod tests {
     use super::*;
     use photocraft_geom::Affine;
+
+    #[test]
+    fn overflowing_selection_matrix_is_rejected() {
+        let layer = TextLayer { text: " ".into(), transform: Affine { m: [1.0, 0.0, 0.0, f64::MAX, 0.0, 0.0] }, ..Default::default() };
+        let mut layout = photocraft_text::TextEngine::new().layout(&layer, 72.0);
+        layout.glyphs.clear();
+        layout.decorations.clear();
+        for line in &mut layout.lines {
+            line.baseline = 0.0;
+            line.ascent = 10.0;
+            line.descent = 2.0;
+        }
+        let font = super::super::selection::SelectionFont::new(std::iter::once(layer.text.as_str()));
+        assert!(layout_ops(&layer, ColorMode::Rgb, 3, &layout, &font).is_none());
+    }
 
     #[test]
     fn embedding_restrictions_refuse_outlines() {
