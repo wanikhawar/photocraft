@@ -157,8 +157,7 @@ fn topmost_shape_and_text_layers_are_both_exported_as_vectors() {
     check_structure(&out.bytes);
     let content = stream_after(&out.bytes, "/Contents 4 0 R");
     let content = String::from_utf8(content).unwrap();
-    assert!(content.contains("1 0 0 rg\n"));
-    assert!(content.contains("0 1 0 rg\n"));
+    assert!(content.find("1 0 0 rg\n").unwrap() < content.find("0 1 0 rg\n").unwrap());
     assert!(content.contains("/Span << /ActualText <FEFF0048> >> BDC"));
     assert!(content.contains("> Tj"));
     assert_eq!(stream_after(&out.bytes, "/Subtype /Image"), vec![255; 4 * 2 * 3]);
@@ -267,4 +266,16 @@ fn text_with_compositing_or_a_profile_stays_in_the_raster_backdrop() {
             assert!(has(&pdf, "[/ICCBased 7 0 R]"));
         }
     }
+}
+
+#[test]
+fn hidden_text_does_not_exhaust_selection_font() {
+    use photocraft_doc::TextLayer;
+    let mut d = doc(ColorMode::Rgb);
+    let mut hidden = Layer::new("Hidden", LayerContent::Text(TextLayer { text: (0x100..0x300).filter_map(char::from_u32).collect(), ..Default::default() }));
+    hidden.visible = false;
+    d.layers.push(hidden);
+    d.layers.push(Layer::new("Top", LayerContent::Text(TextLayer { text: "Hi".into(), ..Default::default() })));
+    let out = export(&d).unwrap();
+    assert!(has(&out.bytes, "/ActualText <FEFF0048>"));
 }

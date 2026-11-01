@@ -222,8 +222,11 @@ fn layout_ops(
         let hex = actual_text_hex(text);
         let encoded = selection_font.encode(text)?;
         writeln!(out, "/Span << /ActualText <{hex}> >> BDC").ok()?;
-        writeln!(out, "{} {} {} {} {} {} Tm", a * f64::from(width), b * f64::from(width), -c * f64::from(height), -d * f64::from(height), origin.x, origin.y)
-            .ok()?;
+        let matrix = [a * f64::from(width), b * f64::from(width), -c * f64::from(height), -d * f64::from(height)];
+        if matrix.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        writeln!(out, "{} {} {} {} {} {} Tm", matrix[0], matrix[1], matrix[2], matrix[3], origin.x, origin.y).ok()?;
         writeln!(out, "<{encoded}> Tj\nEMC").ok()?;
     }
 

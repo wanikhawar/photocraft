@@ -209,10 +209,8 @@ pub fn export(doc: &Document) -> std::result::Result<ExportResult, IoError> {
     // Simple topmost shapes and text layers can be drawn over the flattened backdrop without changing
     // compositing. Stop at the first unsupported visible layer, since it may depend on the
     // backdrop (adjustments, blend modes, masks, effects, or clipping).
-    let selection_font = selection::SelectionFont::new(doc.layers.iter().filter_map(|layer| match &layer.content {
-        photocraft_doc::LayerContent::Text(text) => Some(text.text.as_str()),
-        _ => None,
-    }));
+    let mut selection_texts = Vec::new();
+
     let mut backdrop = doc.clone();
     let mut vector_ops = Vec::new();
     if doc.icc_profile.is_none() {
@@ -236,11 +234,31 @@ pub fn export(doc: &Document) -> std::result::Result<ExportResult, IoError> {
             }
             let ops = match &layer.content {
                 photocraft_doc::LayerContent::Shape(shape) => shapes::shape_path(shape, doc.mode),
-                photocraft_doc::LayerContent::Text(text_layer) => text::text_ops_with_font(text_layer, doc.mode, doc.resolution_dpi, &selection_font),
+                photocraft_doc::LayerContent::Text(text_layer) => {
+                    let candidate = selection::SelectionFont::new(selection_texts.iter().copied().chain(std::iter::once(text_layer.text.as_str())));
+                    let ops = text::text_ops_with_font(text_layer, doc.mode, doc.resolution_dpi, &candidate);
+                    if ops.is_some() {
+                        selection_texts.push(text_layer.text.as_str());
+                    }
+                    ops
+                }
                 _ => break,
             };
             let Some(ops) = ops else { break };
             layer.visible = false;
+            vector_ops.push(ops);
+        }
+    }
+    let selection_font = selection::SelectionFont::new(selection_texts.iter().copied());
+    // Rebuild operators using the final shared character codes.
+    vector_ops.clear();
+    for layer in doc.layers.iter().zip(&backdrop.layers).filter_map(|(original, raster)| (original.visible && !raster.visible).then_some(original)).rev() {
+        let ops = match &layer.content {
+            photocraft_doc::LayerContent::Text(text_layer) => text::text_ops_with_font(text_layer, doc.mode, doc.resolution_dpi, &selection_font),
+            photocraft_doc::LayerContent::Shape(shape) => shapes::shape_path(shape, doc.mode),
+            _ => None,
+        };
+        if let Some(ops) = ops {
             vector_ops.push(ops);
         }
     }

@@ -10,7 +10,14 @@ pub(super) struct SelectionFont {
 
 impl SelectionFont {
     pub(super) fn new<'a>(texts: impl Iterator<Item = &'a str>) -> Self {
-        Self { chars: texts.flat_map(str::chars).take(65536).collect() }
+        let mut chars = BTreeSet::new();
+        for ch in texts.flat_map(str::chars) {
+            chars.insert(ch);
+            if chars.len() > 255 {
+                break;
+            }
+        }
+        Self { chars }
     }
 
     pub(super) fn encode(&self, text: &str) -> Option<String> {
@@ -58,5 +65,15 @@ impl SelectionFont {
         );
         let stream = |data: &str| format!("<< /Length {} >>\nstream\n{data}endstream", data.len()).into_bytes();
         vec![font.into_bytes(), stream("1000 0 0 -250 1000 1000 d1\n"), stream(&cmap)]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn repeated_characters_do_not_hide_later_characters() {
+        let text = format!("{}z", "a".repeat(65536));
+        assert!(SelectionFont::new(std::iter::once(text.as_str())).encode(&text).is_some());
     }
 }
