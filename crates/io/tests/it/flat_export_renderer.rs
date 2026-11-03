@@ -524,7 +524,8 @@ fn a_cancelled_retry_keeps_the_fallback_reason_for_the_caller() {
     let doc = synthetic_doc();
     let opts = ExportOptions::default();
     let cancelled = Arc::new(AtomicBool::new(false));
-    let ctl = Interrupt::cancel_only(&|| cancelled.load(Ordering::SeqCst));
+    let is_cancelled = || cancelled.load(Ordering::SeqCst);
+    let ctl = Interrupt::cancel_only(&is_cancelled);
     let mut renderer = CancellingFailingRenderer { cancelled: cancelled.clone() };
     let mut diagnostics = Vec::new();
     let res = export_flat_with_renderer_diagnostics(&doc, Format::Png, &opts, &ctl, Some(&mut renderer), &mut diagnostics);
