@@ -675,6 +675,28 @@ fn stepped_places_from_a_path_fail_and_cancel_like_background_ones() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A cooperative drop from a path completes in slices (the path read and the placement job, not
+/// egui's reader), making its layer once.
+#[test]
+fn a_cooperative_drop_from_a_path_completes_in_slices() {
+    let dir = std::env::temp_dir().join(format!("photocraft-drop-path-slices-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let good = dir.join("good.png");
+    std::fs::write(&good, png_bytes(30, 30)).unwrap();
+    let ctx = egui::Context::default();
+    let mut app = app_with_canvas();
+    app.session.set_cooperative_jobs(true);
+    app.session.set_job_step_budget(std::time::Duration::ZERO);
+    let layers = layer_count(&app);
+    app.open_dropped(&ctx, vec![dropped(&good, Ok(Vec::new()))], Some(egui::pos2(400.0, 300.0)));
+    app.place_next_dropped(&ctx);
+    assert_eq!(app.jobs.place.as_ref().map(|p| p.name.as_str()), Some("good.png"));
+    tick_until(&mut app, &ctx, |app| app.jobs.place.is_none());
+    assert_eq!(layer_count(&app), layers + 1);
+    assert_eq!(app.ui.transform.as_ref().and_then(|t| t.made), Some(crate::state::MadeLayer::Place));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A file that can't be decoded is reported by name and the files dropped after it go on.
 #[test]
 fn a_background_place_that_fails_reports_it_and_the_queue_continues() {

@@ -7,7 +7,7 @@ use crate::Format;
 use crate::error::CodecError;
 use crate::fidelity::Plan;
 use crate::image::{ChannelLayout, DecodeWarning, Image, Metadata, SampleType};
-use crate::options::{EncodeOptions, Limits, PngCompression, PngStereo, alloc_zeroed};
+use crate::options::{EncodeOptions, Limits, PngCompression, PngStereo};
 
 const F: Format = Format::Png;
 pub(crate) const XMP_KEYWORD: &str = "XML:com.adobe.xmp";
@@ -81,6 +81,22 @@ impl<B: AsRef<[u8]>> std::io::Seek for Tracked<B> {
     }
 }
 
+/// The decoder's input, shared between the reader and the metadata pass: moving an owned buffer in
+/// doesn't keep a second copy of it.
+struct SharedInput<B>(std::sync::Arc<B>);
+
+impl<B> Clone for SharedInput<B> {
+    fn clone(&self) -> Self {
+        Self(std::sync::Arc::clone(&self.0))
+    }
+}
+
+impl<B: AsRef<[u8]>> AsRef<[u8]> for SharedInput<B> {
+    fn as_ref(&self) -> &[u8] {
+        (*self.0).as_ref()
+    }
+}
+
 /// A PNG decoded in resumable steps, for a caller that must not block for the whole image (the
 /// web build, which has no threads): [`PngDecodeRows::step`] decodes rows until the caller says to
 /// stop, and returns the [`Image`] once the last row and the chunks after it are read. [`decode`]
@@ -89,9 +105,9 @@ impl<B: AsRef<[u8]>> std::io::Seek for Tracked<B> {
 /// An interlaced (Adam7) PNG decodes in a single step: its passes land at stride positions all
 /// over the image, so no row is final before the last pass.
 pub struct PngDecodeRows<B: AsRef<[u8]>> {
-    reader: png::Reader<Tracked<B>>,
+    reader: png::Reader<Tracked<SharedInput<B>>>,
     at: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    bytes: B,
+    bytes: SharedInput<B>,
     limits: Limits,
     buf: Vec<u8>,
     layout: ChannelLayout,
@@ -100,17 +116,20 @@ pub struct PngDecodeRows<B: AsRef<[u8]>> {
     width: u32,
     height: usize,
     line: usize,
+    /// The decoder's whole output size, for an interlaced image's single frame decode.
+    size: usize,
     rows: usize,
     interlaced: bool,
     images: u64,
     done: bool,
 }
 
-impl<B: AsRef<[u8]> + Clone> PngDecodeRows<B> {
+impl<B: AsRef<[u8]>> PngDecodeRows<B> {
     /// Reads the header and refuses what [`decode`] refuses before any pixel is decoded: sizes
     /// past `limits`, and a file too small for the image it declares.
     pub fn new(bytes: B, limits: &Limits) -> Result<Self, CodecError> {
         let at = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let bytes = SharedInput(std::sync::Arc::new(bytes));
         let input = Tracked { cursor: Cursor::new(bytes.clone()), at: at.clone() };
         let mut decoder = png::Decoder::new_with_limits(input, png::Limits { bytes: limits.alloc_usize() });
         decoder.set_transformations(png::Transformations::EXPAND);
@@ -120,8 +139,9 @@ impl<B: AsRef<[u8]> + Clone> PngDecodeRows<B> {
         {
             let info = decoder.read_header_info().map_err(map_png_err)?;
             let (w, h) = info.size();
-            // Worst case output: 4 channels x 16 bit.
-            limits.check_bytes(w, h, 8)?;
+            // Size checks now; the allocation budget once the output layout (channels and sample
+            // size) is known below, so a Gray8 image isn't charged for RGBA16.
+            limits.check_size(w, h)?;
             // zlib never beats 1032:1; refuse a file too small for the declared image before the
             // output buffer exists. Measured on the stored samples (before palette/bit expansion).
             let stored = u64::from(w).saturating_mul(u64::from(h)).saturating_mul(info.bits_per_pixel() as u64).div_ceil(8);
@@ -143,18 +163,26 @@ impl<B: AsRef<[u8]> + Clone> PngDecodeRows<B> {
             png::BitDepth::Sixteen => SampleType::U16,
             d => return Err(err(format!("unexpected output bit depth {d:?}"))),
         };
-        let size = reader.output_buffer_size().ok_or_else(|| err("image too large"))?;
-        let buf = alloc_zeroed::<u8>(size)?;
         // The frame the pixels are of: an fcTL before the IDAT overrides the header's size.
         let info = reader.info();
         let (width, height) = info.frame_control.map_or_else(|| info.size(), |f| (f.width, f.height));
         let line = reader.output_line_size(width).ok_or_else(|| err("image too large"))?;
+        // The output layout is known: charge its real bytes per pixel, not RGBA16's worst case.
+        limits.check(width, height, layout, sample)?;
         let height = usize::try_from(height).map_err(|_| err("image too large"))?;
         if width == 0 || height == 0 {
             return Err(err("the image is empty"));
         }
+        let size = reader.output_buffer_size().ok_or_else(|| err("image too large"))?;
+        if line.checked_mul(height).is_none_or(|needed| needed > size) {
+            return Err(err("image too large"));
+        }
+        // Reserve without touching: each row is zero-filled as it is decoded, so the first slice
+        // doesn't zero-fill the whole image (a stall on the web build).
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(size).map_err(|_| CodecError::LimitExceeded(format!("cannot allocate {size} bytes for the image")))?;
         let interlaced = info.interlaced;
-        Ok(Self { reader, at, bytes, limits: *limits, buf, layout, sample, width, height, line, rows: 0, interlaced, images, done: false })
+        Ok(Self { reader, at, bytes, limits: *limits, buf, layout, sample, width, height, line, size, rows: 0, interlaced, images, done: false })
     }
 
     /// The image's width and height in pixels.
@@ -174,6 +202,8 @@ impl<B: AsRef<[u8]> + Clone> PngDecodeRows<B> {
             return Err(err("the image was already decoded"));
         }
         if self.interlaced {
+            // An Adam7 frame is decoded in one go, over the whole output buffer.
+            self.buf.resize(self.size, 0);
             let out = self.reader.next_frame(&mut self.buf).map_err(map_png_err)?;
             self.buf.truncate(out.buffer_size());
             self.rows = self.height;
@@ -183,7 +213,13 @@ impl<B: AsRef<[u8]> + Clone> PngDecodeRows<B> {
         }
         while self.rows < self.height {
             let at = self.rows.checked_mul(self.line).ok_or_else(|| err("image too large"))?;
-            let row = at.checked_add(self.line).and_then(|end| self.buf.get_mut(at..end)).ok_or_else(|| err("the image data is longer than the image"))?;
+            let end = at.checked_add(self.line).ok_or_else(|| err("image too large"))?;
+            // Grow by one row at a time: the zero-fill of the output is spread over the decodes
+            // instead of stalling the first slice.
+            if self.buf.len() < end {
+                self.buf.resize(end, 0);
+            }
+            let row = self.buf.get_mut(at..end).ok_or_else(|| err("the image data is longer than the image"))?;
             self.reader.read_row(row).map_err(map_png_err)?.ok_or_else(|| err("the image data ended early"))?;
             if self.sample == SampleType::U16 {
                 to_native_endian(row);

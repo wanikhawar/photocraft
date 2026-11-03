@@ -338,6 +338,19 @@ fn pngsuite_corpus_matches_oracle() {
     assert!(checked > 100, "{}: only {checked} PNGs compared: run `cargo xtask corpus --all`", dir.display());
 }
 
+/// The preflight charges the decoded layout's bytes per pixel: a 1000×1000 Gray8 PNG (1 MB) fits a
+/// 1.5 MB budget, which the old worst-case RGBA16 preflight (8 MB) refused.
+#[test]
+fn png_preflight_uses_the_output_layout() {
+    let img = synth(1000, 1000, ChannelLayout::Gray, SampleType::U8, 7, 0.5);
+    let bytes = encode(&img, Format::Png, &EncodeOptions::default()).unwrap();
+    let opts = DecodeOptions { limits: Limits { max_alloc: 1_500_000, ..Limits::none() }, ..Default::default() };
+    let got = decode_with(&bytes, &opts).expect("a Gray8 image is charged 1 byte per pixel");
+    assert_eq!(got.data(), img.data());
+    let tight = DecodeOptions { limits: Limits { max_alloc: 900_000, ..Limits::none() }, ..Default::default() };
+    assert!(decode_with(&bytes, &tight).is_err(), "the actual pixel budget still applies");
+}
+
 #[cfg(feature = "corpus")]
 #[test]
 fn png_rows_equal_decode_on_the_pngsuite_corpus() {

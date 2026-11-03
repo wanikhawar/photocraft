@@ -858,7 +858,9 @@ impl Session {
                 // One cooperative job gets the frame's budget; any others wait for the next poll.
                 None if !stepped => {
                     stepped = true;
-                    job.step(web_time::Instant::now() + budget).transpose()
+                    // An absurd budget (`Duration::MAX` through `set_job_step_budget`) must not
+                    // overflow the deadline: fall back to one no job reaches.
+                    job.step(web_time::Instant::now().checked_add(budget).unwrap_or_else(no_deadline)).transpose()
                 }
                 None => None,
             };

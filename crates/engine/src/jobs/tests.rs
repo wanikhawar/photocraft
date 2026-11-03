@@ -876,6 +876,18 @@ fn a_cooperative_job_reports_real_elapsed_time() {
     assert_eq!(s.wait_job(id).unwrap(), json!({"steps": 5}));
 }
 
+/// A budget too large to add to an `Instant` runs the slice to the end instead of overflowing.
+#[test]
+fn a_huge_step_budget_does_not_panic() {
+    let mut s = session(8, 8);
+    s.set_cooperative_jobs(true);
+    s.set_job_step_budget(Duration::MAX);
+    let (id, probe) = start_counting(&mut s, 2, false);
+    s.poll_jobs();
+    assert_eq!(probe.calls.load(Ordering::Relaxed), 1, "one slice still runs");
+    assert_eq!(s.wait_job(id).unwrap(), json!({"steps": 2}));
+}
+
 #[test]
 fn only_one_cooperative_job_is_stepped_per_poll() {
     let mut s = session(8, 8);
