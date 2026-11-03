@@ -10,22 +10,22 @@ use photocraft_engine::Session;
 use serde_json::{Value, json};
 use std::{cell::RefCell, rc::Rc};
 
+/// The import/export services the PSD tests hand the app: real IO, in-memory writes.
+fn services() -> Services {
+    Services {
+        import: Some(Box::new(|name, bytes, opts| {
+            photocraft_io::import_with_options(name, bytes, opts).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string())
+        })),
+        export: Some(Box::new(|doc, path, _| photocraft_io::export(doc, path, &Default::default()).map(|r| (r.bytes, r.warnings)).map_err(|e| e.to_string()))),
+        write: Some(Box::new(|_, _| Ok(()))),
+        automation_write: Some(Box::new(|_, _| Ok(()))),
+        ..Default::default()
+    }
+}
+
 /// Creates a minimal UI application with in-memory import/export services for PSD tests.
 fn app() -> PhotocraftApp {
-    let mut app = PhotocraftApp::new(
-        Session::new(),
-        Services {
-            import: Some(Box::new(|name, bytes, opts| {
-                photocraft_io::import_with_options(name, bytes, opts).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string())
-            })),
-            export: Some(Box::new(|doc, path, _| {
-                photocraft_io::export(doc, path, &Default::default()).map(|r| (r.bytes, r.warnings)).map_err(|e| e.to_string())
-            })),
-            write: Some(Box::new(|_, _| Ok(()))),
-            automation_write: Some(Box::new(|_, _| Ok(()))),
-            ..Default::default()
-        },
-    );
+    let mut app = PhotocraftApp::new(Session::new(), services());
     app.background_jobs = false;
     app
 }
@@ -952,4 +952,307 @@ fn inline_drop_slot_survives_the_memory_prompt() {
             assert_eq!(names, ["dropped.psd", "first.psd", "second.psd"], "the approved drop keeps its tab slot");
         });
     });
+}
+
+/// Offscreen evidence for #10897's PSD/layered-TIFF memory consent.
+///
+/// These captures render the real app through `egui_kittest`'s wgpu renderer, which prefers a
+/// CPU adapter. On Linux that is Mesa's software driver: install `mesa-vulkan-drivers`
+/// (lavapipe) and leave `WGPU_BACKEND` unset, or force the GL software path with
+/// `LIBGL_ALWAYS_SOFTWARE=1 WGPU_BACKEND=gl`. No display is needed. The app deliberately keeps
+/// its canvas on the CPU path here (`set_wgpu` is not called): the evidence is the consent
+/// prompt, the document and the status bar, and that avoids asking a software adapter for the
+/// canvas's float render targets.
+///
+/// The estimate is always the scoped test seam (`with_test_estimate_charge`) over a tiny real
+/// fixture — a 128×96 PSD or an 8×6 layered TIFF — so no capture claims a gigabyte-sized
+/// allocation ever happened. Run explicitly:
+///
+/// ```sh
+/// PHOTOCRAFT_PSD_MEMORY_EVIDENCE=target/psd-memory-evidence \
+///   cargo test -p photocraft-ui-egui --lib psd_memory_evidence -- --ignored --nocapture --test-threads=1
+/// ```
+#[cfg(not(target_arch = "wasm32"))]
+mod evidence {
+    use super::*;
+    use photocraft_engine::EngineError;
+    use serde_json::json;
+
+    /// Where the PNGs go (`PHOTOCRAFT_PSD_MEMORY_EVIDENCE`, default `target/psd-memory-evidence`).
+    fn evidence_dir() -> std::path::PathBuf {
+        let dir = std::env::var_os("PHOTOCRAFT_PSD_MEMORY_EVIDENCE").map(std::path::PathBuf::from).unwrap_or_else(|| "target/psd-memory-evidence".into());
+        std::fs::create_dir_all(&dir).expect("create the PSD memory evidence directory");
+        dir
+    }
+
+    /// The offscreen renderer, with the same IO services as [`super::app`].
+    fn harness(background_jobs: bool) -> egui_kittest::Harness<'static, PhotocraftApp> {
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).with_pixels_per_point(1.0).with_max_steps(64).wgpu().build_eframe(
+            move |cc| {
+                PhotocraftApp::setup_context(&cc.egui_ctx, Default::default());
+                let mut app = PhotocraftApp::new(Session::new(), services());
+                app.session.edit_prefs(|p| p.interface.language = "en".into());
+                app.background_jobs = background_jobs;
+                app
+            },
+        );
+        h.run_steps(8);
+        h
+    }
+
+    /// Renders the current frame and saves it under `name` in `dir`.
+    fn shot(h: &mut egui_kittest::Harness<'static, PhotocraftApp>, dir: &std::path::Path, name: &str) {
+        h.run_steps(12);
+        let image = h.render().expect("render the PSD memory evidence frame");
+        let path = dir.join(name);
+        image.save(&path).expect("save the PSD memory evidence PNG");
+        eprintln!("psd memory evidence: {} ({}×{})", path.display(), image.width(), image.height());
+    }
+
+    /// Known capacity: the estimate is in the approval band, consent opens the real file, and
+    /// the document keeps every layer while the pending preflight is released.
+    #[test]
+    #[ignore = "renders PSD memory-consent evidence PNGs; needs a wgpu adapter"]
+    fn psd_memory_evidence_known_capacity_opens_inline() {
+        if cfg!(target_pointer_width = "32") {
+            return; // the 3 GiB charge would exceed a 32-bit process cap
+        }
+        let _gpu = photocraft_testkit::gpu_lock();
+        let gb = 1u64 << 30;
+        let dir = evidence_dir();
+        let psd = recovery_psd::make_psd(false);
+        let mut h = harness(false);
+        // Known 5 GiB: S = 2.5 GiB, H = 3.75 GiB. The synthetic 3 GiB charge lands in (S, H].
+        let snap = photocraft_io::memory::MemorySnapshot { available_ram: Some(5 * gb), swap_free: None, commit_headroom: None };
+        photocraft_io::psd_budget::with_test_estimate_charge(3 * gb, || {
+            photocraft_io::memory::with_mock_memory(snap, || {
+                {
+                    let app = h.state_mut();
+                    app.open_bytes_from("known_capacity.psd", &psd, Some("/evidence/known_capacity.psd")).unwrap();
+                    assert!(app.session.documents().is_empty(), "the file waits for consent");
+                    assert_eq!(app.held_memory_prompts.len(), 1);
+                    assert_eq!(app.ui.dialogs.len(), 1);
+                    let fields = &app.ui.dialogs[0].fields;
+                    assert!(crate::open_prompt::owns_memory(fields));
+                    assert!(fields["estimated"].as_u64().unwrap() > 3 * gb, "the charged estimate is shown: {fields:?}");
+                    assert_eq!(fields["available"], json!(5 * gb));
+                    assert_eq!(fields["capacityUnknown"], json!(false));
+                    assert_eq!(fields["uncertainCapacityWarning"], json!(false));
+                    assert!(app.session.pending_preflight_bytes().unwrap() > 0, "the engine preflight holds the source");
+                }
+                shot(&mut h, &dir, "01-known-capacity-prompt.png");
+
+                {
+                    let app = h.state_mut();
+                    let dialog = app.ui.dialogs[0].id;
+                    let res = call(app, "ui.dialog.confirm", json!({"dialog": dialog}));
+                    assert_eq!(res["ok"], true, "{res}");
+                    assert_eq!(app.session.documents().len(), 1, "the approved file opens inline");
+                    let st = app.session.active().unwrap();
+                    assert_eq!(st.doc.name, "known_capacity.psd");
+                    assert_eq!(st.path.as_deref(), Some("/evidence/known_capacity.psd"));
+                    let names: Vec<_> = st.doc.layers.iter().map(|l| l.name.clone()).collect();
+                    assert_eq!(names.len(), 2, "both layers survive the approved import: {names:?}");
+                    assert!(names.iter().any(|n| n == "SAFE blue background"));
+                    assert!(names.iter().any(|n| n == "BROKEN orange RLE"));
+                    assert!(app.ui.dialogs.is_empty(), "the prompt is dismissed");
+                    assert!(app.held_memory_prompts.is_empty());
+                    assert!(app.prompt_order.is_empty());
+                    assert_eq!(app.session.pending_preflight_bytes().unwrap(), 0, "the approval releases the preflight");
+                }
+                shot(&mut h, &dir, "02-inline-approved-document.png");
+            });
+        });
+    }
+
+    /// Unknown capacity with an estimate above 8 GiB: the prompt states both facts and
+    /// declining opens nothing, clears the prompt, the batch and the held source.
+    #[test]
+    #[ignore = "renders PSD memory-consent evidence PNGs; needs a wgpu adapter"]
+    fn psd_memory_evidence_unknown_capacity_over_eight_gib_warns_and_cancels() {
+        if cfg!(target_pointer_width = "32") {
+            return; // the 9 GiB charge would exceed a 32-bit process cap
+        }
+        let _gpu = photocraft_testkit::gpu_lock();
+        let gb = 1u64 << 30;
+        let dir = evidence_dir();
+        let psd = recovery_psd::make_psd(false);
+        let mut h = harness(false);
+        photocraft_io::psd_budget::with_test_estimate_charge(9 * gb, || {
+            photocraft_io::memory::with_mock_memory(photocraft_io::memory::MemorySnapshot::UNKNOWN, || {
+                {
+                    let app = h.state_mut();
+                    app.open_bytes_from("unknown_capacity.psd", &psd, Some("/evidence/unknown_capacity.psd")).unwrap();
+                    assert!(app.session.documents().is_empty(), "the file waits for consent");
+                    assert_eq!(app.held_memory_prompts.len(), 1);
+                    assert_eq!(app.ui.dialogs.len(), 1);
+                    let fields = &app.ui.dialogs[0].fields;
+                    assert!(crate::open_prompt::owns_memory(fields));
+                    assert_eq!(fields["available"], json!(null), "no number is invented for an unmeasured capacity");
+                    assert_eq!(fields["capacityUnknown"], json!(true));
+                    assert_eq!(fields["uncertainCapacityWarning"], json!(true));
+                    let message = fields["message"].as_str().unwrap();
+                    assert!(message.contains("could not be measured"), "{message}");
+                    assert!(message.contains("8 GiB") && message.contains("may run out of memory"), "{message}");
+                    assert!(!message.contains("available)"), "the unknown-capacity message claims no available figure: {message}");
+                    assert!(app.session.pending_preflight_bytes().unwrap() > 0, "the engine preflight holds the source");
+                }
+                shot(&mut h, &dir, "03-unknown-capacity-over-8gib-prompt.png");
+
+                {
+                    let app = h.state_mut();
+                    let dialog = app.ui.dialogs[0].id;
+                    assert_eq!(call(app, "ui.dialog.cancel", json!({"dialog": dialog}))["ok"], true);
+                    assert!(app.ui.dialogs.is_empty(), "the prompt is dismissed");
+                    assert!(app.held_memory_prompts.is_empty());
+                    assert!(app.prompt_order.is_empty());
+                    assert!(app.jobs.batches.is_empty(), "the batch is forgotten");
+                    assert!(app.session.documents().is_empty(), "declining opens nothing");
+                    assert_eq!(app.session.pending_preflight_bytes().unwrap(), 0, "declining releases the held source");
+                    assert!(app.ui.status.contains("Cancelled opening"), "{}", app.ui.status);
+                }
+                shot(&mut h, &dir, "04-cancelled-cleanup.png");
+            });
+        });
+    }
+
+    /// Background approval: the scoped estimate reaches the worker, the real layered TIFF waits
+    /// for consent, and the one-shot approval opens both layers on the retry job.
+    #[test]
+    #[ignore = "renders PSD memory-consent evidence PNGs; needs a wgpu adapter"]
+    fn psd_memory_evidence_background_approved_layered_tiff_opens() {
+        if cfg!(target_pointer_width = "32") {
+            return; // the 3 GiB charge would exceed a 32-bit process cap
+        }
+        let _gpu = photocraft_testkit::gpu_lock();
+        let gb = 1u64 << 30;
+        let dir = evidence_dir();
+        let bytes = exported_layered_tiff(8, 6);
+        let mut h = harness(true);
+        let snap = photocraft_io::memory::MemorySnapshot { available_ram: Some(5 * gb), swap_free: None, commit_headroom: None };
+        photocraft_io::psd_budget::with_test_estimate_charge(3 * gb, || {
+            photocraft_io::memory::with_mock_memory(snap, || {
+                {
+                    let app = h.state_mut();
+                    app.open_bytes_from("background_layers.tif", &bytes, Some("/evidence/background_layers.tif")).unwrap();
+                    assert_eq!(app.jobs.opens.len(), 1, "a background open tab appears at once");
+                    let jobs: Vec<_> = app.session.jobs().iter().map(|j| j.id).collect();
+                    for id in jobs {
+                        app.session.wait_job(id).unwrap();
+                    }
+                    crate::jobs_ui::tick(app, &egui::Context::default());
+                    assert!(app.session.documents().is_empty(), "the file waits for consent");
+                    assert_eq!(app.held_memory_prompts.len(), 1);
+                    assert_eq!(app.ui.dialogs.len(), 1);
+                    let fields = &app.ui.dialogs[0].fields;
+                    assert!(crate::open_prompt::owns_memory(fields));
+                    assert!(fields["estimated"].as_u64().unwrap() > 3 * gb, "the worker made the charged estimate: {fields:?}");
+                    assert_eq!(fields["available"], json!(5 * gb));
+                    assert_eq!(fields["capacityUnknown"], json!(false));
+                    assert!(app.session.pending_preflight_bytes().unwrap() > 0, "the engine preflight holds the source");
+                }
+                shot(&mut h, &dir, "05-background-approval-prompt.png");
+
+                {
+                    let app = h.state_mut();
+                    let dialog = app.ui.dialogs[0].id;
+                    let res = call(app, "ui.dialog.confirm", json!({"dialog": dialog}));
+                    assert_eq!(res["ok"], true, "{res}");
+                    assert_eq!(app.jobs.opens.len(), 1, "the retry job is registered");
+                    let jobs: Vec<_> = app.session.jobs().iter().map(|j| j.id).collect();
+                    for id in jobs {
+                        app.session.wait_job(id).unwrap();
+                    }
+                    crate::jobs_ui::tick(app, &egui::Context::default());
+                    assert_eq!(app.session.documents().len(), 1, "the approved layered TIFF opens");
+                    let st = app.session.active().unwrap();
+                    assert_eq!(st.doc.name, "background_layers.tif");
+                    assert_eq!(st.path.as_deref(), Some("/evidence/background_layers.tif"));
+                    let names: Vec<_> = st.doc.layers.iter().map(|l| l.name.clone()).collect();
+                    assert_eq!(names, ["bottom", "top"], "both layers open in their order");
+                    assert!(app.ui.dialogs.is_empty());
+                    assert!(app.held_memory_prompts.is_empty());
+                    assert!(app.prompt_order.is_empty());
+                    assert!(app.jobs.opens.is_empty());
+                    assert_eq!(app.session.pending_preflight_bytes().unwrap(), 0, "the retry releases the preflight");
+                }
+                shot(&mut h, &dir, "06-background-approved-document.png");
+            });
+        });
+    }
+
+    /// An ordinary small PSD under a comfortable measured budget opens immediately: no prompt,
+    /// no held source, both layers present.
+    #[test]
+    #[ignore = "renders PSD memory-consent evidence PNGs; needs a wgpu adapter"]
+    fn psd_memory_evidence_small_import_opens_without_a_prompt() {
+        let _gpu = photocraft_testkit::gpu_lock();
+        let gb = 1u64 << 30;
+        let dir = evidence_dir();
+        let psd = recovery_psd::make_psd(false);
+        let mut h = harness(false);
+        let snap = photocraft_io::memory::MemorySnapshot { available_ram: Some(16 * gb), swap_free: None, commit_headroom: None };
+        photocraft_io::memory::with_mock_memory(snap, || {
+            {
+                let app = h.state_mut();
+                app.open_bytes_from("small.psd", &psd, Some("/evidence/small.psd")).unwrap();
+                assert_eq!(app.session.documents().len(), 1, "a small import opens at once");
+                assert_eq!(app.session.active().unwrap().doc.layers.len(), 2);
+                assert!(app.ui.dialogs.is_empty(), "no consent prompt for an automatically admitted file");
+                assert!(app.held_memory_prompts.is_empty());
+                assert_eq!(app.session.pending_preflight_bytes().unwrap(), 0, "no source is held");
+            }
+            shot(&mut h, &dir, "07-small-import-no-prompt.png");
+        });
+    }
+
+    /// Over the hard ceiling: the refusal is typed (estimate and ceiling intact) in both IO and
+    /// the engine, no approval can raise it, and the UI reports the failure with no document.
+    #[test]
+    #[ignore = "renders PSD memory-consent evidence PNGs; needs a wgpu adapter"]
+    fn psd_memory_evidence_hard_budget_refusal_is_typed() {
+        if cfg!(target_pointer_width = "32") {
+            return; // the 4 GiB budget is already the 32-bit aggregate cap
+        }
+        let _gpu = photocraft_testkit::gpu_lock();
+        let gb = 1u64 << 30;
+        let dir = evidence_dir();
+        let bytes = recovery_psd::make_psd(false);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("too_big.psd");
+        std::fs::write(&path, &bytes).unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let snap = photocraft_io::memory::MemorySnapshot { available_ram: Some(4 * gb), swap_free: None, commit_headroom: None };
+        let hard = photocraft_io::memory::resolve_budget(snap, None).hard_limit;
+        assert!(hard < u64::MAX, "the mock host resolves a finite hard ceiling");
+        let mut h = harness(false);
+        photocraft_io::memory::with_mock_memory(snap, || {
+            photocraft_io::psd_budget::with_test_estimate_charge(hard + 1, || {
+                match photocraft_io::import_with_options(&path, &bytes, &photocraft_io::ImportOptions::default()) {
+                    Err(photocraft_io::IoError::PsdImportBudget { required, limit }) => {
+                        assert!(required > hard, "the estimate is above the ceiling: {required} > {hard}");
+                        assert_eq!(limit, hard, "the refusal reports the hard ceiling");
+                    }
+                    other => panic!("expected a typed hard-budget refusal, got {other:?}"),
+                }
+                let err = h.state_mut().session.execute("file.openAs", json!({"path": path.clone(), "approveHighMemory": true})).unwrap_err();
+                match err {
+                    EngineError::PsdHardBudget { name, required, limit } => {
+                        assert_eq!(name, path);
+                        assert!(required > hard && limit == hard);
+                    }
+                    other => panic!("file.openAs must keep name/required/limit, got {other}"),
+                }
+                let app = h.state_mut();
+                assert_eq!(app.open_paths(&[path.clone()]), 0, "the UI opens nothing");
+                assert!(app.session.documents().is_empty());
+                assert!(app.ui.dialogs.is_empty(), "a hard refusal has no approval prompt");
+                assert!(app.held_memory_prompts.is_empty());
+                assert!(app.ui.status_error, "the failure reaches the status bar");
+                assert!(app.ui.status.contains("limit is"), "{}", app.ui.status);
+                assert_eq!(app.session.pending_preflight_bytes().unwrap(), 0, "no source is held");
+            });
+        });
+        shot(&mut h, &dir, "08-hard-budget-refusal.png");
+    }
 }
