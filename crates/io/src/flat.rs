@@ -15,12 +15,17 @@ const BAND_BYTES: usize = 32 << 20;
 
 #[cfg(test)]
 thread_local! {
-    /// Called on this thread just before a layered TIFF's composite is decoded. A test proves
-    /// that admission refused a file without ever reaching that decode.
+    /// Called on this thread just before a layered TIFF's composite, or a flat TIFF's whole or
+    /// group decode, starts. A test proves that admission refused a file without ever reaching
+    /// that decode.
     static TEST_BEFORE_COMPOSITE_DECODE: std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    /// Called on this thread just before a decoded flat image is converted into a document. A
+    /// test proves that the working allowance refused it before the conversion allocated.
+    static TEST_BEFORE_FLAT_CONVERSION: std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Runs `f` with `hook` called on this thread just before a layered TIFF's composite is decoded.
+/// Runs `f` with `hook` called on this thread just before a layered TIFF's composite, or a flat
+/// TIFF's whole or group decode, starts.
 #[cfg(test)]
 pub(crate) fn with_before_composite_decode<R>(hook: std::rc::Rc<dyn Fn()>, f: impl FnOnce() -> R) -> R {
     struct Reset(Option<std::rc::Rc<dyn Fn()>>);
@@ -46,12 +51,37 @@ fn before_composite_decode() {
 #[cfg(not(test))]
 fn before_composite_decode() {}
 
-/// The codec limits a flat import uses: the caller's decoded-pixel allowance lowers the codec's
-/// default cap; 0 keeps the defaults.
+/// Runs `f` with `hook` called on this thread just before a decoded flat image is converted.
+#[cfg(test)]
+pub(crate) fn with_before_flat_conversion<R>(hook: std::rc::Rc<dyn Fn()>, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<std::rc::Rc<dyn Fn()>>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_BEFORE_FLAT_CONVERSION.with(|h| *h.borrow_mut() = self.0.take());
+        }
+    }
+    let prev = TEST_BEFORE_FLAT_CONVERSION.with(|h| h.borrow_mut().replace(hook));
+    let _reset = Reset(prev);
+    f()
+}
+
+/// Runs the test hook installed by [`with_before_flat_conversion`], if any.
+#[cfg(test)]
+fn before_flat_conversion() {
+    if let Some(hook) = TEST_BEFORE_FLAT_CONVERSION.with(|h| h.borrow().clone()) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn before_flat_conversion() {}
+
+/// The codec limits a flat import uses: the caller's decoded-pixel allowance and its total
+/// working allowance lower the codec's default cap; 0 keeps the defaults.
 fn decode_limits(opts: &crate::ImportOptions) -> codecs::Limits {
     let mut limits = codecs::Limits::default();
-    if opts.flat_max_pixel_bytes > 0 {
-        limits.max_alloc = limits.max_alloc.min(opts.flat_max_pixel_bytes);
+    for cap in [opts.flat_max_pixel_bytes, opts.flat_max_working_bytes].into_iter().filter(|cap| *cap > 0) {
+        limits.max_alloc = limits.max_alloc.min(cap);
     }
     limits
 }
@@ -67,8 +97,10 @@ pub fn import_flat(name: &str, bytes: &[u8]) -> Result<ImportResult, IoError> {
 /// A layered TIFF's composite, layer and retained-image estimate is admitted through
 /// [`crate::memory::evaluate_psd_admission`] with these settings; a zero
 /// `psd_max_pixel_bytes` therefore means the adaptive budget, and
-/// `psd_high_memory_approved`/`psd_approved_estimate` apply to it like to a PSD. The other flat
-/// decoders keep their own limits.
+/// `psd_high_memory_approved`/`psd_approved_estimate` apply to it like to a PSD. Every flat
+/// decoder caps its decoded buffer to `flat_max_pixel_bytes` and `flat_max_working_bytes`, and
+/// the conversion into the document is refused before it allocates when it would exceed the
+/// working allowance.
 pub(crate) fn import_flat_with_options(
     name: &str,
     bytes: &[u8],
@@ -90,6 +122,10 @@ pub(crate) fn import_flat_with_options(
         Some(Format::Gif) => codecs::gif_palette(bytes),
         _ => None,
     };
+    // The decoded image and its conversion into the layer are alive together: refuse before
+    // `image_to_document` allocates the converted bands, tiles and channels.
+    admit_flat_working_bytes(&img, opts.flat_max_working_bytes)?;
+    before_flat_conversion();
     let mut r = image_to_document(name, &img)?;
     if let Some((colors, transparent)) = palette.filter(|(c, _)| !c.is_empty())
         && r.document.mode == ColorMode::Rgb
@@ -302,7 +338,9 @@ pub fn import_tiff_page(name: &str, bytes: &[u8], page: Option<usize>) -> Result
 ///
 /// A layered page takes the same caller limit and high-memory approval as a PSD
 /// (`ImportOptions::psd_*`): its composite, PSD layer model and retained decoded image are
-/// estimated from the page's tags and admitted *before* the composite is decoded. A cancelled
+/// estimated from the page's tags and admitted *before* the composite is decoded. A flat page's
+/// streamed peak, or a whole-image decode with extra samples, is bounded by
+/// [`crate::ImportOptions::flat_max_working_bytes`] before any pixel is decoded. A cancelled
 /// job stops waiting for the PSD decode gate and between bands.
 pub fn import_tiff_page_with_options(
     name: &str,
@@ -320,10 +358,14 @@ pub fn import_tiff_page_with_options(
     }
     // Extra samples (alpha and spot channels) are only available from a whole-image decode.
     if bands.extra_samples() > 0 {
+        // Admit the whole decode, its orientation copy and the conversion before a pixel is
+        // decoded; the caller's flat working allowance bounds this page like any whole image.
+        let (w, h) = bands.dimensions();
+        admit_flat_bytes(whole_tiff_bytes(w, h, bands.layout(), bands.sample_type(), bands.extra_samples(), bands.orientation()), opts.flat_max_working_bytes)?;
         drop(bands);
         return import_tiff_with_extras(name, bytes, page, opts, ctl);
     }
-    tiff_to_document(name, bands.upright(), crate::memory::available, BAND_BYTES, ctl)
+    tiff_to_document(name, bands.upright(), crate::memory::available, BAND_BYTES, opts.flat_max_working_bytes, ctl)
 }
 
 /// A layered TIFF page: its layer tag and resources are read into a plan, the plan's estimate is
@@ -415,6 +457,7 @@ fn import_tiff_with_extras(
 ) -> Result<ImportResult, IoError> {
     ctl.check().map_err(|_| IoError::Cancelled)?;
     let keep = codecs::DecodeOptions { keep_orientation: true, limits: decode_limits(opts) };
+    before_composite_decode();
     let (img, orientation) = match page {
         None => (codecs::decode_with(bytes, &keep)?, codecs::tiff_orientation(bytes)),
         Some(p) => (codecs::decode_tiff_page(bytes, p, &keep)?, codecs::tiff_page_orientation(bytes, p)),
@@ -426,12 +469,14 @@ fn import_tiff_with_extras(
 /// A flat TIFF page as a single-layer document, decoded a group of rows at a time into the
 /// layer's tiles: only one group exists beside the document. `available`: the memory this
 /// process can still use (see [`crate::memory::available`]); `budget`: the source bytes per core
-/// converted at a time ([`BAND_BYTES`]); `ctl`: the job's cancellation, checked per group.
+/// converted at a time ([`BAND_BYTES`]); `limit`: the caller's flat working allowance (0 keeps
+/// the importer's own checks); `ctl`: the job's cancellation, checked per group.
 fn tiff_to_document(
     name: &str,
     mut bands: codecs::TiffBands<'_>,
     available: impl FnOnce() -> Option<u64>,
     budget: usize,
+    limit: u64,
     ctl: &photocraft_raster::Interrupt,
 ) -> Result<ImportResult, IoError> {
     let (w, h) = bands.dimensions();
@@ -439,6 +484,12 @@ fn tiff_to_document(
     let f = document_format(layout, sample);
     let fmt = PixelFormat::new(f.mode, f.depth, true);
     let bpp = fmt.bytes_per_pixel() as u64;
+    // The caller's allowance is a hard bound on the whole streamed import, before any group is
+    // decoded; the importer's own check below still measures free memory when no limit is set.
+    if limit > 0 {
+        let group = bands.group_bytes()? as u64;
+        admit_flat_bytes(streamed_tiff_bytes(w, h, layout, sample, group), limit)?;
+    }
     if needs_memory_check(w, h, layout, sample) {
         // The layer's tiles, plus a group as decoded, turned upright, converted and read into a
         // worker's scratch buffer. Linux overcommits, so the tiles below are allocated even when
@@ -457,6 +508,7 @@ fn tiff_to_document(
         let gb = (u64::from(w) * u64::from(h)).saturating_mul(bpp) as f64 / 1e9;
         IoError::Unsupported(format!("not enough memory to open this {w} × {h} px image: it needs about {gb:.1} GB ({e})"))
     };
+    before_composite_decode();
     bands.decode(|x, y, group: &Image| -> Result<(), IoError> {
         ctl.check().map_err(|_| IoError::Cancelled)?;
         let (gw, gh) = group.dimensions();
@@ -493,6 +545,92 @@ fn tiff_to_document(
 fn surface_bytes(w: u32, h: u32, fmt: PixelFormat) -> u64 {
     let tiles = |n: u32| u64::from(n).div_ceil(TILE_SIZE as u64).saturating_mul(TILE_SIZE as u64);
     tiles(w).saturating_mul(tiles(h)).saturating_mul(fmt.bytes_per_pixel() as u64)
+}
+
+/// Refuses the caller's flat working allowance: `required` bytes of pixels and their document
+/// conversion must fit `limit` (0 keeps the importer's own checks).
+fn admit_flat_bytes(required: u64, limit: u64) -> Result<(), IoError> {
+    if limit > 0 && required > limit {
+        return Err(IoError::PsdImportBudget { required, limit });
+    }
+    Ok(())
+}
+
+/// Refuses a decoded flat image whose conversion into its document would exceed the caller's
+/// working allowance, before [`image_to_document`] allocates anything.
+fn admit_flat_working_bytes(img: &Image, limit: u64) -> Result<(), IoError> {
+    if limit == 0 {
+        return Ok(());
+    }
+    let (w, h) = img.dimensions();
+    let extras = img.meta.extra_samples.len().min(codecs::MAX_EXTRA_SAMPLES);
+    let planes = img.meta.extra_samples.iter().fold(0u64, |n, e| n.saturating_add(e.data.len() as u64));
+    let decoded = (img.data().len() as u64).saturating_add(planes);
+    admit_flat_bytes(image_document_bytes(w, h, img.layout(), img.sample_type(), extras, decoded), limit)
+}
+
+/// One conversion band's copied source, converted bytes and intermediate float planes.
+/// A small image charges only its own rows; an oversized row still has to fit whole.
+fn conversion_band_bytes(w: u32, h: u32, layout: ChannelLayout, sample: CSample) -> u64 {
+    let f = document_format(layout, sample);
+    if (layout == f.layout && sample == f.sample) || w == 0 || h == 0 {
+        return 0;
+    }
+    let row = u64::from(w).saturating_mul(layout.channels() as u64).saturating_mul(sample.bytes() as u64);
+    let out_row = u64::from(w).saturating_mul(f.layout.channels() as u64).saturating_mul(f.sample.bytes() as u64);
+    let rows = (BAND_BYTES as u64 / row.max(1)).clamp(1, u64::from(h));
+    let floats = if sample != f.sample {
+        // Image::convert normalizes the source, converts its layout when needed, then
+        // quantizes while both float planes are still alive. Adding alpha at the same
+        // sample depth uses its direct copy path and needs neither plane.
+        let channels = layout.channels() + if layout != f.layout { f.layout.channels() } else { 0 };
+        u64::from(w).saturating_mul(channels as u64).saturating_mul(4)
+    } else {
+        0
+    };
+    row.saturating_add(out_row).saturating_add(floats).saturating_mul(rows)
+}
+
+/// Bytes a whole decoded image, its banded conversion and the document built from it need at
+/// their peak: `decoded` (the image's pixels and extra-sample planes, or the decoder's estimate),
+/// one conversion band, the layer's tile-rounded surface and, per extra sample, its channel's
+/// tile-rounded surface and the plane copy [`crate::tiff_layers::channels_from_extras`] makes.
+fn image_document_bytes(w: u32, h: u32, layout: ChannelLayout, sample: CSample, extras: usize, decoded: u64) -> u64 {
+    let f = document_format(layout, sample);
+    let fmt = PixelFormat::new(f.mode, f.depth, true);
+    let pixels = u64::from(w).saturating_mul(u64::from(h));
+    let e = extras as u64;
+    let channel = surface_bytes(w, h, PixelFormat::new(ColorMode::Grayscale, f.depth, false));
+    surface_bytes(w, h, fmt)
+        .saturating_add(decoded)
+        .saturating_add(conversion_band_bytes(w, h, layout, sample))
+        .saturating_add(e.saturating_mul(channel.saturating_add(pixels.saturating_mul(f.sample.bytes() as u64))))
+}
+
+/// Bytes a streamed flat TIFF page needs at its peak: the layer's tiles, and one group of bands
+/// decoded, turned upright (its copy) and converted.
+fn streamed_tiff_bytes(w: u32, h: u32, layout: ChannelLayout, sample: CSample, group: u64) -> u64 {
+    let f = document_format(layout, sample);
+    let fmt = PixelFormat::new(f.mode, f.depth, true);
+    let in_bpp = (layout.channels() as u64).saturating_mul(sample.bytes() as u64).max(1);
+    let group_px = group / in_bpp;
+    let float_bpp = if sample != f.sample { (layout.channels() + if layout != f.layout { f.layout.channels() } else { 0 }) as u64 * 4 } else { 0 };
+    surface_bytes(w, h, fmt)
+        .saturating_add(group.saturating_mul(3))
+        .saturating_add(group_px.saturating_mul((fmt.bytes_per_pixel() as u64).saturating_add(float_bpp)))
+}
+
+/// Bytes a whole-image flat TIFF page needs at its peak before it is decoded: the decoded image
+/// and its extra-sample planes, the orientation copy when the page is turned (pixels and
+/// planes), and the conversion into the document.
+fn whole_tiff_bytes(w: u32, h: u32, layout: ChannelLayout, sample: CSample, extras: usize, orientation: u16) -> u64 {
+    let pixels = u64::from(w).saturating_mul(u64::from(h));
+    let in_bps = sample.bytes() as u64;
+    let e = extras as u64;
+    let decoded = pixels.saturating_mul((layout.channels() as u64).saturating_add(e.saturating_mul(2))).saturating_mul(in_bps);
+    let turned = if (2..=8).contains(&orientation) { pixels.saturating_mul((layout.channels() as u64).saturating_add(e)).saturating_mul(in_bps) } else { 0 };
+    let (w, h) = if (5..=8).contains(&orientation) { (h, w) } else { (w, h) };
+    image_document_bytes(w, h, layout, sample, extras, decoded.saturating_add(turned))
 }
 
 /// Bytes a flat page that is decoded whole needs: the decoded image and its extra-sample planes,
@@ -1591,7 +1729,7 @@ mod tiff_banded_tests {
         let img = Image::from_raw(64, 64, ChannelLayout::Rgb, CSample::U8, vec![77; 64 * 64 * 3]).unwrap();
         let bytes = codecs::encode(&img, Format::Tiff, &codecs::EncodeOptions::default()).unwrap();
         let bands = codecs::TiffBands::open(&bytes, None, &codecs::Limits::banded()).unwrap();
-        let r = tiff_to_document("small.tif", bands.upright(), || Some(0), BAND_BYTES, &photocraft_raster::Interrupt::NONE).unwrap();
+        let r = tiff_to_document("small.tif", bands.upright(), || Some(0), BAND_BYTES, 0, &photocraft_raster::Interrupt::NONE).unwrap();
         assert_eq!((r.document.size.width, r.document.size.height), (64, 64));
     }
 
@@ -1607,7 +1745,7 @@ mod tiff_banded_tests {
             let bytes = codecs::encode(&img, Format::Tiff, &codecs::EncodeOptions::default()).unwrap();
             let bands = codecs::TiffBands::open(&bytes, None, &codecs::Limits::banded()).unwrap();
             let row = w as usize * layout.channels() * sample.bytes();
-            let r = tiff_to_document("rounds.tif", bands, || None, 3 * row, &photocraft_raster::Interrupt::NONE).unwrap();
+            let r = tiff_to_document("rounds.tif", bands, || None, 3 * row, 0, &photocraft_raster::Interrupt::NONE).unwrap();
             let f = document_format(layout, sample);
             let want = codecs::decode(&bytes).unwrap().convert(f.layout, f.sample);
             let LayerContent::Raster(s) = &r.document.layers[0].content else { panic!("not a raster layer") };
@@ -1919,5 +2057,161 @@ mod streamed_png_tests {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod flat_working_budget_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use super::*;
+
+    /// A hook that counts how often it runs.
+    fn hook(count: &Rc<Cell<u32>>) -> Rc<dyn Fn()> {
+        let count = Rc::clone(count);
+        Rc::new(move || count.set(count.get() + 1))
+    }
+
+    /// A 16-bit float grayscale image converts to a 32-bit GrayA layer: a caller allowance that
+    /// admits the decoded image but not that conversion is refused before the conversion starts.
+    #[test]
+    fn f16_gray_conversion_is_refused_before_it_starts() {
+        let (w, h) = (512u32, 512u32);
+        let src = Image::from_raw(w, h, ChannelLayout::Gray, CSample::F16, vec![0u8; (w * h * 2) as usize]).unwrap();
+        let required = image_document_bytes(w, h, ChannelLayout::Gray, CSample::F16, 0, src.data().len() as u64);
+        // Per pixel: decoded F16, copied F16 band, normalized Gray, converted GrayA,
+        // quantized GrayA F32 and the tile-aligned GrayA F32 layer.
+        assert_eq!(required, u64::from(w) * u64::from(h) * (2 + 2 + 4 + 8 + 8 + 8));
+        assert!(required > src.data().len() as u64, "the conversion adds to the decoded image");
+        let bytes = codecs::encode(&src, Format::OpenExr, &codecs::EncodeOptions::default()).unwrap();
+
+        let converted = Rc::new(Cell::new(0));
+        let refused = crate::ImportOptions { flat_max_working_bytes: required - 1, ..Default::default() };
+        let r = with_before_flat_conversion(hook(&converted), || import_flat_with_options("f16.exr", &bytes, &refused, &photocraft_raster::Interrupt::NONE));
+        match r {
+            Err(IoError::PsdImportBudget { required: r, limit }) => assert_eq!((r, limit), (required, required - 1)),
+            other => panic!("expected the working allowance to refuse, got {:?}", other.map(|_| ())),
+        }
+        assert_eq!(converted.get(), 0, "a refused image must not reach the conversion");
+
+        let admitted = crate::ImportOptions { flat_max_working_bytes: required, ..Default::default() };
+        let opened =
+            with_before_flat_conversion(hook(&converted), || import_flat_with_options("f16.exr", &bytes, &admitted, &photocraft_raster::Interrupt::NONE))
+                .expect("within the working allowance");
+        assert_eq!((opened.document.mode, opened.document.depth), (ColorMode::Grayscale, SampleType::F32));
+        assert_eq!(converted.get(), 1, "the admitted image converts exactly once");
+    }
+
+    fn encoded_tiff(img: &Image) -> Vec<u8> {
+        codecs::encode(img, Format::Tiff, &codecs::EncodeOptions::default()).unwrap()
+    }
+
+    /// A streamed TIFF's peak (the layer's tiles and one group decoded, turned and converted) is
+    /// checked before any group is decoded: a small allowance refuses it without decoding, and
+    /// one at the estimate opens it.
+    #[test]
+    fn streamed_tiff_peak_is_refused_before_decoding() {
+        let img = Image::from_raw(512, 512, ChannelLayout::Rgb, CSample::U8, vec![40; 512 * 512 * 3]).unwrap();
+        let bytes = encoded_tiff(&img);
+        let bands = codecs::TiffBands::open(&bytes, None, &codecs::Limits::banded()).unwrap();
+        let (w, h) = bands.dimensions();
+        let required = streamed_tiff_bytes(w, h, bands.layout(), bands.sample_type(), bands.group_bytes().unwrap() as u64);
+        drop(bands);
+
+        let decoded = Rc::new(Cell::new(0));
+        let refused = crate::ImportOptions { flat_max_working_bytes: required - 1, ..Default::default() };
+        let r = with_before_composite_decode(hook(&decoded), || {
+            crate::import_tiff_page_with_options("stream.tif", &bytes, None, &refused, &photocraft_raster::Interrupt::NONE)
+        });
+        match r {
+            Err(IoError::PsdImportBudget { required: r, limit }) => assert_eq!((r, limit), (required, required - 1)),
+            other => panic!("expected the streaming peak to refuse, got {:?}", other.map(|_| ())),
+        }
+        assert_eq!(decoded.get(), 0, "a refused page must not decode a group");
+
+        let admitted = crate::ImportOptions { flat_max_working_bytes: required, ..Default::default() };
+        let opened = with_before_composite_decode(hook(&decoded), || {
+            crate::import_tiff_page_with_options("stream.tif", &bytes, None, &admitted, &photocraft_raster::Interrupt::NONE)
+        })
+        .expect("within the working allowance");
+        assert_eq!(opened.document.layers.len(), 1);
+        assert_eq!(decoded.get(), 1, "the admitted page is decoded once");
+    }
+
+    /// Sets a TIFF's first directory's Orientation entry by appending a copied directory with
+    /// one extra entry and pointing the header at it: the pixel offsets stay where they are.
+    fn with_orientation(bytes: &[u8], orientation: u16) -> Vec<u8> {
+        let le = bytes.starts_with(b"II");
+        let u16_at = |b: &[u8], at: usize| -> u16 {
+            let p = [b[at], b[at + 1]];
+            if le { u16::from_le_bytes(p) } else { u16::from_be_bytes(p) }
+        };
+        let u32_at = |b: &[u8], at: usize| -> u32 {
+            let p = [b[at], b[at + 1], b[at + 2], b[at + 3]];
+            if le { u32::from_le_bytes(p) } else { u32::from_be_bytes(p) }
+        };
+        let put16 = |v: u16| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+        let put32 = |v: u32| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+        let first = u32_at(bytes, 4) as usize;
+        let n = u16_at(bytes, first) as usize;
+        let next = u32_at(bytes, first + 2 + n * 12);
+        let mut entries: Vec<[u8; 12]> = (0..n).map(|k| bytes[first + 2 + k * 12..first + 2 + (k + 1) * 12].try_into().unwrap()).collect();
+        let mut entry = [0u8; 12];
+        entry[..2].copy_from_slice(&put16(274));
+        entry[2..4].copy_from_slice(&put16(3));
+        entry[4..8].copy_from_slice(&put32(1));
+        entry[8..10].copy_from_slice(&put16(orientation));
+        let tag = |e: &[u8; 12]| u16_at(e, 0);
+        let at = entries.iter().position(|e| tag(e) > 274).unwrap_or(entries.len());
+        entries.insert(at, entry);
+
+        let mut out = bytes.to_vec();
+        if out.len() % 2 == 1 {
+            out.push(0);
+        }
+        let offset = u32::try_from(out.len()).unwrap();
+        out.extend_from_slice(&put16(entries.len() as u16));
+        for e in entries {
+            out.extend_from_slice(&e);
+        }
+        out.extend_from_slice(&put32(next));
+        out[4..8].copy_from_slice(&put32(offset));
+        out
+    }
+
+    /// A whole-image TIFF with an extra sample and an Orientation tag: its decode, orientation
+    /// copy (planes included) and conversion are admitted before any pixel is decoded.
+    #[test]
+    fn oriented_extras_are_refused_before_decoding() {
+        let (w, h) = (64u32, 48u32);
+        let mut src = Image::from_raw(w, h, ChannelLayout::Rgb, CSample::U8, vec![90; (w * h * 3) as usize]).unwrap();
+        src.meta.extra_samples = vec![codecs::ExtraSample { kind: 0, data: vec![128; (w * h) as usize] }];
+        let bytes = with_orientation(&encoded_tiff(&src), 6);
+        let bands = codecs::TiffBands::open(&bytes, None, &codecs::Limits::banded()).unwrap();
+        assert_eq!((bands.extra_samples(), bands.orientation()), (1, 6), "the fixture is an oriented extras page");
+        let (w, h) = bands.dimensions();
+        let required = whole_tiff_bytes(w, h, bands.layout(), bands.sample_type(), bands.extra_samples(), bands.orientation());
+        drop(bands);
+
+        let decoded = Rc::new(Cell::new(0));
+        let refused = crate::ImportOptions { flat_max_working_bytes: required - 1, ..Default::default() };
+        let r = with_before_composite_decode(hook(&decoded), || {
+            crate::import_tiff_page_with_options("oriented.tif", &bytes, None, &refused, &photocraft_raster::Interrupt::NONE)
+        });
+        match r {
+            Err(IoError::PsdImportBudget { required: r, limit }) => assert_eq!((r, limit), (required, required - 1)),
+            other => panic!("expected the oriented extras page to refuse, got {:?}", other.map(|_| ())),
+        }
+        assert_eq!(decoded.get(), 0, "a refused page must not decode its pixels");
+
+        let admitted = crate::ImportOptions { flat_max_working_bytes: required, ..Default::default() };
+        let opened = with_before_composite_decode(hook(&decoded), || {
+            crate::import_tiff_page_with_options("oriented.tif", &bytes, None, &admitted, &photocraft_raster::Interrupt::NONE)
+        })
+        .expect("within the working allowance");
+        assert_eq!((opened.document.size.width, opened.document.size.height), (h, w), "the page opens upright");
+        assert_eq!(opened.document.channels.len(), 1, "the extra sample becomes a channel");
+        assert_eq!(decoded.get(), 1, "the admitted page is decoded once");
     }
 }

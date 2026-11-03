@@ -35,7 +35,7 @@ fn time<T>(name: &str, only: &Option<String>, f: impl FnOnce() -> T) -> Option<T
     Some(r)
 }
 
-fn main() {
+fn main() -> Result<(), String> {
     let only = std::env::args().nth(1);
     let (w, h) = (6000usize, 4000usize);
     let px = pattern(w, h);
@@ -150,7 +150,7 @@ fn main() {
         hdr::tone_map(&mut m.px, w, h, &ToneMethod::LocalAdaptation(HdrToning { radius: 7.0, strength: 0.52, ..Default::default() }));
     });
     time("crop and straighten: detection", &only, || photocraft_algo::scancrop::find_photos(w, h, &px));
-    time("panorama: 4 × 2 MP register + blend", &only, || {
+    let panorama_result = time("panorama: 4 × 2 MP register + blend", &only, || -> Result<(), String> {
         let (sw, sh) = (1700usize, 1200usize);
         let views: Vec<Vec<f32>> = (0..4)
             .map(|k| {
@@ -190,7 +190,10 @@ fn main() {
             })
             .collect();
         let t1 = Instant::now();
-        let _ = panorama::multiband(cw, sh, &rois, &wts, panorama::blend_levels(cw, sh));
+        let _ = panorama::multiband(cw, sh, &rois, &wts, panorama::blend_levels(cw, sh)).map_err(|e| format!("multiband: {e}"))?;
         println!("  multiband {:.1} ms", t1.elapsed().as_secs_f64() * 1000.0);
+        Ok(())
     });
+    panorama_result.transpose()?;
+    Ok(())
 }

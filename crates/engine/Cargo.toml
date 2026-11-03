@@ -69,3 +69,8 @@ photocraft-testkit = { workspace = true }
 wat = "1.228"
 # Synthetic multi-part EXR fixtures for the parts-commands tests.
 exr = { version = "1.73", default-features = false }
+
+# Measures the allocations of the Photomerge memory tests. Native-only: the crate installs a
+# forwarding global allocator, and the web build never compiles those tests.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+allocation-counter = "=0.8.1"
