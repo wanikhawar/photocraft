@@ -53,8 +53,8 @@ fn textured(fmt: PixelFormat, area: Rect, base: f32) -> Surface {
     s
 }
 
-fn single_worker() -> rayon::ThreadPool {
-    ThreadPoolBuilder::new().num_threads(1).build().expect("a one-worker Rayon pool")
+fn single_worker() -> std::result::Result<rayon::ThreadPool, rayon::ThreadPoolBuildError> {
+    ThreadPoolBuilder::new().num_threads(1).build()
 }
 
 fn pyramid_levels(f: &BlendFixture) -> usize {
@@ -85,7 +85,7 @@ fn seam_blend_allocations_fit_the_estimate() {
     let u8_fixture = fixture(PixelFormat::RGBA8, (150, 110), (150, 110), (80, 40));
     let u16_fixture = fixture(PixelFormat::RGBA16, (90, 70), (90, 70), (40, 25));
     assert_ne!(pyramid_levels(&u8_fixture), pyramid_levels(&u16_fixture), "the fixtures must exercise different pyramid levels");
-    let pool = single_worker();
+    let pool = single_worker().expect("a one-worker Rayon pool");
     for f in [&u8_fixture, &u16_fixture] {
         // The closure below creates the warped surfaces itself, so the estimate is asked for the
         // warp-surfaces-plus-blend/output phase only: no separate source surfaces exist.
@@ -134,7 +134,7 @@ fn blend_inputs() -> (Vec<RoiImage>, Vec<Vec<f32>>) {
 fn multiband_refuses_a_band_before_allocating() {
     let (w, h, levels) = (64usize, 48usize, 3usize);
     let (imgs, weights) = blend_inputs();
-    let pool = single_worker();
+    let pool = single_worker().expect("a one-worker Rayon pool");
     // Warm the worker's allocator counter so a first-use initialisation can't be mistaken for
     // the call under test allocating.
     pool.install(|| {
@@ -156,7 +156,7 @@ fn multiband_refuses_a_band_before_allocating() {
 fn multiband_admitted_bands_allocate_and_return_output() {
     let (w, h, ch, levels) = (64usize, 48usize, 3usize, 3usize);
     let (imgs, weights) = blend_inputs();
-    let pool = single_worker();
+    let pool = single_worker().expect("a one-worker Rayon pool");
     let mut outcome = None;
     let info = pool.install(|| {
         measure(|| {
