@@ -359,6 +359,91 @@ fn png_rows_read_compressed_text_in_bounded_batches() {
     }
 }
 
+/// An Adam7 image whose compressed text needs many metadata yields: the pixels are decoded
+/// once, before the first yield, and later steps only read text.
+#[test]
+fn png_rows_finish_adam7_text_in_bounded_batches() {
+    let img = synth(19, 23, ChannelLayout::Rgba, SampleType::U8, 9, 0.4);
+    let base = encode(&img, Format::Png, &EncodeOptions { png_interlaced: true, ..Default::default() }).unwrap();
+    let text = "A".repeat(150_000);
+    for kind in [b"zTXt", b"iTXt"] {
+        let bytes = with_chunks_before_iend(&base, &[png_text_chunk(kind, b"Comment", text.as_bytes())]);
+        let mut rows = PngDecodeRows::new(bytes.as_slice(), &Limits::default()).unwrap();
+        let mut calls = 0;
+        let stepped = loop {
+            calls += 1;
+            if let Some(img) = rows.step(&mut || false).unwrap() {
+                break img;
+            }
+            assert!(calls < 100_000, "the decoder never finished");
+        };
+        assert_eq!(stepped, decode(&bytes).unwrap(), "{kind:?}");
+        assert_eq!(stepped.meta.text, vec![("Comment".into(), text.clone())], "{kind:?}: the whole value is kept");
+        assert!(calls > 20, "{kind:?}: {calls} bounded calls after the one Adam7 pass");
+    }
+}
+
+/// An uncompressed `iTXt` chunk (`value` is its text, so its CRC covers the whole value).
+fn png_itxt_uncompressed(keyword: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut data = keyword.to_vec();
+    data.push(0);
+    data.extend_from_slice(&[0, 0, 0, 0]);
+    data.extend_from_slice(value);
+    png_chunk(b"iTXt", &data)
+}
+
+/// The CRC of a large text chunk takes bounded batches too, before any of its value is read.
+#[test]
+fn png_rows_read_a_large_text_crc_in_bounded_batches() {
+    let img = synth(5, 5, ChannelLayout::Rgb, SampleType::U8, 3, 0.2);
+    let base = encode(&img, Format::Png, &EncodeOptions::default()).unwrap();
+    let text: String = (0..300_000u32).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+    let bytes = with_chunks_before_iend(&base, &[png_itxt_uncompressed(b"Comment", text.as_bytes())]);
+    let mut rows = PngDecodeRows::new(bytes.as_slice(), &Limits::default()).unwrap();
+    let mut calls = 0;
+    let stepped = loop {
+        calls += 1;
+        if let Some(img) = rows.step(&mut || false).unwrap() {
+            break img;
+        }
+        assert!(calls < 100_000, "the decoder never finished");
+    };
+    assert_eq!(stepped.meta.text, vec![("Comment".into(), text)]);
+    assert!(calls > 60, "{calls} calls: the CRC and the value each take bounded batches");
+}
+
+/// A text chunk whose CRC does not match is still dropped after its bounded CRC batches.
+#[test]
+fn png_rows_drop_a_corrupt_text_crc() {
+    let img = synth(5, 5, ChannelLayout::Rgb, SampleType::U8, 3, 0.2);
+    let base = encode(&img, Format::Png, &EncodeOptions::default()).unwrap();
+    let mut chunk = png_itxt_uncompressed(b"Comment", b"not accepted");
+    let at = chunk.len() - 5;
+    chunk[at] ^= 0xFF;
+    let bytes = with_chunks_before_iend(&base, &[chunk]);
+    let stepped = decode_in_steps(&bytes, 0).unwrap().0;
+    assert!(stepped.meta.text.is_empty(), "a broken CRC drops the text");
+    assert_eq!(stepped, decode(&bytes).unwrap(), "the one-pass decode drops it too");
+}
+
+/// An uncompressed iTXt value that is not UTF-8 is dropped without charging its bytes against
+/// the budget, even when it is larger than all of it: the previous reader checked UTF-8 first.
+#[test]
+fn png_rows_drop_invalid_uncompressed_text_before_charging_the_budget() {
+    let img = synth(4, 4, ChannelLayout::Rgb, SampleType::U8, 3, 0.2);
+    let base = encode(&img, Format::Png, &EncodeOptions::default()).unwrap();
+    let mut value = vec![b'A'; 12_000];
+    value[11_999] = 0xFF;
+    let bytes = with_chunks_before_iend(&base, &[png_itxt_uncompressed(b"Comment", &value)]);
+    let opts = DecodeOptions { limits: Limits { max_alloc: 200, ..Default::default() }, ..Default::default() };
+    let mut rows = PngDecodeRows::new(bytes.as_slice(), &opts.limits).unwrap();
+    let stepped = rows.step(&mut || true).unwrap().unwrap();
+    let stepped = finish_png_decode(stepped, &opts).unwrap();
+    assert!(stepped.meta.text.is_empty(), "invalid UTF-8 is skipped, not a budget failure");
+    let whole = decode_with(&bytes, &opts).unwrap();
+    assert!(whole.meta.text.is_empty(), "the one-pass decode skips it too");
+}
+
 #[test]
 fn png_rows_fail_like_decode_on_damaged_files() {
     let img = synth(64, 64, ChannelLayout::Rgb, SampleType::U8, 11, 1.0);

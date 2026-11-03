@@ -129,6 +129,9 @@ pub struct PngDecodeRows<B: AsRef<[u8]>> {
     /// True once the pixel reader has been finished and the tail is known.
     tail: bool,
     done: bool,
+    /// Test-only count of the pixel finalization: metadata yields must not repeat it.
+    #[cfg(test)]
+    pixel_finalizations: u32,
 }
 
 impl<B: AsRef<[u8]>> PngDecodeRows<B> {
@@ -209,6 +212,8 @@ impl<B: AsRef<[u8]>> PngDecodeRows<B> {
             text: TextScan::default(),
             tail: false,
             done: false,
+            #[cfg(test)]
+            pixel_finalizations: 0,
         })
     }
 
@@ -228,44 +233,51 @@ impl<B: AsRef<[u8]>> PngDecodeRows<B> {
         if self.done {
             return Err(err("the image was already decoded"));
         }
-        if self.interlaced {
-            // An Adam7 frame is decoded in one go, over the whole output buffer.
-            self.buf.resize(self.size, 0);
-            let out = self.reader.next_frame(&mut self.buf).map_err(map_png_err)?;
-            self.buf.truncate(out.buffer_size());
-            self.rows = self.height;
-            if self.sample == SampleType::U16 {
-                to_native_endian(&mut self.buf);
-            }
-        }
-        while self.rows < self.height {
-            let at = self.rows.checked_mul(self.line).ok_or_else(|| err("image too large"))?;
-            let end = at.checked_add(self.line).ok_or_else(|| err("image too large"))?;
-            // Grow by one row at a time: the zero-fill of the output is spread over the decodes
-            // instead of stalling the first slice.
-            if self.buf.len() < end {
-                self.buf.resize(end, 0);
-            }
-            let row = self.buf.get_mut(at..end).ok_or_else(|| err("the image data is longer than the image"))?;
-            self.reader.read_row(row).map_err(map_png_err)?.ok_or_else(|| err("the image data ended early"))?;
-            if self.sample == SampleType::U16 {
-                to_native_endian(row);
-            }
-            self.rows += 1;
-            if self.rows < self.height && !more() {
-                return Ok(None);
-            }
-        }
-        if !self.interlaced {
-            // No row is left: this reads on to the end of the image data.
-            if self.reader.read_row(&mut []).map_err(map_png_err)?.is_some() {
-                return Err(err("the image has more rows than its header declares"));
-            }
-            self.buf.truncate(self.line.saturating_mul(self.height));
-        }
-        // The chunks after the pixels, one bounded batch at a time: a large text chunk never
-        // makes one step block, and what was accepted stays accepted when a step stops.
+        // Once the pixels are complete and the tail is known, a step only reads metadata:
+        // running the pixel reader again after `begin_tail` would decode an Adam7 frame twice
+        // or finish the image data again on every metadata yield.
         if !self.tail {
+            if self.interlaced {
+                // An Adam7 frame is decoded in one go, over the whole output buffer.
+                self.buf.resize(self.size, 0);
+                let out = self.reader.next_frame(&mut self.buf).map_err(map_png_err)?;
+                self.buf.truncate(out.buffer_size());
+                self.rows = self.height;
+                if self.sample == SampleType::U16 {
+                    to_native_endian(&mut self.buf);
+                }
+            }
+            while self.rows < self.height {
+                let at = self.rows.checked_mul(self.line).ok_or_else(|| err("image too large"))?;
+                let end = at.checked_add(self.line).ok_or_else(|| err("image too large"))?;
+                // Grow by one row at a time: the zero-fill of the output is spread over the decodes
+                // instead of stalling the first slice.
+                if self.buf.len() < end {
+                    self.buf.resize(end, 0);
+                }
+                let row = self.buf.get_mut(at..end).ok_or_else(|| err("the image data is longer than the image"))?;
+                self.reader.read_row(row).map_err(map_png_err)?.ok_or_else(|| err("the image data ended early"))?;
+                if self.sample == SampleType::U16 {
+                    to_native_endian(row);
+                }
+                self.rows += 1;
+                if self.rows < self.height && !more() {
+                    return Ok(None);
+                }
+            }
+            if !self.interlaced {
+                #[cfg(test)]
+                {
+                    self.pixel_finalizations += 1;
+                }
+                // No row is left: this reads on to the end of the image data.
+                if self.reader.read_row(&mut []).map_err(map_png_err)?.is_some() {
+                    return Err(err("the image has more rows than its header declares"));
+                }
+                self.buf.truncate(self.line.saturating_mul(self.height));
+            }
+            // The chunks after the pixels, one bounded batch at a time: a large text chunk never
+            // makes one step block, and what was accepted stays accepted when a step stops.
             self.begin_tail()?;
         }
         while !self.text.done {
@@ -291,18 +303,21 @@ impl<B: AsRef<[u8]>> PngDecodeRows<B> {
     }
 
     /// Reads one bounded batch of the chunks after the pixels: up to [`TEXT_CHUNK_BATCH`] chunks,
-    /// or one batch of one text chunk's value while its decompressor is mid-stream.
+    /// or one batch of one text chunk's CRC or value while either is mid-stream.
     fn text_batch(&mut self) -> Result<(), CodecError> {
         let bytes = self.bytes.clone();
         let bytes = bytes.as_ref();
         if let Some(pending) = self.text.pending.take() {
-            match inflate_text(pending, bytes)? {
-                TextBatch::More(p) => self.text.pending = Some(p),
-                TextBatch::Finished(p) => {
-                    let (keyword, keyword_len, kind, text) = (p.keyword, p.keyword_len, p.kind, p.out);
-                    self.text.accept(keyword, keyword_len, kind, text)?;
-                }
-                TextBatch::Invalid => {}
+            match pending {
+                TextPending::Crc(p) => self.crc_batch(p, bytes)?,
+                TextPending::Value(p) => match inflate_text(p, bytes)? {
+                    TextBatch::More(p) => self.text.pending = Some(TextPending::Value(p)),
+                    TextBatch::Finished(p) => {
+                        let (keyword, keyword_len, kind, text) = (p.keyword, p.keyword_len, p.kind, p.out);
+                        self.text.accept(keyword, keyword_len, kind, text)?;
+                    }
+                    TextBatch::Invalid => {}
+                },
             }
             return Ok(());
         }
@@ -316,8 +331,80 @@ impl<B: AsRef<[u8]>> PngDecodeRows<B> {
         Ok(())
     }
 
-    /// Reads the header of the next chunk, accepting it when it is a CRC-valid text chunk (which
-    /// it then starts reading) or stepping over any other. False when the scan can go on in this
+    /// Hashes one bounded batch of a text chunk's data. Only a fully CRC-valid chunk is parsed
+    /// into a value, so a broken chunk is still dropped before its keyword or flags are used.
+    fn crc_batch(&mut self, mut p: PendingCrc, bytes: &[u8]) -> Result<(), CodecError> {
+        let Some(left) = p.data.end.checked_sub(p.at) else { return Ok(()) };
+        let take = left.min(TEXT_BATCH);
+        let Some(end) = p.at.checked_add(take) else { return Ok(()) };
+        let Some(slice) = bytes.get(p.at..end) else { return Ok(()) };
+        p.crc.update(slice);
+        p.at = end;
+        if p.at < p.data.end {
+            self.text.pending = Some(TextPending::Crc(p));
+            return Ok(());
+        }
+        if p.crc.sum() != p.checksum {
+            return Ok(());
+        }
+        let Some(data) = bytes.get(p.data.clone()) else { return Ok(()) };
+        if let Some(value) = self.pending_text(p.kind, data, p.data.start)? {
+            self.text.pending = Some(TextPending::Value(value));
+        }
+        Ok(())
+    }
+
+    /// The value of a CRC-valid text chunk, with its decoded keyword and where its bytes start.
+    fn pending_text(&self, kind: [u8; 4], data: &[u8], data_at: usize) -> Result<Option<PendingText>, CodecError> {
+        // A keyword is 1..=79 Latin-1 bytes, so only the start of the chunk can hold it.
+        let Some(nul) = data.iter().take(80).position(|&b| b == 0) else { return Ok(None) };
+        let Some(keyword) = data.get(..nul) else { return Ok(None) };
+        let Some(value_start) = nul.checked_add(1) else { return Ok(None) };
+        let Some(value) = data.get(value_start..) else { return Ok(None) };
+        if keyword.is_empty() {
+            return Ok(None);
+        }
+        let (value, compressed, latin1, kind) = match &kind {
+            b"tEXt" => (value, false, true, TextKind::Plain),
+            b"zTXt" => {
+                let Some((&0, value)) = value.split_first() else { return Ok(None) };
+                (value, true, true, TextKind::Compressed)
+            }
+            _ => {
+                let Some(([flag, method], value)) = value.split_first_chunk::<2>() else { return Ok(None) };
+                if *flag > 1 || (*flag == 1 && *method != 0) {
+                    return Ok(None);
+                }
+                let Some((language, value)) = split_nul(value) else { return Ok(None) };
+                let Some((translated, value)) = split_nul(value) else { return Ok(None) };
+                if !language.is_ascii() || std::str::from_utf8(translated).is_err() {
+                    return Ok(None);
+                }
+                (value, *flag == 1, false, TextKind::International)
+            }
+        };
+        let keyword_len = latin1_len(keyword).ok_or_else(text_limit)?;
+        let keyword: String = keyword.iter().map(|&b| char::from(b)).collect();
+        let Some(value_at) = data_at.checked_add(data.len().saturating_sub(value.len())) else { return Ok(None) };
+        let Some(value_end) = value_at.checked_add(value.len()) else { return Ok(None) };
+        Ok(Some(PendingText {
+            kind,
+            keyword,
+            keyword_len,
+            limit: self.text.remaining.saturating_sub(keyword_len),
+            input: value_at..value_end,
+            at: value_at,
+            latin1,
+            decoder: compressed.then(|| flate2::Decompress::new(true)),
+            // An uncompressed iTXt value's UTF-8 is checked batch by batch, before its budget.
+            utf8: (!compressed && !latin1).then(Utf8Check::default),
+            over: false,
+            out: Vec::new(),
+        }))
+    }
+
+    /// Reads the header of the next chunk, starting a text chunk's CRC (which then reads its
+    /// bytes in batches) or stepping over any other. False when the scan can go on in this
     /// batch; true when a text chunk was started and its bytes need their own batches. Sets
     /// [`TextScan::done`] at the end of the tail, at `IEND`, or at a malformed one, as the
     /// previous one-pass reader did.
@@ -344,7 +431,7 @@ impl<B: AsRef<[u8]>> PngDecodeRows<B> {
             self.text.done = true;
             return Ok(false);
         };
-        let Some((data, rest)) = rest.split_at_checked(length) else {
+        let Some((_data, rest)) = rest.split_at_checked(length) else {
             self.text.done = true;
             return Ok(false);
         };
@@ -370,54 +457,14 @@ impl<B: AsRef<[u8]>> PngDecodeRows<B> {
         }
         let mut crc = flate2::Crc::new();
         crc.update(kind);
-        crc.update(data);
-        if crc.sum() != u32::from_be_bytes(*checksum) {
-            return Ok(false);
-        }
-        let Some((keyword, value)) = split_nul(data) else { return Ok(false) };
-        if keyword.is_empty() || keyword.len() > 79 {
-            return Ok(false);
-        }
-        let (value, compressed, latin1, kind) = match kind {
-            b"tEXt" => (value, false, true, TextKind::Plain),
-            b"zTXt" => {
-                let Some((&0, value)) = value.split_first() else { return Ok(false) };
-                (value, true, true, TextKind::Compressed)
-            }
-            _ => {
-                let Some(([flag, method], value)) = value.split_first_chunk::<2>() else { return Ok(false) };
-                if *flag > 1 || (*flag == 1 && *method != 0) {
-                    return Ok(false);
-                }
-                let Some((language, value)) = split_nul(value) else { return Ok(false) };
-                let Some((translated, value)) = split_nul(value) else { return Ok(false) };
-                if !language.is_ascii() || std::str::from_utf8(translated).is_err() {
-                    return Ok(false);
-                }
-                (value, *flag == 1, false, TextKind::International)
-            }
-        };
-        let keyword_len = latin1_len(keyword).ok_or_else(text_limit)?;
-        let keyword: String = keyword.iter().map(|&b| char::from(b)).collect();
-        let Some(value_at) = data_at.checked_add(data.len().saturating_sub(value.len())) else {
+        let Some(data_end) = data_at.checked_add(length) else {
             self.text.done = true;
             return Ok(false);
         };
-        let Some(value_end) = value_at.checked_add(value.len()) else {
-            self.text.done = true;
-            return Ok(false);
-        };
-        self.text.pending = Some(PendingText {
-            kind,
-            keyword,
-            keyword_len,
-            limit: self.text.remaining.saturating_sub(keyword_len),
-            input: value_at..value_end,
-            at: value_at,
-            latin1,
-            decoder: compressed.then(|| flate2::Decompress::new(true)),
-            out: Vec::new(),
-        });
+        // The CRC of a large chunk is hashed a bounded batch at a time too, so one metadata
+        // step never scans the whole chunk.
+        self.text.pending =
+            Some(TextPending::Crc(PendingCrc { kind: *kind, data: data_at..data_end, at: data_at, crc, checksum: u32::from_be_bytes(*checksum) }));
         Ok(true)
     }
 
@@ -539,9 +586,9 @@ fn latin1_len(bytes: &[u8]) -> Option<usize> {
 }
 
 /// The text chunks after the pixels, accepted one bounded batch at a time: one shared budget for
-/// decoded UTF-8 keywords and values (including overwritten XMP), and the decompressor of a
-/// compressed chunk kept between batches. Invalid ancillary text stays optional, as it was with
-/// png's text decoder.
+/// decoded UTF-8 keywords and values (including overwritten XMP), the CRC and decompressor of a
+/// chunk kept between batches. Invalid ancillary text stays optional, as it was with png's text
+/// decoder.
 #[derive(Default)]
 struct TextScan {
     /// UTF-8 bytes left of [`Limits::max_alloc`] for the text.
@@ -550,7 +597,7 @@ struct TextScan {
     compressed: Vec<(String, String)>,
     international: Vec<(String, String)>,
     xmp: Option<String>,
-    pending: Option<PendingText>,
+    pending: Option<TextPending>,
     done: bool,
 }
 
@@ -580,6 +627,22 @@ enum TextKind {
     International,
 }
 
+/// A text chunk being read: its CRC first, then (when valid) its value.
+enum TextPending {
+    Crc(PendingCrc),
+    Value(PendingText),
+}
+
+/// The CRC of a text chunk's data, hashed a bounded batch at a time before the chunk is parsed.
+struct PendingCrc {
+    kind: [u8; 4],
+    /// The chunk's data in the file, and the next byte a batch hashes.
+    data: std::ops::Range<usize>,
+    at: usize,
+    crc: flate2::Crc,
+    checksum: u32,
+}
+
 /// A text chunk's value being read, with its position in the file and (when compressed) the
 /// inflator kept between batches.
 struct PendingText {
@@ -595,7 +658,75 @@ struct PendingText {
     latin1: bool,
     /// Some for a compressed value.
     decoder: Option<flate2::Decompress>,
+    /// Some for an uncompressed iTXt value: its UTF-8 is checked before its bytes are charged.
+    utf8: Option<Utf8Check>,
+    /// The value has outgrown the budget but its UTF-8 validity is still being checked, so an
+    /// invalid value is still dropped instead of failing the decode.
+    over: bool,
     out: Vec<u8>,
+}
+
+/// Incremental UTF-8 validation across batches, so a value that spans batches is checked as a
+/// whole before it can fail the budget. A sequence straddling two batches keeps its expected
+/// continuation range here.
+#[derive(Default)]
+struct Utf8Check {
+    /// Continuation bytes still needed, and the range the next one may take.
+    need: u8,
+    min: u8,
+    max: u8,
+}
+
+impl Utf8Check {
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        for &b in bytes {
+            if self.need > 0 {
+                if b < self.min || b > self.max {
+                    return false;
+                }
+                self.need -= 1;
+                (self.min, self.max) = (0x80, 0xBF);
+            } else {
+                match b {
+                    0x00..=0x7f => {}
+                    0xc2..=0xdf => {
+                        self.need = 1;
+                        (self.min, self.max) = (0x80, 0xBF);
+                    }
+                    0xe0 => {
+                        self.need = 2;
+                        (self.min, self.max) = (0xa0, 0xBF);
+                    }
+                    0xe1..=0xec | 0xee..=0xef => {
+                        self.need = 2;
+                        (self.min, self.max) = (0x80, 0xBF);
+                    }
+                    0xed => {
+                        self.need = 2;
+                        (self.min, self.max) = (0x80, 0x9f);
+                    }
+                    0xf0 => {
+                        self.need = 3;
+                        (self.min, self.max) = (0x90, 0xBF);
+                    }
+                    0xf1..=0xf3 => {
+                        self.need = 3;
+                        (self.min, self.max) = (0x80, 0xBF);
+                    }
+                    0xf4 => {
+                        self.need = 3;
+                        (self.min, self.max) = (0x80, 0x8f);
+                    }
+                    _ => return false,
+                }
+            }
+        }
+        true
+    }
+
+    fn complete(&self) -> bool {
+        self.need == 0
+    }
 }
 
 /// What one batch of a text value produced.
@@ -627,7 +758,9 @@ fn inflate_text(mut p: PendingText, bytes: &[u8]) -> Result<TextBatch, CodecErro
         let made = usize::try_from(decoder.total_out().saturating_sub(start_out)).unwrap_or(usize::MAX);
         let (Some(used), Some(batch)) = (p.at.checked_add(used), scratch.get(..made)) else { return Ok(TextBatch::Invalid) };
         p.at = used;
-        append_text(&mut p.out, batch, p.latin1, p.limit)?;
+        if !append_checked(&mut p.out, &mut p.utf8, &mut p.over, batch, p.latin1, p.limit)? {
+            return Ok(TextBatch::Invalid);
+        }
         if status == flate2::Status::StreamEnd {
             return Ok(TextBatch::Finished(p));
         }
@@ -640,8 +773,16 @@ fn inflate_text(mut p: PendingText, bytes: &[u8]) -> Result<TextBatch, CodecErro
         let start = p.at.saturating_sub(p.input.start);
         let Some(batch) = input.get(start..start.saturating_add(take)) else { return Ok(TextBatch::Invalid) };
         p.at = p.at.saturating_add(take);
-        append_text(&mut p.out, batch, p.latin1, p.limit)?;
+        if !append_checked(&mut p.out, &mut p.utf8, &mut p.over, batch, p.latin1, p.limit)? {
+            return Ok(TextBatch::Invalid);
+        }
         if take == remaining {
+            if p.utf8.as_ref().is_some_and(|check| !check.complete()) {
+                return Ok(TextBatch::Invalid);
+            }
+            if p.over {
+                return Err(text_limit());
+            }
             return Ok(TextBatch::Finished(p));
         }
     }
@@ -650,21 +791,37 @@ fn inflate_text(mut p: PendingText, bytes: &[u8]) -> Result<TextBatch, CodecErro
 
 /// Appends one batch of decoded bytes, refusing to grow past the budget. Every Latin-1 code
 /// point fits in at most two UTF-8 bytes.
-fn append_text(out: &mut Vec<u8>, bytes: &[u8], latin1: bool, limit: usize) -> Result<(), CodecError> {
+///
+/// An uncompressed iTXt value is UTF-8 checked batch by batch before it is charged: an invalid
+/// value is dropped even when it is over the budget, as the previous whole-value check did.
+/// Its budget error is deferred until every byte has been seen and found valid.
+fn append_checked(out: &mut Vec<u8>, utf8: &mut Option<Utf8Check>, over: &mut bool, bytes: &[u8], latin1: bool, limit: usize) -> Result<bool, CodecError> {
+    if let Some(check) = utf8.as_mut()
+        && !check.feed(bytes)
+    {
+        return Ok(false);
+    }
+    if *over {
+        return Ok(true);
+    }
     let added = if latin1 { latin1_len(bytes).ok_or_else(text_limit)? } else { bytes.len() };
     if out.len().checked_add(added).is_none_or(|len| len > limit) {
+        if utf8.is_some() {
+            *over = true;
+            return Ok(true);
+        }
         return Err(text_limit());
     }
     out.try_reserve(added).map_err(|_| text_limit())?;
     if latin1 {
-        let mut utf8 = [0; 2];
+        let mut buf = [0; 2];
         for &b in bytes {
-            out.extend_from_slice(char::from(b).encode_utf8(&mut utf8).as_bytes());
+            out.extend_from_slice(char::from(b).encode_utf8(&mut buf).as_bytes());
         }
     } else {
         out.extend_from_slice(bytes);
     }
-    Ok(())
+    Ok(true)
 }
 
 fn is_latin1_keyword(k: &str) -> bool {
@@ -1730,5 +1887,25 @@ mod rows_tests {
                 }
             }
         }
+    }
+
+    /// A metadata yield after the last row must not finish the pixel reader again on every call.
+    #[test]
+    fn metadata_yields_do_not_finalize_the_pixels_again() {
+        let text = "A".repeat(20_000);
+        let img = image(8, 6, ChannelLayout::Rgb, SampleType::U8).with_meta(Metadata { text: vec![("Comment".into(), text.clone())], ..Default::default() });
+        let bytes = crate::encode(&img, Format::Png, &EncodeOptions::default()).unwrap();
+        let mut rows = PngDecodeRows::new(bytes.as_slice(), &Limits::default()).unwrap();
+        let mut calls = 0;
+        let got = loop {
+            calls += 1;
+            if let Some(img) = rows.step(&mut || false).unwrap() {
+                break img;
+            }
+            assert!(calls < 10_000, "the decoder never finished");
+        };
+        assert!(calls > 1, "the metadata took more than the pixel step");
+        assert_eq!(rows.pixel_finalizations, 1, "a metadata yield must not finalize the pixels again");
+        assert_eq!(got.meta.text, vec![("Comment".into(), text)]);
     }
 }
