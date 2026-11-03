@@ -469,10 +469,12 @@ pub enum ImportPreflight {
     Psd,
     /// TIFF: a layered page uses [`ImportOptions::psd_max_pixel_bytes`]; a flat page is decoded
     /// in bands, so the caller bounds its whole canvas from the page's header
-    /// ([`photocraft_codecs::tiff_info`]).
+    /// ([`photocraft_codecs::tiff_info`]) and its working peak with
+    /// [`ImportOptions::flat_max_working_bytes`].
     Tiff,
     /// A flat raster decoded into one image, bounded by
-    /// [`ImportOptions::flat_max_pixel_bytes`].
+    /// [`ImportOptions::flat_max_pixel_bytes`] and
+    /// [`ImportOptions::flat_max_working_bytes`].
     Flat,
     /// Affinity, OpenRaster, Krita, XCF, PDN, SVG, camera raw and `.pcraft` files: this build has
     /// no header-only estimate of their pixel memory before decoding.
@@ -562,6 +564,11 @@ pub struct ImportOptions {
     /// Decoded-pixel allowance for a flat raster (the buffer a codec decodes into). May lower
     /// the codec's default cap; 0 uses it. PSD/PSB and layered TIFF use `psd_max_pixel_bytes`.
     pub flat_max_pixel_bytes: u64,
+    /// Total pixel working allowance for a flat import: the decoded image or TIFF band buffers,
+    /// the row bands it is converted through, and the layer, channel and extra-sample tiles
+    /// built from it, all alive together. May lower the importer's own checks; 0 keeps them. It
+    /// does not cover metadata, and a layered TIFF keeps using `psd_max_pixel_bytes`.
+    pub flat_max_working_bytes: u64,
     /// Explicit one-shot authorization for imports that exceed the soft budget but fit within the hard budget.
     pub psd_high_memory_approved: bool,
     /// Optional estimate limit for high-memory approval. When set, approval only applies if
@@ -576,6 +583,7 @@ impl Default for ImportOptions {
             demosaic: raw::Demosaic::default(),
             psd_max_pixel_bytes: 0,
             flat_max_pixel_bytes: 0,
+            flat_max_working_bytes: 0,
             psd_high_memory_approved: false,
             psd_approved_estimate: None,
         }
