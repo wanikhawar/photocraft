@@ -52,6 +52,13 @@ pub fn quick_export_target_is_own_file(s: &Session) -> bool {
 /// File › Export › Quick Export as <format>: the format, quality, metadata, colour space and
 /// location from Export Preferences. `path` overrides the location ("ask" needs one).
 pub(super) fn quick_export(s: &mut Session, p: &Value) -> Result<Value> {
+    let mut renderer = s.quick_export_renderer.take();
+    let result = quick_export_with(s, p, renderer.as_mut().map(|r| &mut **r as &mut dyn photocraft_io::BandRenderer));
+    s.quick_export_renderer = renderer;
+    result
+}
+
+fn quick_export_with(s: &mut Session, p: &Value, mut renderer: Option<&mut dyn photocraft_io::BandRenderer>) -> Result<Value> {
     let cmd = "file.export.quickExport";
     let prefs = s.prefs().export.clone();
     let fmt = quick_export_ext(s);
@@ -82,7 +89,10 @@ pub(super) fn quick_export(s: &mut Session, p: &Value) -> Result<Value> {
         // EXR keeps floating-point scene values. The ordinary exporter converts to linear
         // light; the web/sRGB pipeline would instead clamp HDR and negative values.
         let opts = photocraft_io::ExportOptions { xmp: photocraft_io::XmpEmbed::None, ..Default::default() };
-        let out = photocraft_io::export(&doc, "exr", &opts).map_err(other)?;
+        let mut out = photocraft_io::export(&doc, "exr", &opts).map_err(other)?;
+        if renderer.is_some() {
+            out.warnings.push("EXR export uses the CPU compositor; custom rendering applies to PNG, JPEG, TIFF and WebP".into());
+        }
         write_file(&path, &out.bytes)?;
         crate::automate_cmds::fire_event(s, "export");
         return Ok(json!({"path": path, "format": fmt, "bytes": out.bytes.len(), "warnings": out.warnings}));
@@ -116,7 +126,10 @@ pub(super) fn quick_export(s: &mut Session, p: &Value) -> Result<Value> {
             // Keeping quality absent preserves the historical lossless Quick Export behavior.
             let (wdoc, _, _) = web_document(&doc, &json!({}), &WebSettings { convert_to_srgb: prefs.convert_to_srgb, ..Default::default() })?;
             let quality = if prefs.webp_lossless { None } else { Some((f64::from(prefs.webp_quality.clamp(1, 100)) - 1.0) * 12.0 / 99.0) };
-            let warnings = crate::file_cmds::save_doc(&wdoc, &path, quality)?;
+            let warnings = match renderer.as_mut() {
+                Some(renderer) => crate::file_cmds::save_doc_with_renderer(&wdoc, &path, quality, Some(&mut **renderer))?,
+                None => crate::file_cmds::save_doc(&wdoc, &path, quality)?,
+            };
             crate::automate_cmds::fire_event(s, "export");
             return Ok(json!({"path": path, "format": fmt, "warnings": warnings}));
         }
@@ -127,11 +140,22 @@ pub(super) fn quick_export(s: &mut Session, p: &Value) -> Result<Value> {
     let q = Value::Object(o);
     let st = WebSettings::from_params(&q, cmd)?;
     let (wdoc, _, _) = web_document(&doc, &json!({}), &st)?;
-    let buf = photocraft_compose::flatten(&wdoc);
+    let mut warnings = Vec::new();
+    let px = if fmt == "gif" {
+        // GIF stays on the CPU path (the documented renderer scope starts at PNG/JPEG/WebP/TIFF).
+        if renderer.is_some() {
+            warnings.push("GIF export uses the CPU compositor; custom rendering applies to PNG, JPEG, TIFF and WebP".into());
+        }
+        photocraft_compose::flatten(&wdoc).px
+    } else if let Some(renderer) = renderer.as_mut() {
+        photocraft_io::flatten_rgba_f32_with_renderer(&wdoc, &mut warnings, Some(&mut **renderer)).map_err(other)?
+    } else {
+        photocraft_compose::flatten(&wdoc).px
+    };
     let xmp = web_xmp(&doc, st.metadata);
     let exif = web_exif(&doc, st.metadata);
     let opt = optimize(
-        &buf.px,
+        &px,
         wdoc.size.width as usize,
         wdoc.bounds(),
         &st,
@@ -141,7 +165,8 @@ pub(super) fn quick_export(s: &mut Session, p: &Value) -> Result<Value> {
         wdoc.resolution_dpi,
         false,
     )?;
+    warnings.extend(web_warnings(&st, exif, wdoc.resolution_dpi));
     write_file(&path, &opt.bytes)?;
     crate::automate_cmds::fire_event(s, "export");
-    Ok(json!({"path": path, "format": fmt, "bytes": opt.bytes.len(), "warnings": web_warnings(&st, exif, wdoc.resolution_dpi)}))
+    Ok(json!({"path": path, "format": fmt, "bytes": opt.bytes.len(), "warnings": warnings}))
 }

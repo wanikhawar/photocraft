@@ -191,6 +191,16 @@ pub fn dds_param(p: &Value, cmd: &str) -> Result<Option<photocraft_io::DdsOption
 
 /// Encodes `doc` for `path`'s extension.
 pub(crate) fn encode(doc: &Document, path: &str, save: impl Into<SaveOpts>) -> Result<(Vec<u8>, Vec<String>)> {
+    encode_with_renderer(doc, path, save, None)
+}
+
+/// [`encode`] through a renderer the caller owns (Quick Export's `--gpu` path).
+pub(crate) fn encode_with_renderer(
+    doc: &Document,
+    path: &str,
+    save: impl Into<SaveOpts>,
+    renderer: Option<&mut dyn photocraft_io::BandRenderer>,
+) -> Result<(Vec<u8>, Vec<String>)> {
     crate::allocation::checkpoint("saving document")?;
     let save = save.into();
     let mut opts = photocraft_io::ExportOptions {
@@ -223,11 +233,24 @@ pub(crate) fn encode(doc: &Document, path: &str, save: impl Into<SaveOpts>) -> R
     if let Some(f) = save.jpeg_format {
         opts.encode.jpeg_format = f;
     }
-    photocraft_io::export(doc, path, &opts).map(|r| (r.bytes, r.warnings)).map_err(|e| EngineError::Other(format!("{path}: {e}")))
+    photocraft_io::export_with_renderer(doc, path, &opts, &photocraft_raster::Interrupt::NONE, renderer)
+        .map(|r| (r.bytes, r.warnings))
+        .map_err(|e| EngineError::Other(format!("{path}: {e}")))
 }
 
 pub(crate) fn save_doc(doc: &Document, path: &str, save: impl Into<SaveOpts>) -> Result<Vec<String>> {
     let (bytes, warnings) = encode(doc, path, save)?;
+    write_file(path, &bytes)?;
+    Ok(warnings)
+}
+
+pub(crate) fn save_doc_with_renderer(
+    doc: &Document,
+    path: &str,
+    save: impl Into<SaveOpts>,
+    renderer: Option<&mut dyn photocraft_io::BandRenderer>,
+) -> Result<Vec<String>> {
+    let (bytes, warnings) = encode_with_renderer(doc, path, save, renderer)?;
     write_file(path, &bytes)?;
     Ok(warnings)
 }

@@ -223,7 +223,7 @@ fn diagnostics_preserve_clean_stdout_and_emit_to_stderr() {
 }
 
 #[test]
-fn serve_gpu_preserves_clean_protocol_stdout_and_drains_diagnostics_to_stderr() {
+fn serve_gpu_preserves_clean_protocol_stdout_and_returns_render_diagnostics() {
     use std::io::{BufRead, BufReader, Write};
     use std::process::Stdio;
 
@@ -273,8 +273,9 @@ fn serve_gpu_preserves_clean_protocol_stdout_and_drains_diagnostics_to_stderr() 
     assert_eq!(v4["id"], 4);
     assert_eq!(v4["ok"], true, "{v4}");
 
-    // 5. Render the composite: one JSON line on stdout, diagnostics only on stderr.
-    writeln!(stdin, "{}", serde_json::json!({"id": 5, "method": "doc.render", "params": {"maxSide": 16}})).unwrap();
+    // 5. Render the composite: one JSON line on stdout, with this render's diagnostics in the
+    // reply rather than queued for a later save.
+    writeln!(stdin, "{}", serde_json::json!({"id": 5, "method": "doc.render", "params": {"maxSide": 0}})).unwrap();
     stdin.flush().unwrap();
 
     let mut line5 = String::new();
@@ -283,17 +284,17 @@ fn serve_gpu_preserves_clean_protocol_stdout_and_drains_diagnostics_to_stderr() 
     assert_eq!(v5["id"], 5);
     assert_eq!(v5["ok"], true, "{v5}");
     assert!(v5["result"]["base64"].as_str().is_some_and(|b| !b.is_empty()), "render must return PNG bytes: {v5}");
+    let warnings = v5["result"]["warnings"].as_array().cloned().unwrap_or_default();
+    let markers = ["GPU adapter:", "no GPU adapter available", "could not build GPU compositor", "falling back to CPU", "GPU acceleration requested"];
+    assert!(
+        warnings.iter().any(|w| w.as_str().is_some_and(|w| markers.iter().any(|m| w.contains(m)))),
+        "doc.render must return its GPU backend or fallback diagnostics: {v5}"
+    );
 
     // Close stdin and verify graceful exit
     drop(stdin);
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
-
-    // Every render that reaches the renderer reports its adapter or why it fell back, whichever
-    // build and adapter this test runs on.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let markers = ["GPU adapter:", "no GPU adapter available", "could not build GPU compositor", "falling back to CPU", "GPU acceleration requested"];
-    assert!(markers.iter().any(|m| stderr.contains(m)), "render must report its GPU backend or fallback on stderr: {stderr}");
 }
 
 #[test]
@@ -309,6 +310,25 @@ fn cpu_default_does_not_emit_gpu_warnings() {
 
     let stderr = String::from_utf8_lossy(&o.stderr);
     assert!(!stderr.contains("GPU"), "default CPU convert should not emit GPU warnings, got: {stderr}");
+
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn run_gpu_quick_export_uses_the_configured_renderer() {
+    let d = tmp("quick_export");
+    let out_png = d.join("quick.png");
+    let params = serde_json::json!({"path": out_png.to_string_lossy()}).to_string();
+
+    let o = bin()
+        .args(["run", "--gpu", "--new", r#"{"width":32,"height":32}"#, "--cmd", "layer.new.layer", "--cmd", "file.export.quickExport", "--params", &params])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    assert!(out_png.is_file(), "Quick Export must write its PNG");
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    let markers = ["GPU adapter:", "no GPU adapter available", "could not build GPU compositor", "falling back to CPU"];
+    assert!(markers.iter().any(|marker| stderr.contains(marker)), "Quick Export must use the configured renderer: {stderr}");
 
     let _ = std::fs::remove_dir_all(&d);
 }

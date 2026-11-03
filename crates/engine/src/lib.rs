@@ -275,6 +275,9 @@ pub struct Session {
     /// Object Selection's Object Finder results (#4087), shared by the hover preview and the
     /// click that commits it; valid while the pixels are unchanged.
     pub object_finder: smartselect_cmds::ObjectFinderCache,
+    /// A renderer a command may use for its own flat export (`file.export.quickExport`). The
+    /// headless runner installs it for one command and takes it back afterwards.
+    pub(crate) quick_export_renderer: Option<Box<dyn photocraft_io::BandRenderer>>,
     /// A finished live stroke offered to the `paint.stroke` / `paint.pencil` that commits it
     /// ([`Session::offer_live_stroke`]).
     pub(crate) live_commit: Option<brush_cmds::LiveCommit>,

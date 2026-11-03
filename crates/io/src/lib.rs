@@ -95,8 +95,8 @@ pub use adjust_map::ADJUSTMENT_KEYS;
 pub use flat::{
     DEFAULT_LOSSY_WEBP_QUALITY, apply_file_encoding, document_to_image, document_to_image_with_renderer, export_flat, export_flat_with_renderer,
     export_flat_with_renderer_diagnostics, export_png_streamed_with_renderer, export_png_streamed_with_renderer_diagnostics, export_preview_png_with_renderer,
-    export_preview_png_with_renderer_diagnostics, file_encoding, import_gif_frames, import_tiff_page, import_tiff_page_with_options, import_webp_frames,
-    tga_alpha_channel_to_transparency, tga_default_bits,
+    export_preview_png_with_renderer_diagnostics, file_encoding, flatten_rgba_f32_with_renderer, import_gif_frames, import_tiff_page,
+    import_tiff_page_with_options, import_webp_frames, tga_alpha_channel_to_transparency, tga_default_bits,
 };
 pub use psd_export::{PsdExportOptions, document_to_psd, document_to_psd_with};
 pub use psd_import::{psd_to_document, psd_to_document_with};
@@ -954,11 +954,20 @@ pub fn export_with_renderer_diagnostics(
     renderer: Option<&mut dyn BandRenderer>,
     diagnostics: &mut Vec<String>,
 ) -> Result<ExportResult, IoError> {
-    let r = checked_stages(doc, name_or_ext, opts, ctl, renderer, diagnostics)?;
-    let bytes = r.encoded.into_bytes()?;
-    ctl.check().map_err(|_| IoError::Cancelled)?;
+    let EncodedExport { encoded, warnings } = checked_stages(doc, name_or_ext, opts, ctl, renderer, diagnostics)?;
+    let bytes = match encoded.into_bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            diagnostics.extend(warnings);
+            return Err(error);
+        }
+    };
+    if ctl.check().is_err() {
+        diagnostics.extend(warnings);
+        return Err(IoError::Cancelled);
+    }
     ctl.progress(1.0);
-    Ok(ExportResult { bytes, warnings: r.warnings })
+    Ok(ExportResult { bytes, warnings })
 }
 
 /// [`export_with`] up to the point where the file can be written: PSD/PSB stop at the file model,
@@ -998,7 +1007,10 @@ fn checked_stages(
         diagnostics.extend(std::mem::take(&mut r.warnings));
         return Err(error);
     }
-    ctl.check().map_err(|_| IoError::Cancelled)?;
+    if ctl.check().is_err() {
+        diagnostics.extend(std::mem::take(&mut r.warnings));
+        return Err(IoError::Cancelled);
+    }
     Ok(r)
 }
 

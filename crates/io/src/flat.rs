@@ -733,6 +733,76 @@ fn document_to_image_for_with_renderer(
     Ok(Image::from_raw(w, h, layout, src.sample, data)?.with_icc(src.icc.clone()).with_meta(src.meta()))
 }
 
+/// The document flattened to straight-alpha RGBA f32, through `renderer` when one is supplied.
+/// The float result keeps the compositor's precision for callers such as Quick Export's optimiser.
+pub fn flatten_rgba_f32_with_renderer(doc: &Document, warnings: &mut Vec<String>, renderer: Option<&mut dyn BandRenderer>) -> Result<Vec<[f32; 4]>, IoError> {
+    let Some(r) = renderer else {
+        return flatten_rgba_f32(doc, warnings, None);
+    };
+    let mut attempt_warnings = Vec::new();
+    match flatten_rgba_f32(doc, &mut attempt_warnings, Some(r)) {
+        Ok(pixels) => {
+            warnings.extend(attempt_warnings);
+            warnings.extend(r.drain_diagnostics());
+            Ok(pixels)
+        }
+        Err(IoError::Render(render_err)) if render_err.is_retryable() => {
+            let fallback_warning = format!("rendering backend unavailable ({render_err}); falling back to CPU");
+            let mut cpu_warnings = Vec::new();
+            match flatten_rgba_f32(doc, &mut cpu_warnings, None) {
+                Ok(pixels) => {
+                    warnings.extend(cpu_warnings);
+                    warnings.extend(r.drain_diagnostics());
+                    warnings.push(fallback_warning);
+                    Ok(pixels)
+                }
+                Err(cpu_error) => {
+                    warnings.extend(attempt_warnings);
+                    warnings.extend(r.drain_diagnostics());
+                    warnings.push(fallback_warning);
+                    Err(cpu_error)
+                }
+            }
+        }
+        Err(error) => {
+            warnings.extend(attempt_warnings);
+            warnings.extend(r.drain_diagnostics());
+            Err(error)
+        }
+    }
+}
+
+fn flatten_rgba_f32(doc: &Document, warnings: &mut Vec<String>, renderer: Option<&mut dyn BandRenderer>) -> Result<Vec<[f32; 4]>, IoError> {
+    let mut src = FlatSource::new(doc, warnings, false, false)?;
+    // Compose in RGB f32 with no native copy: the result has the same precision as
+    // [`photocraft_compose::flatten`] whether the pixels came from the renderer or the CPU.
+    src.native = None;
+    src.mode = ColorMode::Rgb;
+    src.sample = CSample::F32;
+    src.inks = false;
+    src.space = None;
+    src.rows = 0;
+    let (w, h) = (doc.size.width, doc.size.height);
+    let mut out = Vec::new();
+    out.try_reserve_exact((w as usize).saturating_mul(h as usize)).map_err(|_| IoError::Unsupported("not enough memory for a flattened image".into()))?;
+    src.bands(true, &Interrupt::NONE, renderer, warnings, |_, band, _| {
+        if band.len() % 16 != 0 {
+            return Err(IoError::Render(RenderError::Execution("invalid f32 band length".into())));
+        }
+        for px in band.chunks_exact(16) {
+            let mut rgba = [0.0f32; 4];
+            for (i, value) in rgba.iter_mut().enumerate() {
+                let start = i * 4;
+                let sample = px.get(start..start + 4).ok_or_else(|| IoError::Render(RenderError::Execution("truncated f32 band".into())))?;
+                *value = f32::from_ne_bytes([sample[0], sample[1], sample[2], sample[3]]);
+            }
+            out.push(rgba);
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
 /// The document composited as an 8-bit RGBA image, through `renderer` when one is supplied.
 fn document_to_preview_with_renderer(doc: &Document, warnings: &mut Vec<String>, renderer: Option<&mut dyn BandRenderer>) -> Result<Image, IoError> {
     let src = FlatSource::preview(doc, warnings)?;
@@ -800,7 +870,7 @@ pub fn export_preview_png_with_renderer_diagnostics(
                         Ok(cpu_result)
                     }
                     Err(cpu_error) => {
-                        // Keep the reason the GPU attempt failed when the CPU retry fails too.
+                        // Keep the reason the renderer attempt failed when the CPU retry fails too.
                         diagnostics.extend(std::mem::take(&mut warnings));
                         diagnostics.extend(r.drain_diagnostics());
                         diagnostics.push(fallback_warning);
@@ -979,7 +1049,7 @@ impl<'a> FlatSource<'a> {
         let colors = self.layout(false).channels();
         // Bands of quantised samples with alpha; the alpha is dropped here when not wanted.
         let mut emit = |rows: u32, parts: Vec<Vec<u8>>, translucent: bool| -> Result<(), IoError> {
-            // The CPU retry after a retryable GPU error composes through this sink with no
+            // The CPU retry after a retryable renderer error composes through this sink with no
             // renderer to poll `ctl` for it: check once per band, as `CpuRenderer` does.
             ctl.check().map_err(|_| IoError::Cancelled)?;
             let mut data = Vec::with_capacity(parts.iter().map(Vec::len).sum());
@@ -1223,7 +1293,7 @@ pub fn export_flat_with_renderer_diagnostics(
                 let fallback_warning = format!("rendering backend unavailable ({render_err}); falling back to CPU");
                 // Keep the fallback reason in this export's warnings only. Move this attempt's
                 // queued diagnostics into its retry result too: leaving either on the renderer
-                // would leak them into a later successful GPU export. A cancelled export keeps
+                // would leak them into a later successful renderer export. A cancelled export keeps
                 // the reason with the caller instead of compositing the document again.
                 if ctl.check().is_err() {
                     diagnostics.extend(std::mem::take(&mut warnings));

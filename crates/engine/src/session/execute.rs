@@ -22,6 +22,31 @@ impl Session {
         }
     }
 
+    /// [`Self::execute`] with a renderer that commands such as `file.export.quickExport` may use
+    /// for their own flat export. The renderer is handed back even when the command fails, so the
+    /// caller can keep using it for the next request.
+    pub fn execute_with_renderer(
+        &mut self,
+        id: &str,
+        params: Value,
+        renderer: Option<Box<dyn photocraft_io::BandRenderer>>,
+    ) -> (Result<Value>, Option<Box<dyn photocraft_io::BandRenderer>>) {
+        self.quick_export_renderer = renderer;
+        let result = self.execute(id, params);
+        (result, self.quick_export_renderer.take())
+    }
+
+    /// Install the renderer a later [`Self::execute`] / [`Self::start`] may use for its own flat
+    /// export, for a caller that runs the command in the background.
+    pub fn set_quick_export_renderer(&mut self, renderer: Option<Box<dyn photocraft_io::BandRenderer>>) {
+        self.quick_export_renderer = renderer;
+    }
+
+    /// Take back the renderer installed by [`Self::set_quick_export_renderer`].
+    pub fn take_quick_export_renderer(&mut self) -> Option<Box<dyn photocraft_io::BandRenderer>> {
+        self.quick_export_renderer.take()
+    }
+
     /// Offer a finished live stroke to the next command: a `paint.stroke` / `paint.pencil` whose
     /// params match it exactly takes its pixels instead of rendering the stroke again (its result
     /// then says `"fromLive": true`); any other command drops the offer. The command still runs

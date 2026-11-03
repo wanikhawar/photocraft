@@ -39,15 +39,19 @@ pub(crate) fn convert(a: &ConvertArgs, _out: &mut dyn Write, err: &mut dyn Write
     warn_dedup(err, &missing_font_warnings(&o.document), &mut seen_warnings);
     let policy = crate::gpu::GpuPolicy::from_args(&a.gpu).map_err(CliError::Other)?;
     let mut renderer = policy.create_renderer();
+    let mut diagnostics = Vec::new();
     let ws = match renderer.as_mut() {
-        Some(renderer) => files::save_with_renderer(&o.document, output, a.export.format.as_deref(), &opts, None, Some(&mut **renderer)),
+        Some(renderer) => {
+            files::save_with_renderer_diagnostics(&o.document, output, a.export.format.as_deref(), &opts, None, Some(&mut **renderer), &mut diagnostics)
+        }
         None => files::save(&o.document, output, a.export.format.as_deref(), &opts, None),
     };
     // A failed GPU export can leave fallback reasons queued: report them before the error
     // propagates, or the user would never learn why the GPU was not used.
     if let Some(renderer) = renderer.as_mut() {
-        warn_dedup(err, &renderer.drain_diagnostics(), &mut seen_warnings);
+        diagnostics.extend(renderer.drain_diagnostics());
     }
+    warn_dedup(err, &diagnostics, &mut seen_warnings);
     let ws = ws?;
     warn_dedup(err, &ws, &mut seen_warnings);
     Ok(())

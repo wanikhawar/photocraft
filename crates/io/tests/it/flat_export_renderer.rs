@@ -27,6 +27,7 @@ fn synthetic_doc() -> Document {
 #[derive(Default)]
 struct RecordingRenderer {
     diagnostics: Vec<String>,
+    renders: usize,
 }
 
 impl BandRenderer for RecordingRenderer {
@@ -38,6 +39,7 @@ impl BandRenderer for RecordingRenderer {
         ctl: &Interrupt<'_>,
         sink: &mut dyn FnMut(RenderBand) -> Result<(), IoError>,
     ) -> Result<(), RenderError> {
+        self.renders += 1;
         let mut cpu = CpuRenderer;
         cpu.render_bands(doc, rect, band_rows, ctl, sink)
     }
@@ -313,8 +315,9 @@ fn renderer_preview_is_8bit_rgba_while_saved_export_keeps_depth() {
     s.fill_rect(Rect::new(8, 8, 56, 40), &[0.2, 0.4, 0.8, 0.5]);
     doc.layers.push(Layer::new("top", LayerContent::Raster(s)));
 
-    let mut preview_renderer = CpuRenderer;
+    let mut preview_renderer = RecordingRenderer::default();
     let preview = export_preview_png_with_renderer(&doc, Some(&mut preview_renderer)).expect("preview export");
+    assert!(preview_renderer.renders > 0, "the preview must be rendered through the supplied renderer");
     let img = photocraft_codecs::decode(&preview.bytes).expect("decode preview");
     assert_eq!((img.width(), img.height()), (64, 48));
     assert_eq!(img.layout(), photocraft_codecs::ChannelLayout::Rgba, "a preview is always RGBA");
@@ -524,7 +527,8 @@ fn a_cancelled_retry_keeps_the_fallback_reason_for_the_caller() {
     let doc = synthetic_doc();
     let opts = ExportOptions::default();
     let cancelled = Arc::new(AtomicBool::new(false));
-    let ctl = Interrupt::cancel_only(&|| cancelled.load(Ordering::SeqCst));
+    let cancel = || cancelled.load(Ordering::SeqCst);
+    let ctl = Interrupt::cancel_only(&cancel);
     let mut renderer = CancellingFailingRenderer { cancelled: cancelled.clone() };
     let mut diagnostics = Vec::new();
     let res = export_flat_with_renderer_diagnostics(&doc, Format::Png, &opts, &ctl, Some(&mut renderer), &mut diagnostics);

@@ -498,18 +498,35 @@ impl Headless {
         // Commands such as `file.close`, `file.closeAll` and `file.closeOthers` remove
         // documents directly through the session, so release their GPU caches here too.
         let before = self.document_ids();
+        // Quick Export is an engine command, so its configured renderer must travel with the
+        // command rather than being applied only to the save/preview paths below.
+        let renderer = self.renderer.take();
         let result = if wait {
-            self.session.execute(id, params).map_err(AutomationError::from)
+            let (result, returned) = self.session.execute_with_renderer(id, params, renderer);
+            self.renderer = returned;
+            result.map_err(AutomationError::from)
         } else {
-            self.session
+            self.session.set_quick_export_renderer(renderer);
+            let result = self
+                .session
                 .start(id, params)
                 .map(|started| match started {
                     photocraft_engine::jobs::Started::Done(v) => v,
                     photocraft_engine::jobs::Started::Job(job) => json!({"job": job.0, "pending": true}),
                 })
-                .map_err(AutomationError::from)
+                .map_err(AutomationError::from);
+            self.renderer = self.session.take_quick_export_renderer();
+            result
         };
         self.forget_removed_documents(&before);
+        // Quick Export is a command, so its fallback diagnostics are in its own result rather
+        // than in the save/preview paths. Make them drainable too, for `run`, `batch` and RPC.
+        if id == "file.export.quickExport"
+            && let Ok(value) = &result
+            && let Some(warnings) = value.get("warnings").and_then(Value::as_array)
+        {
+            self.pending_diagnostics.extend(warnings.iter().filter_map(Value::as_str).map(str::to_owned));
+        }
         result
     }
 

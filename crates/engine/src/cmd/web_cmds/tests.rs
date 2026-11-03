@@ -551,6 +551,68 @@ fn export_preferences_drive_quick_export() {
     s.execute("prefs.reset", json!({"path": "export"})).unwrap();
 }
 
+#[test]
+fn quick_export_uses_the_supplied_renderer_and_reports_cpu_fallback() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingRenderer {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl photocraft_io::BandRenderer for CountingRenderer {
+        fn render_bands(
+            &mut self,
+            doc: &photocraft_doc::Document,
+            rect: Rect,
+            band_rows: i32,
+            ctl: &photocraft_raster::Interrupt<'_>,
+            sink: &mut dyn FnMut(photocraft_io::RenderBand) -> Result<(), photocraft_io::IoError>,
+        ) -> Result<(), photocraft_io::RenderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut cpu = photocraft_io::CpuRenderer;
+            cpu.render_bands(doc, rect, band_rows, ctl, sink)
+        }
+    }
+
+    struct UnavailableRenderer;
+
+    impl photocraft_io::BandRenderer for UnavailableRenderer {
+        fn render_bands(
+            &mut self,
+            _doc: &photocraft_doc::Document,
+            _rect: Rect,
+            _band_rows: i32,
+            _ctl: &photocraft_raster::Interrupt<'_>,
+            _sink: &mut dyn FnMut(photocraft_io::RenderBand) -> Result<(), photocraft_io::IoError>,
+        ) -> Result<(), photocraft_io::RenderError> {
+            Err(photocraft_io::RenderError::Unavailable("forced unavailable backend".into()))
+        }
+    }
+
+    let dir = tmp("quick_renderer");
+    let mut s = session(8);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let path = format!("{dir}/gpu.png");
+    let (r, returned) = s.execute_with_renderer("file.export.quickExport", json!({"path": path}), Some(Box::new(CountingRenderer { calls: calls.clone() })));
+    let r = r.unwrap();
+    assert!(returned.is_some(), "the renderer must be handed back to the caller");
+    assert!(calls.load(Ordering::SeqCst) > 0, "Quick Export must render through the supplied renderer");
+    assert_eq!(decode(&path).dimensions(), (64, 48));
+    let warnings: Vec<String> = serde_json::from_value(r["warnings"].clone()).unwrap_or_default();
+    assert!(!warnings.iter().any(|w| w.contains("falling back to CPU")), "a successful render must not report a fallback: {warnings:?}");
+
+    let path = format!("{dir}/fallback.png");
+    let (r, returned) = s.execute_with_renderer("file.export.quickExport", json!({"path": path}), Some(Box::new(UnavailableRenderer)));
+    let r = r.unwrap();
+    assert!(returned.is_some(), "a failed render must still return the renderer");
+    let warnings: Vec<String> = serde_json::from_value(r["warnings"].clone()).unwrap_or_default();
+    assert!(warnings.iter().any(|w| w.contains("falling back to CPU")), "Quick Export must report its CPU fallback: {warnings:?}");
+    assert_eq!(decode(&path).dimensions(), (64, 48));
+    s.execute("prefs.reset", json!({"path": "export"})).unwrap();
+}
+
 /// #6599: with Location = Same Folder, a document opened from `photo.png` would be exported over
 /// `photo.png` itself. Without a `path` that is refused and the file is left alone; named
 /// explicitly (the save dialog's answer) it is written.
