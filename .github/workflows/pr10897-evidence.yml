@@ -1,5 +1,5 @@
 name: PR 10897 PSD memory evidence (verification only)
-true:
+on:
   workflow_dispatch: null
   push:
     branches:
