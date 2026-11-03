@@ -146,11 +146,11 @@ fn quick_export_with(s: &mut Session, p: &Value, mut renderer: Option<&mut dyn p
         if renderer.is_some() {
             warnings.push("GIF export uses the CPU compositor; custom rendering applies to PNG, JPEG, TIFF and WebP".into());
         }
-        photocraft_compose::flatten(&wdoc).px
+        photocraft_compose::flatten(&wdoc).into_px()
     } else if let Some(renderer) = renderer.as_mut() {
         photocraft_io::flatten_rgba_f32_with_renderer(&wdoc, &mut warnings, Some(&mut **renderer)).map_err(other)?
     } else {
-        photocraft_compose::flatten(&wdoc).px
+        photocraft_compose::flatten(&wdoc).into_px()
     };
     let xmp = web_xmp(&doc, st.metadata);
     let exif = web_exif(&doc, st.metadata);

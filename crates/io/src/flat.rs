@@ -789,7 +789,7 @@ fn flatten_rgba_f32(doc: &Document, warnings: &mut Vec<String>, renderer: Option
         if band.len() % 16 != 0 {
             return Err(IoError::Render(RenderError::Execution("invalid f32 band length".into())));
         }
-        for px in band.chunks_exact(16) {
+        for px in band.as_chunks::<16>().0 {
             let mut rgba = [0.0f32; 4];
             for (i, value) in rgba.iter_mut().enumerate() {
                 let start = i * 4;
