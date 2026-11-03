@@ -569,9 +569,8 @@ fn admit_flat_working_bytes(img: &Image, limit: u64) -> Result<(), IoError> {
     admit_flat_bytes(image_document_bytes(w, h, img.layout(), img.sample_type(), extras, decoded), limit)
 }
 
-/// Bytes one band of rows takes through [`image_surface`]: the source rows copied and the
-/// converted image built beside them. At most [`BAND_BYTES`] of source rows and never more rows
-/// than the image has, so a small image charges only its own buffers.
+/// One conversion band's copied source, converted bytes and intermediate float planes.
+/// A small image charges only its own rows; an oversized row still has to fit whole.
 fn conversion_band_bytes(w: u32, h: u32, layout: ChannelLayout, sample: CSample) -> u64 {
     let f = document_format(layout, sample);
     if (layout == f.layout && sample == f.sample) || w == 0 || h == 0 {
@@ -580,7 +579,16 @@ fn conversion_band_bytes(w: u32, h: u32, layout: ChannelLayout, sample: CSample)
     let row = u64::from(w).saturating_mul(layout.channels() as u64).saturating_mul(sample.bytes() as u64);
     let out_row = u64::from(w).saturating_mul(f.layout.channels() as u64).saturating_mul(f.sample.bytes() as u64);
     let rows = (BAND_BYTES as u64 / row.max(1)).clamp(1, u64::from(h));
-    row.saturating_add(out_row).saturating_mul(rows)
+    let floats = if sample != f.sample {
+        // Image::convert normalizes the source, converts its layout when needed, then
+        // quantizes while both float planes are still alive. Adding alpha at the same
+        // sample depth uses its direct copy path and needs neither plane.
+        let channels = layout.channels() + if layout != f.layout { f.layout.channels() } else { 0 };
+        u64::from(w).saturating_mul(channels as u64).saturating_mul(4)
+    } else {
+        0
+    };
+    row.saturating_add(out_row).saturating_add(floats).saturating_mul(rows)
 }
 
 /// Bytes a whole decoded image, its banded conversion and the document built from it need at
@@ -606,7 +614,10 @@ fn streamed_tiff_bytes(w: u32, h: u32, layout: ChannelLayout, sample: CSample, g
     let fmt = PixelFormat::new(f.mode, f.depth, true);
     let in_bpp = (layout.channels() as u64).saturating_mul(sample.bytes() as u64).max(1);
     let group_px = group / in_bpp;
-    surface_bytes(w, h, fmt).saturating_add(group.saturating_mul(3)).saturating_add(group_px.saturating_mul(fmt.bytes_per_pixel() as u64))
+    let float_bpp = if sample != f.sample { (layout.channels() + if layout != f.layout { f.layout.channels() } else { 0 }) as u64 * 4 } else { 0 };
+    surface_bytes(w, h, fmt)
+        .saturating_add(group.saturating_mul(3))
+        .saturating_add(group_px.saturating_mul((fmt.bytes_per_pixel() as u64).saturating_add(float_bpp)))
 }
 
 /// Bytes a whole-image flat TIFF page needs at its peak before it is decoded: the decoded image
@@ -618,6 +629,7 @@ fn whole_tiff_bytes(w: u32, h: u32, layout: ChannelLayout, sample: CSample, extr
     let e = extras as u64;
     let decoded = pixels.saturating_mul((layout.channels() as u64).saturating_add(e.saturating_mul(2))).saturating_mul(in_bps);
     let turned = if (2..=8).contains(&orientation) { pixels.saturating_mul((layout.channels() as u64).saturating_add(e)).saturating_mul(in_bps) } else { 0 };
+    let (w, h) = if (5..=8).contains(&orientation) { (h, w) } else { (w, h) };
     image_document_bytes(w, h, layout, sample, extras, decoded.saturating_add(turned))
 }
 
@@ -2068,6 +2080,9 @@ mod flat_working_budget_tests {
         let (w, h) = (512u32, 512u32);
         let src = Image::from_raw(w, h, ChannelLayout::Gray, CSample::F16, vec![0u8; (w * h * 2) as usize]).unwrap();
         let required = image_document_bytes(w, h, ChannelLayout::Gray, CSample::F16, 0, src.data().len() as u64);
+        // Per pixel: decoded F16, copied F16 band, normalized Gray, converted GrayA,
+        // quantized GrayA F32 and the tile-aligned GrayA F32 layer.
+        assert_eq!(required, u64::from(w) * u64::from(h) * (2 + 2 + 4 + 8 + 8 + 8));
         assert!(required > src.data().len() as u64, "the conversion adds to the decoded image");
         let bytes = codecs::encode(&src, Format::OpenExr, &codecs::EncodeOptions::default()).unwrap();
 
