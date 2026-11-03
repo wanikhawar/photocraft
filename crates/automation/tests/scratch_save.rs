@@ -11,8 +11,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 struct QueuedDiagnosticsRenderer(Vec<String>);
 
-/// Renders through the reference compositor, then makes a scratch tile unreadable so the final
-/// health check fails after the export looked successful.
+/// Renders through the reference compositor, then makes the scratch copy of every tile unreadable
+/// so the final health check fails after the export looked successful.
 struct CorruptingRenderer {
     diagnostics: Vec<String>,
 }
@@ -29,18 +29,28 @@ impl BandRenderer for CorruptingRenderer {
         let mut cpu = photocraft_io::CpuRenderer;
         cpu.render_bands(doc, rect, band_rows, ctl, sink)?;
         self.diagnostics.push("adapter status before the scratch failure".into());
+        // The compositor renders bands and tiles in parallel, so it can leave the tiles it just
+        // read in memory, and a resident tile never checks its scratch copy. Evict everything
+        // first (the tiles then live only on the scratch disk, as the other scratch tests arrange
+        // before damaging it), then damage the whole file: whether a read fails must not depend on
+        // which tile the last worker happened to leave resident.
+        spill::settle();
         if let Some(mut file) = spill::scratch_handle_for_tests() {
             file.seek(SeekFrom::Start(0)).unwrap();
-            file.write_all(&vec![0u8; 1 << 20]).unwrap();
+            // At least the extents written so far, and never less than the old fixed window.
+            let len = usize::try_from(file.metadata().map(|m| m.len()).unwrap_or(0)).unwrap_or(0).max(1 << 20);
+            file.write_all(&vec![0u8; len]).unwrap();
             file.sync_all().unwrap();
         }
+        let mut failed = false;
         for layer in &doc.layers {
             if let Some(surface) = layer.surface() {
                 for (_, tile) in surface.tiles() {
-                    let _ = tile.try_bytes();
+                    failed |= tile.try_bytes().is_err();
                 }
             }
         }
+        assert!(failed, "the corrupted scratch file must make at least one tile unreadable once it is evicted");
         Ok(())
     }
 
