@@ -94,7 +94,11 @@ fn surface_bytes_misaligned(w: usize, h: usize, bpp: usize) -> usize {
         return 0;
     }
     let side = TILE_SIZE as usize;
-    w.div_ceil(side).saturating_add(1).saturating_mul(h.div_ceil(side).saturating_add(1)).saturating_mul(side.saturating_mul(side)).saturating_mul(bpp)
+    w.saturating_add(side - 1)
+        .div_ceil(side)
+        .saturating_mul(h.saturating_add(side - 1).div_ceil(side))
+        .saturating_mul(side.saturating_mul(side))
+        .saturating_mul(bpp)
 }
 
 /// `bytes` for people ("12 MiB", "900 KiB", "17 B").
@@ -537,8 +541,16 @@ fn estimate_photomerge_memory(
     // ROI colours, alpha and the seam weights (f32 each).
     let rois_weights = roi_px.saturating_mul((cc + 2) * 4);
     let canvas_px = cw.saturating_mul(ch);
-    // The accumulator and weight-sum pyramids (4/3 of a plane each).
-    let accumulators = canvas_px.saturating_mul((cc + 1) * 4 * 4 / 3);
+    let levels = panorama::blend_levels(cw, ch).min(7);
+    // Sum the actual ceil-halved levels: multiplying by a truncated 4/3 factor
+    // undercounts both RGB planes and odd dimensions.
+    let (mut lw, mut lh, mut pyramid_px) = (cw, ch, 0usize);
+    for _ in 0..levels {
+        pyramid_px = pyramid_px.saturating_add(lw.saturating_mul(lh));
+        lw = lw.div_ceil(2);
+        lh = lh.div_ceil(2);
+    }
+    let accumulators = pyramid_px.saturating_mul((cc + 1) * 4);
     let blend_out = canvas_px.saturating_mul((cc + 1) * 4);
     // The output layers and their masks are surfaces at the warped ROIs' origins.
     let output_layers = sum_surfaces(placed_sizes, |w, h| surface_bytes_misaligned(w, h, bpp).saturating_add(surface_bytes_misaligned(w, h, 1)));
@@ -547,7 +559,6 @@ fn estimate_photomerge_memory(
     let fill_planes = if fill { 24 << 20 } else { 0 };
 
     // The levels `seam_blend` blends with.
-    let levels = panorama::blend_levels(cw, ch).min(7);
     let max_band_cost = placed_sizes.iter().map(|&(w, h)| panorama::band_bytes_bound(w, h, cc, levels, cw, ch)).max().unwrap_or(0);
 
     let fixed_during_bands = rois_weights.saturating_add(accumulators);

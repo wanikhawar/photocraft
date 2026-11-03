@@ -385,7 +385,7 @@ fn photomerge_estimate_is_the_largest_phase_not_the_sum() {
     let (cw, ch, cc, bpp) = (150, 100, 3, 4);
     let band = panorama::band_bytes_bound(100, 100, cc, panorama::blend_levels(cw, ch).min(7), cw, ch);
     assert_eq!(band, 150 * 100 * 4 * 12);
-    let (rois, accumulators) = (20_000 * 20, 15_000 * 21);
+    let (rois, accumulators) = (20_000 * 20, (150 * 100 + 75 * 50 + 38 * 25 + 19 * 13) * 16);
     let (peak, fixed) = estimate_photomerge_memory(&sizes, &sizes, cw, ch, cc, bpp, true, false);
     assert_eq!(fixed, rois + accumulators);
     // Surfaces are whole 256 px tiles; a warped surface and an output layer and mask at a
@@ -419,9 +419,14 @@ fn photomerge_estimate_tile_rounds_tiny_and_misaligned_surfaces() {
     for &(w, h) in &[(1usize, 1usize), (1, 1000), (1000, 1), (255, 255), (256, 256), (257, 257)] {
         let source = surface_bytes(w, h, 4);
         let misaligned = surface_bytes_misaligned(w, h, 4);
-        let expect = w.div_ceil(side).saturating_add(1).saturating_mul(h.div_ceil(side).saturating_add(1)).saturating_mul(side * side).saturating_mul(4);
-        assert_eq!(misaligned, expect, "{w}×{h}");
         assert!(misaligned >= source, "{w}×{h}");
+        for x in [-255, 0, 1, 255] {
+            for y in [-255, 0, 1, 255] {
+                let surface = flat_surface(Rect::new(x, y, x + w as i32, y + h as i32), 0.4);
+                let allocated: usize = surface.tiles().map(|(_, tile)| tile.len()).sum();
+                assert!(allocated <= misaligned, "{w}×{h} at ({x}, {y}): {allocated} > {misaligned}");
+            }
+        }
         let (peak, _) = estimate_photomerge_memory(&[(w, h)], &[(w, h)], w.max(1), h.max(1), 3, 4, true, false);
         assert!(peak >= misaligned, "{w}×{h}: {peak} < {misaligned}");
     }
@@ -654,8 +659,9 @@ fn photomerge_missing_file_keeps_its_io_error_not_a_budget_error() {
     let path = dir.join("absent.png");
     let mut s = Session::new();
     s.add_document(doc_from("open", &scene(8, 8, 1), 8, 8, SampleType::U8), None);
-    let err =
-        load_sources(&s, &json!({"useOpenDocuments": true, "paths": [path.to_string_lossy()]}), cmd, Some(1u64 << 30)).err().expect("a missing file must fail");
+    let err = load_sources(&s, &json!({"useOpenDocuments": true, "paths": [path.to_string_lossy()]}), cmd, Some(1usize << 30))
+        .err()
+        .expect("a missing file must fail");
     let message = err.to_string();
     assert!(matches!(err, EngineError::Other(_)), "{message}");
     assert!(message.contains("absent.png"), "{message}");
@@ -674,7 +680,7 @@ fn photomerge_directory_source_keeps_its_io_error_not_a_budget_error() {
     std::fs::create_dir(&path).unwrap();
     let mut s = Session::new();
     s.add_document(doc_from("open", &scene(8, 8, 1), 8, 8, SampleType::U8), None);
-    let err = load_sources(&s, &json!({"useOpenDocuments": true, "paths": [path.to_string_lossy()]}), cmd, Some(1u64 << 30))
+    let err = load_sources(&s, &json!({"useOpenDocuments": true, "paths": [path.to_string_lossy()]}), cmd, Some(1usize << 30))
         .err()
         .expect("a directory is not an image file");
     let message = err.to_string();
