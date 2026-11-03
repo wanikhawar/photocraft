@@ -214,7 +214,9 @@ fn ref_adjust(adj: &Adjustment, p: Cmyka) -> Cmyka {
 }
 
 /// An adjustment layer `l` (adjusting `p`, then `clipped` onto that) mixed into `p` in its blend
-/// mode by its opacity and mask; coverage stays.
+/// mode by its opacity and mask; coverage stays. The special eight below 100% Fill change the
+/// blend itself (Fill apart from Opacity) and use the mode's neutral brightness for the pulled
+/// source, written out channel by channel.
 fn ref_adjusted(l: &Layer, adj: &Adjustment, clipped: &[Layer], p: Cmyka, x: i32, y: i32) -> Cmyka {
     let mut a = ref_adjust(adj, p);
     if p[4] > 0.0 {
@@ -1898,6 +1900,7 @@ fn captured_adjustment_doc(depth: SampleType, blend: BlendMode, opacity: f32, fi
     (d, stored_yellow)
 }
 
+/// The captured seed 4725294a stack reproduces its recorded yellow level on both routes.
 #[test]
 fn adjustment_special_fill_recreates_captured_repro() {
     let (d, _) = captured_adjustment_doc(SampleType::U8, BlendMode::Difference, 1.0, 0.170_322_34, None);
@@ -1906,6 +1909,7 @@ fn adjustment_special_fill_recreates_captured_repro() {
     assert_eq!(render1(&d, 0, 0)[2], 174.0 / 255.0);
 }
 
+/// The captured stack stores the Difference-on-brightness result at each document depth.
 #[test]
 fn adjustment_special_fill_depths() {
     for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
@@ -1929,6 +1933,8 @@ fn adjustment_special_fill_depths() {
     }
 }
 
+/// Opacity, masks, Normal blending, zero and full Fill, and Dissolve around the special-Fill
+/// adjustment all follow the reference.
 #[test]
 fn adjustment_fill_attenuation_and_boundaries() {
     let cases = [
@@ -1949,4 +1955,49 @@ fn adjustment_fill_attenuation_and_boundaries() {
             assert_eq!(got[2], stored);
         }
     }
+}
+
+/// A one-pixel 32-bit CMYK document: a raster `base` backdrop and an `adj` adjustment layer in
+/// `blend` at `fill`; `clipped`, when given, is a fully covering clipped Normal raster that
+/// replaces the adjusted inks exactly.
+fn special_fill_doc(base: Cmyka, adj: Adjustment, blend: BlendMode, fill: f32, clipped: Option<Cmyka>) -> Document {
+    let format = PixelFormat { mode: ColorMode::Cmyk, sample: SampleType::F32, alpha: true };
+    let pixel = Rect::new(0, 0, 1, 1);
+    let mut d = Document::new("fill", Size::new(1, 1), ColorMode::Cmyk, SampleType::F32);
+    let mut backdrop = Layer::raster("base", format);
+    backdrop.surface_mut().unwrap().fill_rect(pixel, &base);
+    d.layers.push(backdrop);
+    let mut adjust = adjustment(adj);
+    adjust.blend = blend;
+    adjust.fill_opacity = fill;
+    d.layers.push(adjust);
+    if let Some(ink) = clipped {
+        let mut clip = Layer::raster("clip", format);
+        clip.surface_mut().unwrap().fill_rect(pixel, &ink);
+        clip.clipped = true;
+        d.layers.push(clip);
+    }
+    d
+}
+
+/// Zero Fill in Difference blends the backdrop with itself, so every ink stays bit-exact; F32 0.1
+/// and 0.4 must not come back as 1 − (1 − ink) (about 0.100000024 and 0.39999998).
+#[test]
+fn adjustment_special_fill_zero_keeps_backdrop_ink_exact() {
+    let base = [0.1, 0.4, 0.7, 0.3, 1.0];
+    let d = special_fill_doc(base, Adjustment::Invert, BlendMode::Difference, 0.0, None);
+    assert!(supports(&d));
+    assert_eq!(render1(&d, 0, 0), base);
+}
+
+/// A nonzero Fill whose Linear Light result is the source brightness keeps the source ink exactly:
+/// a clipped raster leaves 0.1 in the adjusted pixel, where 1 − (1 − ink) would store
+/// 0.100000024.
+#[test]
+fn adjustment_special_fill_input_match_keeps_source_ink_exact() {
+    let base = [0.5, 0.5, 0.5, 0.5, 1.0];
+    let source = [0.1, 0.1, 0.1, 0.1, 1.0];
+    let d = special_fill_doc(base, Adjustment::Invert, BlendMode::LinearLight, 0.5, Some(source));
+    assert!(supports(&d));
+    assert_eq!(render1(&d, 0, 0), source);
 }

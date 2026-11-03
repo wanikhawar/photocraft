@@ -430,7 +430,18 @@ fn mix_adjusted(l: &Layer, base: &mut CmykBuffer, adjusted: &CmykBuffer, cx: &Ct
             let s = |i: usize| 1.0 - a[i];
             let cmy = super::psblend::blend_rgb_fill(l.blend, [b(0), b(1), b(2)], [s(0), s(1), s(2)], l.fill_opacity);
             let k = super::psblend::blend_rgb_fill(l.blend, [b(3); 3], [s(3); 3], l.fill_opacity);
-            [1.0 - cmy[0], 1.0 - cmy[1], 1.0 - cmy[2], 1.0 - k[0]]
+            // A result equal to one input is that ink exactly, as in blend_ink: the source first,
+            // then the backdrop (zero Fill returns the backdrop).
+            let ink = |r: f32, i: usize| {
+                if r == s(i) {
+                    a[i]
+                } else if r == b(i) {
+                    p[i]
+                } else {
+                    1.0 - r
+                }
+            };
+            [ink(cmy[0], 0), ink(cmy[1], 1), ink(cmy[2], 2), ink(k[0], 3)]
         } else {
             blend_ink(l.blend, [p[0], p[1], p[2], p[3]], [a[0], a[1], a[2], a[3]])
         };
