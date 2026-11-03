@@ -200,6 +200,35 @@ impl BandRenderer for DrainOnlyRenderer {
 }
 
 #[test]
+fn failed_local_write_keeps_export_warnings_with_a_drain_only_renderer() {
+    let dir = std::env::temp_dir().join(format!("photocraft-local-write-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    // A directory at the destination makes the final atomic rename fail after encoding.
+    let target = dir.join("target.png");
+    fs::create_dir(&target).unwrap();
+
+    let mut h = Headless::trusted_local();
+    let mut doc = Document::with_background("test", Size::new(32, 24), ColorMode::Rgb, SampleType::U8, Color::WHITE);
+    let mut top = doc.layers[0].clone();
+    top.name = "top".into();
+    doc.layers.push(top);
+    h.session.open_document(doc, None);
+    h.set_renderer(Some(Box::new(DrainOnlyRenderer)));
+
+    let res = h.save(Some(0), Some(&target), Some("png"), &Default::default());
+    assert!(res.is_err(), "a write over a directory must fail: {res:?}");
+    let diagnostics = h.drain_diagnostics();
+    assert!(
+        diagnostics.iter().any(|d| d.contains("flattened")),
+        "the export warnings must survive a failed local write when the renderer ignores pushed diagnostics: {diagnostics:?}"
+    );
+    let again = h.drain_diagnostics();
+    assert!(again.is_empty(), "the export warnings must drain exactly once: {again:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn failed_workspace_write_keeps_export_warnings_with_a_drain_only_renderer() {
     let dir = std::env::temp_dir().join(format!("photocraft-workspace-warnings-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -227,4 +256,84 @@ fn failed_workspace_write_keeps_export_warnings_with_a_drain_only_renderer() {
     let again = h.drain_diagnostics();
     assert!(again.is_empty(), "the export warnings must drain exactly once: {again:?}");
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// Fails every render retryably and keeps the default no-op `push_diagnostic`: only the io
+/// layer's returned warnings can carry the fallback reason.
+struct UnavailableRenderer;
+
+impl BandRenderer for UnavailableRenderer {
+    fn render_bands(
+        &mut self,
+        _doc: &Document,
+        _rect: Rect,
+        _band_rows: i32,
+        _ctl: &photocraft_raster::Interrupt<'_>,
+        _sink: &mut dyn FnMut(RenderBand) -> Result<(), IoError>,
+    ) -> Result<(), RenderError> {
+        Err(RenderError::Unavailable("forced unavailable backend".into()))
+    }
+}
+
+fn multi_layer_doc(name: &str) -> Document {
+    let mut doc = Document::with_background(name, Size::new(48, 32), ColorMode::Rgb, SampleType::U8, Color::WHITE);
+    let mut top = doc.layers[0].clone();
+    top.name = "top".into();
+    doc.layers.push(top);
+    doc
+}
+
+#[test]
+fn preview_fallback_warnings_reach_the_next_drain() {
+    let mut h = Headless::trusted_local();
+    h.session.open_document(multi_layer_doc("preview"), None);
+    h.set_renderer(Some(Box::new(UnavailableRenderer)));
+
+    let png = h.render_png(Some(0), 0).expect("preview falls back to the CPU");
+    assert!(!png.is_empty(), "the CPU retry must still produce a preview");
+    let diagnostics = h.drain_diagnostics();
+    assert!(diagnostics.iter().any(|d| d.contains("falling back to CPU")), "the preview fallback reason must reach the caller: {diagnostics:?}");
+    assert!(h.drain_diagnostics().is_empty(), "preview warnings drain exactly once");
+}
+
+#[test]
+fn doc_render_reply_carries_preview_fallback_warnings() {
+    let mut h = Headless::trusted_local();
+    h.session.open_document(multi_layer_doc("render"), None);
+    h.set_renderer(Some(Box::new(UnavailableRenderer)));
+
+    let reply = h.handle("doc.render", serde_json::json!({"maxSide": 0})).expect("doc.render");
+    let warnings = reply["warnings"].as_array().cloned().unwrap_or_default();
+    assert!(
+        warnings.iter().any(|w| w.as_str().is_some_and(|w| w.contains("falling back to CPU"))),
+        "the doc.render reply must carry the fallback reason: {reply}"
+    );
+}
+
+#[test]
+fn a_panicking_drain_still_lets_the_rpc_reply_be_written() {
+    struct PanickingDrain;
+    impl BandRenderer for PanickingDrain {
+        fn render_bands(
+            &mut self,
+            _doc: &Document,
+            _rect: Rect,
+            _band_rows: i32,
+            _ctl: &photocraft_raster::Interrupt<'_>,
+            _sink: &mut dyn FnMut(RenderBand) -> Result<(), IoError>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        fn drain_diagnostics(&mut self) -> Vec<String> {
+            panic!("custom renderer panic");
+        }
+    }
+
+    let mut h = Headless::trusted_local();
+    h.set_renderer(Some(Box::new(PanickingDrain)));
+    let h = Mutex::new(h);
+    let reply = photocraft_automation::rpc::respond(&h, r#"{"id":7,"method":"methods"}"#);
+    assert_eq!(reply["id"], 7);
+    assert_eq!(reply["ok"], true, "a panicking drain must not prevent the reply: {reply}");
 }

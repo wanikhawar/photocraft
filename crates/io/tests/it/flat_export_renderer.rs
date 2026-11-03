@@ -1,6 +1,7 @@
 //! Tests for custom [`BandRenderer`] injection, complete CPU retry, and renderer error handling.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use photocraft_codecs::Format;
 use photocraft_color::{BlendMode, Color, ColorMode, SampleType};
@@ -8,7 +9,7 @@ use photocraft_doc::{Document, Layer, LayerContent};
 use photocraft_geom::{Rect, Size};
 use photocraft_io::{
     BandRenderer, CpuRenderer, ExportOptions, IoError, RenderBand, RenderError, document_to_image_with_renderer, export_flat, export_flat_with_renderer,
-    export_png_streamed_with_renderer, export_preview_png_with_renderer,
+    export_flat_with_renderer_diagnostics, export_png_streamed_with_renderer, export_preview_png_with_renderer,
 };
 use photocraft_raster::{Interrupt, Surface};
 
@@ -132,10 +133,19 @@ fn single_layer_and_cmyk_exports_report_that_the_renderer_was_not_used() {
     let mut renderer = RecordingRenderer::default();
     let mut warnings = Vec::new();
     document_to_image_with_renderer(&single, &mut warnings, Some(&mut renderer)).expect("single-layer export");
-    let diagnostics = renderer.drain_diagnostics();
     assert!(
-        diagnostics.iter().any(|d| d.contains("single-layer") && d.contains("CPU")),
-        "a requested renderer that is bypassed must report why: {diagnostics:?}"
+        warnings.iter().any(|d| d.contains("single-layer") && d.contains("CPU")),
+        "a requested renderer that is bypassed must report why in the result: {warnings:?}"
+    );
+
+    // The flat-export result carries the same notice, not only the renderer's queue.
+    let mut renderer = RecordingRenderer::default();
+    let exported =
+        export_flat_with_renderer(&single, Format::Png, &ExportOptions::default(), &Interrupt::NONE, Some(&mut renderer)).expect("single-layer flat export");
+    assert!(
+        exported.warnings.iter().any(|d| d.contains("single-layer") && d.contains("CPU")),
+        "ExportResult.warnings must report a bypassed renderer: {:?}",
+        exported.warnings
     );
 
     // A CMYK composite mixed on ink values likewise returns before the renderer branch.
@@ -342,7 +352,7 @@ fn forced_unsupported_renderer_restarts_complete_export_on_cpu() {
 
     assert_eq!(expected.bytes, res.bytes, "output after retry must match clean CPU output");
     assert!(
-        res.warnings.iter().any(|w| w.contains("GPU rendering unavailable") && w.contains("falling back to CPU")),
+        res.warnings.iter().any(|w| w.contains("rendering backend unavailable") && w.contains("falling back to CPU")),
         "fallback warning must be reported: {:?}",
         res.warnings
     );
@@ -436,4 +446,91 @@ fn unknown_export_format_is_rejected() {
     // `export` takes a name or bare extension; an unknown one fails before any codec runs.
     let export_err = photocraft_io::export(&doc, "invalid_unknown_extension_xyz", &opts);
     assert!(export_err.is_err());
+}
+
+/// Fails its first render retryably, keeps the default no-op `push_diagnostic`, and owns one
+/// diagnostic of its own: the export must still report both the fallback and that diagnostic.
+struct DrainOnlyFailingRenderer {
+    failed: bool,
+    drained: bool,
+}
+
+impl BandRenderer for DrainOnlyFailingRenderer {
+    fn render_bands(
+        &mut self,
+        doc: &Document,
+        rect: Rect,
+        band_rows: i32,
+        ctl: &Interrupt<'_>,
+        sink: &mut dyn FnMut(RenderBand) -> Result<(), IoError>,
+    ) -> Result<(), RenderError> {
+        if !self.failed {
+            self.failed = true;
+            return Err(RenderError::Unavailable("forced unavailable backend".into()));
+        }
+        let mut cpu = CpuRenderer;
+        cpu.render_bands(doc, rect, band_rows, ctl, sink)
+    }
+
+    fn drain_diagnostics(&mut self) -> Vec<String> {
+        if self.drained {
+            Vec::new()
+        } else {
+            self.drained = true;
+            vec!["renderer-owned diagnostic".into()]
+        }
+    }
+}
+
+#[test]
+fn retry_fallback_and_renderer_diagnostics_reach_a_drain_only_renderer() {
+    let doc = synthetic_doc();
+    let opts = ExportOptions::default();
+    let mut renderer = DrainOnlyFailingRenderer { failed: false, drained: false };
+    let res = export_flat_with_renderer(&doc, Format::Png, &opts, &Interrupt::NONE, Some(&mut renderer)).expect("export retries on CPU");
+    assert!(res.warnings.iter().any(|w| w.contains("falling back to CPU")), "the fallback reason must reach the result: {:?}", res.warnings);
+    assert!(res.warnings.iter().any(|w| w == "renderer-owned diagnostic"), "a drain-only renderer's queued diagnostic must not be lost: {:?}", res.warnings);
+}
+
+#[test]
+fn preview_retry_fallback_reaches_a_drain_only_renderer() {
+    let doc = synthetic_doc();
+    let mut renderer = DrainOnlyFailingRenderer { failed: false, drained: false };
+    let res = export_preview_png_with_renderer(&doc, Some(&mut renderer)).expect("preview retries on CPU");
+    assert!(res.warnings.iter().any(|w| w.contains("falling back to CPU")), "the preview fallback reason must reach the result: {:?}", res.warnings);
+    assert!(res.warnings.iter().any(|w| w == "renderer-owned diagnostic"), "the preview must keep the renderer's diagnostic: {:?}", res.warnings);
+}
+
+struct CancellingFailingRenderer {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl BandRenderer for CancellingFailingRenderer {
+    fn render_bands(
+        &mut self,
+        _doc: &Document,
+        _rect: Rect,
+        _band_rows: i32,
+        _ctl: &Interrupt<'_>,
+        _sink: &mut dyn FnMut(RenderBand) -> Result<(), IoError>,
+    ) -> Result<(), RenderError> {
+        self.cancelled.store(true, Ordering::SeqCst);
+        Err(RenderError::Device("forced device loss".into()))
+    }
+}
+
+#[test]
+fn a_cancelled_retry_keeps_the_fallback_reason_for_the_caller() {
+    let doc = synthetic_doc();
+    let opts = ExportOptions::default();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let ctl = Interrupt::cancel_only(&|| cancelled.load(Ordering::SeqCst));
+    let mut renderer = CancellingFailingRenderer { cancelled: cancelled.clone() };
+    let mut diagnostics = Vec::new();
+    let res = export_flat_with_renderer_diagnostics(&doc, Format::Png, &opts, &ctl, Some(&mut renderer), &mut diagnostics);
+    assert!(matches!(res, Err(IoError::Cancelled)), "cancellation must stop before the CPU retry: {res:?}");
+    assert!(
+        diagnostics.iter().any(|d| d.contains("rendering backend unavailable") && d.contains("falling back to CPU")),
+        "a failed retry must keep the fallback reason with the caller: {diagnostics:?}"
+    );
 }

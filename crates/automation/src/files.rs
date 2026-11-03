@@ -114,7 +114,34 @@ pub fn save_with_renderer(
     format_override: Option<&str>,
     opts: &ExportOptions,
     writer: Option<&mut PcraftWriter>,
+    mut renderer: Option<&mut dyn BandRenderer>,
+) -> Result<Vec<String>, AutomationError> {
+    let mut diagnostics = Vec::new();
+    let reborrowed = renderer.as_mut().map(|r| &mut **r as &mut dyn BandRenderer);
+    let result = save_with_renderer_diagnostics(doc, path, format_override, opts, writer, reborrowed, &mut diagnostics);
+    if let Err(error) = result {
+        // Keep the old API's contract for custom renderers that override `push_diagnostic`.
+        if let Some(renderer) = renderer.as_mut() {
+            for diagnostic in diagnostics {
+                renderer.push_diagnostic(diagnostic);
+            }
+        }
+        return Err(error);
+    }
+    result
+}
+
+/// [`save_with_renderer`] reporting the diagnostics of a failed save through `diagnostics`
+/// instead of the renderer's queue, which a custom renderer may leave unimplemented.
+#[allow(clippy::too_many_arguments)]
+pub fn save_with_renderer_diagnostics(
+    doc: &Document,
+    path: &Path,
+    format_override: Option<&str>,
+    opts: &ExportOptions,
+    writer: Option<&mut PcraftWriter>,
     renderer: Option<&mut dyn BandRenderer>,
+    diagnostics: &mut Vec<String>,
 ) -> Result<Vec<String>, AutomationError> {
     let ext = format_override
         .map(|f| f.trim_start_matches('.').to_ascii_lowercase())
@@ -127,7 +154,7 @@ pub fn save_with_renderer(
         w.save_path(&named, path, &native_options(&named, opts)?)?;
         let mut warnings = Vec::new();
         if let Some(r) = renderer {
-            warnings.push("native .pcraft format uses CPU compositor for previews".into());
+            warnings.push("native .pcraft format uses the CPU compositor for previews".into());
             warnings.extend(r.drain_diagnostics());
         }
         return Ok(warnings);
@@ -135,17 +162,25 @@ pub fn save_with_renderer(
     let Some(renderer) = renderer else {
         let r = photocraft_io::export_with_renderer(doc, &ext, opts, &photocraft_raster::Interrupt::NONE, None)?;
         // Crash-safe: a failed write never destroys the previous file.
-        photocraft_format::atomic_write(path, &r.bytes).map_err(|e| AutomationError::Io(e.to_string()))?;
+        if let Err(error) = photocraft_format::atomic_write(path, &r.bytes) {
+            diagnostics.extend(r.warnings);
+            return Err(AutomationError::Io(error.to_string()));
+        }
         return Ok(r.warnings);
     };
-    let r = photocraft_io::export_with_renderer(doc, &ext, opts, &photocraft_raster::Interrupt::NONE, Some(&mut *renderer))?;
-    if let Err(e) = photocraft_format::atomic_write(path, &r.bytes) {
-        // Encoding drained the renderer's diagnostics into `r.warnings`; put them back so the
-        // caller can still report the adapter or fallback reason alongside the write error.
-        for warning in &r.warnings {
-            renderer.push_diagnostic(warning.clone());
+    let result = photocraft_io::export_with_renderer_diagnostics(doc, &ext, opts, &photocraft_raster::Interrupt::NONE, Some(&mut *renderer), diagnostics);
+    let r = match result {
+        Ok(r) => r,
+        Err(error) => {
+            diagnostics.extend(renderer.drain_diagnostics());
+            return Err(error.into());
         }
-        return Err(AutomationError::Io(e.to_string()));
+    };
+    if let Err(error) = photocraft_format::atomic_write(path, &r.bytes) {
+        // Encoding drained the renderer's diagnostics into `r.warnings`; keep them with the
+        // caller so the adapter or fallback reason is reported alongside the write error.
+        diagnostics.extend(r.warnings);
+        return Err(AutomationError::Io(error.to_string()));
     }
     Ok(r.warnings)
 }
@@ -162,7 +197,32 @@ pub fn save_bytes_with_renderer(
     name: &str,
     format_override: Option<&str>,
     opts: &ExportOptions,
+    mut renderer: Option<&mut dyn BandRenderer>,
+) -> Result<(Vec<u8>, Vec<String>), AutomationError> {
+    let mut diagnostics = Vec::new();
+    let reborrowed = renderer.as_mut().map(|r| &mut **r as &mut dyn BandRenderer);
+    let result = save_bytes_with_renderer_diagnostics(doc, name, format_override, opts, reborrowed, &mut diagnostics);
+    if let Err(error) = result {
+        // Keep the old API's contract for custom renderers that override `push_diagnostic`.
+        if let Some(renderer) = renderer.as_mut() {
+            for diagnostic in diagnostics {
+                renderer.push_diagnostic(diagnostic);
+            }
+        }
+        return Err(error);
+    }
+    result
+}
+
+/// [`save_bytes_with_renderer`] reporting the diagnostics of a failed export through
+/// `diagnostics` instead of the renderer's queue, which a custom renderer may leave unimplemented.
+pub fn save_bytes_with_renderer_diagnostics(
+    doc: &Document,
+    name: &str,
+    format_override: Option<&str>,
+    opts: &ExportOptions,
     renderer: Option<&mut dyn BandRenderer>,
+    diagnostics: &mut Vec<String>,
 ) -> Result<(Vec<u8>, Vec<String>), AutomationError> {
     let ext = format_override
         .map(|format| format.trim_start_matches('.').to_ascii_lowercase())
@@ -175,13 +235,23 @@ pub fn save_bytes_with_renderer(
         let bytes = photocraft_format::save_to_bytes(&named, &native_options(&named, opts)?)?;
         let mut warnings = Vec::new();
         if let Some(r) = renderer {
-            warnings.push("native .pcraft format uses CPU compositor for previews".into());
+            warnings.push("native .pcraft format uses the CPU compositor for previews".into());
             warnings.extend(r.drain_diagnostics());
         }
         return Ok((bytes, warnings));
     }
-    let result = photocraft_io::export_with_renderer(doc, &ext, opts, &photocraft_raster::Interrupt::NONE, renderer)?;
-    Ok((result.bytes, result.warnings))
+    let Some(renderer) = renderer else {
+        let result = photocraft_io::export_with_renderer(doc, &ext, opts, &photocraft_raster::Interrupt::NONE, None)?;
+        return Ok((result.bytes, result.warnings));
+    };
+    let result = photocraft_io::export_with_renderer_diagnostics(doc, &ext, opts, &photocraft_raster::Interrupt::NONE, Some(&mut *renderer), diagnostics);
+    match result {
+        Ok(result) => Ok((result.bytes, result.warnings)),
+        Err(error) => {
+            diagnostics.extend(renderer.drain_diagnostics());
+            Err(error.into())
+        }
+    }
 }
 
 /// Flattened document as PNG, scaled to fit `max_side` (0 = full size).
@@ -191,6 +261,26 @@ pub fn render_png(doc: &Document, max_side: u32) -> Result<Vec<u8>, AutomationEr
 
 /// [`render_png`] with an optional custom [`BandRenderer`].
 pub fn render_png_with_renderer(doc: &Document, max_side: u32, mut renderer: Option<&mut dyn BandRenderer>) -> Result<Vec<u8>, AutomationError> {
+    let mut diagnostics = Vec::new();
+    let reborrowed = renderer.as_mut().map(|r| &mut **r as &mut dyn BandRenderer);
+    let result = render_png_with_renderer_diagnostics(doc, max_side, reborrowed, &mut diagnostics);
+    // Keep the old API's contract for custom renderers that override `push_diagnostic`.
+    if let Some(renderer) = renderer.as_mut() {
+        for diagnostic in diagnostics {
+            renderer.push_diagnostic(diagnostic);
+        }
+    }
+    result
+}
+
+/// [`render_png_with_renderer`] reporting what the preview produced (or why it fell back) through
+/// `diagnostics` instead of the renderer's queue.
+pub fn render_png_with_renderer_diagnostics(
+    doc: &Document,
+    max_side: u32,
+    mut renderer: Option<&mut dyn BandRenderer>,
+    diagnostics: &mut Vec<String>,
+) -> Result<Vec<u8>, AutomationError> {
     let side = if max_side == 0 { doc.size.width.max(doc.size.height) } else { max_side };
     let (target_w, target_h) = photocraft_compose::thumbnail_size(doc, side.max(1));
 
@@ -199,21 +289,23 @@ pub fn render_png_with_renderer(doc: &Document, max_side: u32, mut renderer: Opt
     {
         // 8-bit RGBA whatever the document's depth, like the CPU preview path: a 16-bit
         // document's preview must not be twice as large as the one it previews.
-        let res = photocraft_io::export_preview_png_with_renderer(doc, Some(&mut **r));
+        let res = photocraft_io::export_preview_png_with_renderer_diagnostics(doc, Some(&mut **r), diagnostics);
         match res {
             Ok(res) => {
-                for w in res.warnings {
-                    r.push_diagnostic(w);
-                }
+                diagnostics.extend(res.warnings);
                 return Ok(res.bytes);
             }
             Err(photocraft_io::IoError::Cancelled) => return Err(AutomationError::Other("rendering was cancelled".into())),
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                diagnostics.extend(r.drain_diagnostics());
+                return Err(e.into());
+            }
         }
     }
 
     if let Some(r) = renderer {
-        r.push_diagnostic("scaled previews and thumbnails use CPU compositor; GPU rendering applies to full-size previews".into());
+        diagnostics.push("scaled previews and thumbnails use the CPU compositor; custom rendering applies to full-size previews".into());
+        diagnostics.extend(r.drain_diagnostics());
     }
 
     let img = photocraft_compose::thumbnail(doc, side.max(1));

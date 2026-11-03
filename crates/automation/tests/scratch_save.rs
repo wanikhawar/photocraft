@@ -11,6 +11,48 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 struct QueuedDiagnosticsRenderer(Vec<String>);
 
+/// Renders through the reference compositor, then makes a scratch tile unreadable so the final
+/// health check fails after the export looked successful.
+struct CorruptingRenderer {
+    diagnostics: Vec<String>,
+}
+
+impl BandRenderer for CorruptingRenderer {
+    fn render_bands(
+        &mut self,
+        doc: &Document,
+        rect: Rect,
+        band_rows: i32,
+        ctl: &Interrupt<'_>,
+        sink: &mut dyn FnMut(RenderBand) -> Result<(), IoError>,
+    ) -> Result<(), RenderError> {
+        let mut cpu = photocraft_io::CpuRenderer;
+        cpu.render_bands(doc, rect, band_rows, ctl, sink)?;
+        self.diagnostics.push("adapter status before the scratch failure".into());
+        if let Some(mut file) = spill::scratch_handle_for_tests() {
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(&vec![0u8; 1 << 20]).unwrap();
+            file.sync_all().unwrap();
+        }
+        for layer in &doc.layers {
+            if let Some(surface) = layer.surface() {
+                for (_, tile) in surface.tiles() {
+                    let _ = tile.try_bytes();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn drain_diagnostics(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.diagnostics)
+    }
+
+    fn push_diagnostic(&mut self, diagnostic: String) {
+        self.diagnostics.push(diagnostic);
+    }
+}
+
 impl BandRenderer for QueuedDiagnosticsRenderer {
     fn render_bands(
         &mut self,
@@ -78,6 +120,21 @@ fn native_save_refuses_previews_rendered_from_unreadable_scratch() {
     assert!(spill::check_integrity().is_ok());
     let (bytes, _) = files::save_bytes(&doc, "Scratch.pcraft", None, &on).unwrap();
     assert_eq!(photocraft_format::load_from_bytes(&bytes).unwrap().layers, doc.layers);
+
+    // A flat export that succeeds provisionally keeps its renderer diagnostics when the final
+    // scratch check fails afterwards.
+    doc.layers.push(doc.layers[0].clone());
+    spill::settle();
+    let mut renderer = CorruptingRenderer { diagnostics: Vec::new() };
+    let mut diagnostics = Vec::new();
+    let err =
+        files::save_bytes_with_renderer_diagnostics(&doc, "Scratch.png", Some("png"), &Default::default(), Some(&mut renderer), &mut diagnostics).unwrap_err();
+    assert!(matches!(err, AutomationError::Io(_) | AutomationError::Import(_)), "{err:?}");
+    assert!(
+        diagnostics.iter().any(|d| d.contains("adapter status before the scratch failure")),
+        "a final scratch failure must keep the provisional renderer diagnostics: {diagnostics:?}"
+    );
+
     drop((doc, file));
     spill::configure(None, 0).unwrap();
     let _ = std::fs::remove_dir_all(dir);

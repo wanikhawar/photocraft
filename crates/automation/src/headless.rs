@@ -342,31 +342,49 @@ impl Headless {
             Filesystem::Denied => return Err(AutomationError::BadRequest("automation filesystem access is not granted: write authority is absent".into())),
             Filesystem::TrustedLocal => {
                 let writer = self.writers.entry(doc.id.0).or_default();
-                files::save_with_renderer(
+                let mut diagnostics = Vec::new();
+                let result = files::save_with_renderer_diagnostics(
                     &doc,
                     &target,
                     format,
                     opts,
                     Some(writer),
                     self.renderer.as_mut().map(|b| &mut **b as &mut dyn photocraft_io::BandRenderer),
-                )?
+                    &mut diagnostics,
+                );
+                if result.is_err() {
+                    // Keep export warnings from a failed local write for the next drain, whatever
+                    // the renderer's `push_diagnostic` does.
+                    self.pending_diagnostics.extend(diagnostics);
+                }
+                result?
             }
             Filesystem::Workspace(workspace) => {
                 // Only the target is granted: a linked smart object's stored path is document
                 // data, so PSD export writes that layer as pixels instead of embedding the file.
                 let opts = ExportOptions { read_linked_files: false, ..opts.clone() };
-                let (bytes, warnings) = files::save_bytes_with_renderer(
+                let mut diagnostics = Vec::new();
+                let result = files::save_bytes_with_renderer_diagnostics(
                     &doc,
                     target_text,
                     format,
                     &opts,
                     self.renderer.as_mut().map(|b| &mut **b as &mut dyn photocraft_io::BandRenderer),
-                )?;
+                    &mut diagnostics,
+                );
+                let (bytes, warnings) = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.pending_diagnostics.extend(diagnostics);
+                        return Err(error);
+                    }
+                };
                 if let Err(error) = workspace.write(target_text, &bytes) {
                     // Keep the export diagnostics for the caller, as the local save path does:
                     // they are reported with the write error and by the next drain, even when the
                     // renderer's `push_diagnostic` is the default no-op.
                     self.pending_diagnostics.extend(warnings);
+                    self.pending_diagnostics.extend(diagnostics);
                     return Err(error);
                 }
                 warnings
@@ -413,7 +431,14 @@ impl Headless {
         if !matches!(&self.filesystem, Filesystem::TrustedLocal) {
             crate::budgets::check_preview(doc.size.width, doc.size.height, max_side)?;
         }
-        let png = files::render_png_with_renderer(doc, max_side, self.renderer.as_mut().map(|b| &mut **b as &mut dyn photocraft_io::BandRenderer))?;
+        let mut diagnostics = Vec::new();
+        let png = files::render_png_with_renderer_diagnostics(
+            doc,
+            max_side,
+            self.renderer.as_mut().map(|b| &mut **b as &mut dyn photocraft_io::BandRenderer),
+            &mut diagnostics,
+        )?;
+        self.pending_diagnostics.extend(diagnostics);
         if !matches!(&self.filesystem, Filesystem::TrustedLocal) {
             crate::budgets::check_png(png.len())?;
         }

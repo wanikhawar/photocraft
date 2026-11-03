@@ -720,7 +720,7 @@ fn document_to_image_for_with_renderer(
     let bytes = src.sample.bytes();
     let mut data = try_buffer((w as usize) * (h as usize), src.layout(alpha).channels() * bytes)?;
     let mut opaque = true;
-    src.bands(alpha, ctl, renderer, |_, band, translucent| {
+    src.bands(alpha, ctl, renderer, warnings, |_, band, translucent| {
         opaque &= !translucent;
         data.extend_from_slice(&band);
         Ok(())
@@ -739,7 +739,7 @@ fn document_to_preview_with_renderer(doc: &Document, warnings: &mut Vec<String>,
     let (w, h) = (doc.size.width, doc.size.height);
     let pixels = (w as usize).checked_mul(h as usize).ok_or_else(|| IoError::Unsupported("image too large".into()))?;
     let mut data = try_buffer(pixels, ChannelLayout::Rgba.channels())?;
-    src.bands(true, &Interrupt::NONE, renderer, |_, band, _| {
+    src.bands(true, &Interrupt::NONE, renderer, warnings, |_, band, _| {
         data.extend_from_slice(&band);
         Ok(())
     })?;
@@ -751,34 +751,74 @@ fn document_to_preview_with_renderer(doc: &Document, warnings: &mut Vec<String>,
 /// at 8-bit RGBA stops a 16-bit document's preview from outgrowing the preview size limit; saved
 /// exports still keep the document's native depth. Like the CPU preview, it carries no export
 /// metadata (EXIF, XMP or resolution).
-pub fn export_preview_png_with_renderer(doc: &Document, renderer: Option<&mut dyn BandRenderer>) -> Result<ExportResult, IoError> {
+pub fn export_preview_png_with_renderer(doc: &Document, mut renderer: Option<&mut dyn BandRenderer>) -> Result<ExportResult, IoError> {
+    let mut diagnostics = Vec::new();
+    let reborrowed = renderer.as_mut().map(|r| &mut **r as &mut dyn BandRenderer);
+    match export_preview_png_with_renderer_diagnostics(doc, reborrowed, &mut diagnostics) {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            // Keep the old API's contract for custom renderers that override `push_diagnostic`.
+            if let Some(renderer) = renderer.as_mut() {
+                for diagnostic in diagnostics {
+                    renderer.push_diagnostic(diagnostic);
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+/// [`export_preview_png_with_renderer`] reporting the diagnostics of a failed attempt through
+/// `diagnostics` instead of the renderer's queue, which a custom renderer may leave unimplemented.
+pub fn export_preview_png_with_renderer_diagnostics(
+    doc: &Document,
+    renderer: Option<&mut dyn BandRenderer>,
+    diagnostics: &mut Vec<String>,
+) -> Result<ExportResult, IoError> {
     if let Some(r) = renderer {
         let mut warnings = Vec::new();
         match document_to_preview_with_renderer(doc, &mut warnings, Some(&mut *r)) {
             Ok(img) => {
-                // Leave queued diagnostics in the renderer when encoding fails, as a flat
-                // export does, so the caller can still report the fallback reason.
-                let mut res = encode_image(&img, Format::Png, &ExportOptions::default(), warnings)?;
+                let attempt_warnings = warnings.clone();
+                let mut res = match encode_image(&img, Format::Png, &ExportOptions::default(), warnings) {
+                    Ok(res) => res,
+                    Err(error) => {
+                        diagnostics.extend(attempt_warnings);
+                        diagnostics.extend(r.drain_diagnostics());
+                        return Err(error);
+                    }
+                };
                 res.warnings.extend(r.drain_diagnostics());
                 return Ok(res);
             }
             Err(IoError::Render(render_err)) if render_err.is_retryable() => {
-                let fallback_warning = format!("GPU rendering unavailable ({render_err}); falling back to CPU");
-                // Keep the fallback reason in this export's warnings only. Move this attempt's
-                // queued diagnostics into its retry result too: leaving either on the renderer
-                // would leak them into a later successful GPU export. If the retry fails, `?`
-                // returns early and they stay with the renderer for the caller.
-                let mut cpu_result = export_preview_png_with_renderer(doc, None)?;
-                cpu_result.warnings.extend(r.drain_diagnostics());
-                cpu_result.warnings.push(fallback_warning);
-                return Ok(cpu_result);
+                let fallback_warning = format!("rendering backend unavailable ({render_err}); falling back to CPU");
+                match export_preview_png_with_renderer_diagnostics(doc, None, diagnostics) {
+                    Ok(mut cpu_result) => {
+                        cpu_result.warnings.extend(r.drain_diagnostics());
+                        cpu_result.warnings.push(fallback_warning);
+                        Ok(cpu_result)
+                    }
+                    Err(cpu_error) => {
+                        // Keep the reason the GPU attempt failed when the CPU retry fails too.
+                        diagnostics.extend(std::mem::take(&mut warnings));
+                        diagnostics.extend(r.drain_diagnostics());
+                        diagnostics.push(fallback_warning);
+                        Err(cpu_error)
+                    }
+                }
             }
-            Err(e) => return Err(e),
+            Err(error) => {
+                diagnostics.extend(std::mem::take(&mut warnings));
+                diagnostics.extend(r.drain_diagnostics());
+                Err(error)
+            }
         }
+    } else {
+        let mut warnings = Vec::new();
+        let img = document_to_preview_with_renderer(doc, &mut warnings, None)?;
+        encode_image(&img, Format::Png, &ExportOptions::default(), warnings)
     }
-    let mut warnings = Vec::new();
-    let img = document_to_preview_with_renderer(doc, &mut warnings, None)?;
-    encode_image(&img, Format::Png, &ExportOptions::default(), warnings)
 }
 
 /// How a document becomes flat codec pixels, a band of rows at a time: [`document_to_image`]
@@ -896,6 +936,7 @@ impl<'a> FlatSource<'a> {
         alpha: bool,
         ctl: &Interrupt<'_>,
         mut renderer: Option<&mut dyn BandRenderer>,
+        warnings: &mut Vec<String>,
         mut sink: impl FnMut(u32, Vec<u8>, bool) -> Result<(), IoError>,
     ) -> Result<(), IoError> {
         let doc = self.doc;
@@ -904,10 +945,10 @@ impl<'a> FlatSource<'a> {
         if let Some(s) = self.native {
             // Native path: keep model and depth. The surface's encoded samples are the codec's raw
             // native-endian samples, copied a band of rows at a time (alpha dropped when opaque).
-            if let Some(r) = renderer.as_mut() {
-                r.push_diagnostic(
-                    "GPU rendering unsupported: a single-layer export copies the document's own pixels with the CPU path; falling back to CPU".into(),
-                );
+            // The notice goes into the export's own warnings, not the renderer's queue: a custom
+            // renderer may leave `push_diagnostic` at its no-op default.
+            if renderer.is_some() {
+                warnings.push("a single-layer export copies the document's own pixels with the CPU path; falling back to CPU".into());
             }
             let ch = fmt.channels();
             let bps = fmt.sample.bytes();
@@ -915,6 +956,7 @@ impl<'a> FlatSource<'a> {
             let rows = if self.rows > 0 { self.rows } else { (BAND_BYTES / (w as usize * ch * bps).max(1)).max(1) as i32 };
             let mut y = 0;
             while y < h as i32 {
+                ctl.check().map_err(|_| IoError::Cancelled)?;
                 let y1 = y.saturating_add(rows).min(h as i32);
                 let mut band = s.to_interleaved(Rect::new(0, y, w as i32, y1));
                 if !alpha {
@@ -950,8 +992,8 @@ impl<'a> FlatSource<'a> {
             sink(rows, data, translucent)
         };
         if self.inks {
-            if let Some(r) = renderer.as_mut() {
-                r.push_diagnostic("GPU rendering unsupported: CMYK ink mixing uses the CPU compositor; falling back to CPU".into());
+            if renderer.is_some() {
+                warnings.push("CMYK ink mixing uses the CPU compositor; falling back to CPU".into());
             }
             // Mixed on ink values, rendered and quantised in bands.
             let rendered = photocraft_compose::cmyk::render_cmyk_bands(doc, doc.bounds(), self.rows, |band| -> Result<(), IoError> {
@@ -1102,22 +1144,48 @@ pub fn export_flat_with_renderer(
     ctl: &photocraft_raster::Interrupt,
     mut renderer: Option<&mut dyn BandRenderer>,
 ) -> Result<ExportResult, IoError> {
+    let mut diagnostics = Vec::new();
+    let reborrowed = renderer.as_mut().map(|r| &mut **r as &mut dyn BandRenderer);
+    match export_flat_with_renderer_diagnostics(doc, format, opts, ctl, reborrowed, &mut diagnostics) {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            // Keep the old API's contract for custom renderers that override `push_diagnostic`.
+            if let Some(renderer) = renderer.as_mut() {
+                for diagnostic in diagnostics {
+                    renderer.push_diagnostic(diagnostic);
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+/// [`export_flat_with_renderer`] reporting the diagnostics of a failed attempt through
+/// `diagnostics` instead of the renderer's queue, which a custom renderer may leave unimplemented.
+pub fn export_flat_with_renderer_diagnostics(
+    doc: &Document,
+    format: Format,
+    opts: &ExportOptions,
+    ctl: &photocraft_raster::Interrupt,
+    renderer: Option<&mut dyn BandRenderer>,
+    diagnostics: &mut Vec<String>,
+) -> Result<ExportResult, IoError> {
     if let Some(mut r) = export_mode_specific(doc, format, opts)? {
         // Palette PNG/BMP and Duotone exports render on their own paths before the renderer
-        // branch: say so, or `--gpu` would silently do nothing for them.
-        if let Some(renderer) = &mut renderer {
+        // branch: say so, or a configured renderer would silently do nothing for them.
+        if let Some(renderer) = renderer {
             let why = match doc.mode {
                 ColorMode::Indexed => "palette (Indexed Color) PNG/BMP export uses the CPU compositor",
                 ColorMode::Duotone => "Duotone export uses the CPU compositor",
                 _ => "this export uses the CPU compositor",
             };
-            renderer.push_diagnostic(format!("GPU rendering unsupported: {why}; falling back to CPU"));
+            r.warnings.push(format!("rendering backend unsupported: {why}; falling back to CPU"));
             r.warnings.extend(renderer.drain_diagnostics());
         }
         return Ok(r);
     }
     if format == Format::Png && streams_png(doc) {
-        return export_png_streamed_with_renderer(doc, opts, ctl, 0, renderer);
+        return export_png_streamed_with_renderer_diagnostics(doc, opts, ctl, 0, renderer, diagnostics);
     }
 
     if let Some(r) = renderer {
@@ -1139,47 +1207,76 @@ pub fn export_flat_with_renderer(
                 if format == Format::Tiff {
                     warnings.extend(crate::tiff_layers::stamp_flat_channels(doc, &mut img));
                 }
-                // Drain only once encoding succeeded: if it fails, the queued diagnostics stay
-                // with the renderer for the caller to report alongside the error.
-                let mut res = encode_image(&img, format, opts, warnings)?;
+                let attempt_warnings = warnings.clone();
+                let mut res = match encode_image(&img, format, opts, warnings) {
+                    Ok(res) => res,
+                    Err(error) => {
+                        diagnostics.extend(attempt_warnings);
+                        diagnostics.extend(r.drain_diagnostics());
+                        return Err(error);
+                    }
+                };
                 res.warnings.extend(r.drain_diagnostics());
                 return Ok(res);
             }
             Err(IoError::Render(render_err)) if render_err.is_retryable() => {
-                let fallback_warning = format!("GPU rendering unavailable ({render_err}); falling back to CPU");
+                let fallback_warning = format!("rendering backend unavailable ({render_err}); falling back to CPU");
                 // Keep the fallback reason in this export's warnings only. Move this attempt's
                 // queued diagnostics into its retry result too: leaving either on the renderer
-                // would leak them into a later successful GPU export. If the retry fails, `?`
-                // returns early and they stay with the renderer for the caller.
-                // A cancelled export stops before compositing the document again.
-                ctl.check().map_err(|_| IoError::Cancelled)?;
-                let mut cpu_result = export_flat_with_renderer(doc, format, opts, ctl, None)?;
-                cpu_result.warnings.extend(r.drain_diagnostics());
-                cpu_result.warnings.push(fallback_warning);
-                return Ok(cpu_result);
+                // would leak them into a later successful GPU export. A cancelled export keeps
+                // the reason with the caller instead of compositing the document again.
+                if ctl.check().is_err() {
+                    diagnostics.extend(std::mem::take(&mut warnings));
+                    diagnostics.extend(r.drain_diagnostics());
+                    diagnostics.push(fallback_warning);
+                    return Err(IoError::Cancelled);
+                }
+                match export_flat_with_renderer_diagnostics(doc, format, opts, ctl, None, diagnostics) {
+                    Ok(mut cpu_result) => {
+                        cpu_result.warnings.extend(r.drain_diagnostics());
+                        cpu_result.warnings.push(fallback_warning);
+                        Ok(cpu_result)
+                    }
+                    Err(cpu_error) => {
+                        diagnostics.extend(std::mem::take(&mut warnings));
+                        diagnostics.extend(r.drain_diagnostics());
+                        diagnostics.push(fallback_warning);
+                        Err(cpu_error)
+                    }
+                }
             }
-            Err(e) => return Err(e),
+            Err(error) => {
+                diagnostics.extend(std::mem::take(&mut warnings));
+                diagnostics.extend(r.drain_diagnostics());
+                Err(error)
+            }
+        }
+    } else {
+        let mut warnings = Vec::new();
+        let cmyk_target = format.caps().layouts.iter().any(|layout| layout.is_cmyk());
+        let lab_target = format.caps().layouts.iter().any(|layout| layout.is_lab());
+        let mut img = document_to_image_for_with_renderer(doc, &mut warnings, cmyk_target, lab_target, ctl, None)?;
+        ctl.check().map_err(|_| IoError::Cancelled)?;
+        ctl.progress(composite_share(format));
+        strip_xmp(&mut img.meta, opts);
+        let mut img = prepare_flat(img, format, &mut warnings)?;
+        if format == Format::Tga {
+            img = tga_image(doc, img, opts.tga_bits, &mut warnings)?;
+        }
+        if format == Format::Dds {
+            img = dds_image(doc, img, &mut warnings)?;
+        }
+        if format == Format::Tiff {
+            warnings.extend(crate::tiff_layers::stamp_flat_channels(doc, &mut img));
+        }
+        match encode_image(&img, format, opts, warnings.clone()) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                diagnostics.extend(warnings);
+                Err(error)
+            }
         }
     }
-
-    let mut warnings = Vec::new();
-    let cmyk_target = format.caps().layouts.iter().any(|layout| layout.is_cmyk());
-    let lab_target = format.caps().layouts.iter().any(|layout| layout.is_lab());
-    let mut img = document_to_image_for_with_renderer(doc, &mut warnings, cmyk_target, lab_target, ctl, None)?;
-    ctl.check().map_err(|_| IoError::Cancelled)?;
-    ctl.progress(composite_share(format));
-    strip_xmp(&mut img.meta, opts);
-    let mut img = prepare_flat(img, format, &mut warnings)?;
-    if format == Format::Tga {
-        img = tga_image(doc, img, opts.tga_bits, &mut warnings)?;
-    }
-    if format == Format::Dds {
-        img = dds_image(doc, img, &mut warnings)?;
-    }
-    if format == Format::Tiff {
-        warnings.extend(crate::tiff_layers::stamp_flat_channels(doc, &mut img));
-    }
-    encode_image(&img, format, opts, warnings)
 }
 
 /// Export As's Metadata: None drops the XMP packet, which lists the text of every type layer and
@@ -1269,7 +1366,33 @@ pub fn export_png_streamed_with_renderer(
     opts: &ExportOptions,
     ctl: &photocraft_raster::Interrupt,
     rows: i32,
+    mut renderer: Option<&mut dyn BandRenderer>,
+) -> Result<ExportResult, IoError> {
+    let mut diagnostics = Vec::new();
+    let reborrowed = renderer.as_mut().map(|r| &mut **r as &mut dyn BandRenderer);
+    match export_png_streamed_with_renderer_diagnostics(doc, opts, ctl, rows, reborrowed, &mut diagnostics) {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            // Keep the old API's contract for custom renderers that override `push_diagnostic`.
+            if let Some(renderer) = renderer.as_mut() {
+                for diagnostic in diagnostics {
+                    renderer.push_diagnostic(diagnostic);
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+/// [`export_png_streamed_with_renderer`] reporting the diagnostics of a failed attempt through
+/// `diagnostics` instead of the renderer's queue, which a custom renderer may leave unimplemented.
+pub fn export_png_streamed_with_renderer_diagnostics(
+    doc: &Document,
+    opts: &ExportOptions,
+    ctl: &photocraft_raster::Interrupt,
+    rows: i32,
     renderer: Option<&mut dyn BandRenderer>,
+    diagnostics: &mut Vec<String>,
 ) -> Result<ExportResult, IoError> {
     if let Some(r) = renderer {
         let opaque = match single_layer(doc) {
@@ -1281,7 +1404,7 @@ pub fn export_png_streamed_with_renderer(
         let attempt = match first_try {
             Ok(Some(res)) => Ok(Some(res)),
             Ok(None) => {
-                // Alpha was mispredicted: retry with alpha enabled, retaining the GPU provider!
+                // Alpha was mispredicted: retry with alpha enabled, retaining the renderer.
                 stream_png_with_renderer(doc, opts, ctl, true, rows, &mut progress, Some(&mut *r))
             }
             Err(e) => Err(e),
@@ -1289,34 +1412,45 @@ pub fn export_png_streamed_with_renderer(
         match attempt {
             Ok(Some(mut res)) => {
                 res.warnings.extend(r.drain_diagnostics());
-                return Ok(res);
+                Ok(res)
             }
-            Ok(None) => return Err(IoError::Unsupported("PNG export lost its alpha channel".into())),
+            Ok(None) => Err(IoError::Unsupported("PNG export lost its alpha channel".into())),
             Err(IoError::Render(render_err)) if render_err.is_retryable() => {
-                let fallback_warning = format!("GPU rendering unavailable ({render_err}); falling back to CPU");
-                // Keep the fallback reason in this export's warnings only. Move this attempt's
-                // queued diagnostics into its retry result too: leaving either on the renderer
-                // would leak them into a later successful GPU export. If the retry fails, `?`
-                // returns early and they stay with the renderer for the caller.
-                // A cancelled export stops before streaming the PNG again.
-                ctl.check().map_err(|_| IoError::Cancelled)?;
-                let mut cpu_result = export_png_streamed_with_renderer(doc, opts, ctl, rows, None)?;
-                cpu_result.warnings.extend(r.drain_diagnostics());
-                cpu_result.warnings.push(fallback_warning);
-                return Ok(cpu_result);
+                let fallback_warning = format!("rendering backend unavailable ({render_err}); falling back to CPU");
+                if ctl.check().is_err() {
+                    diagnostics.extend(r.drain_diagnostics());
+                    diagnostics.push(fallback_warning);
+                    return Err(IoError::Cancelled);
+                }
+                match export_png_streamed_with_renderer_diagnostics(doc, opts, ctl, rows, None, diagnostics) {
+                    Ok(mut cpu_result) => {
+                        cpu_result.warnings.extend(r.drain_diagnostics());
+                        cpu_result.warnings.push(fallback_warning);
+                        Ok(cpu_result)
+                    }
+                    Err(cpu_error) => {
+                        diagnostics.extend(r.drain_diagnostics());
+                        diagnostics.push(fallback_warning);
+                        Err(cpu_error)
+                    }
+                }
             }
-            Err(e) => return Err(e),
+            Err(error) => {
+                diagnostics.extend(r.drain_diagnostics());
+                Err(error)
+            }
         }
-    }
-    let opaque = match single_layer(doc) {
-        Some(s) => opaque_surface(s, doc.bounds()),
-        None => opaque_bottom(doc),
-    };
-    let mut progress = 0.0;
-    match stream_png_with_renderer(doc, opts, ctl, !opaque, rows, &mut progress, None)? {
-        Some(r) => Ok(r),
-        None => stream_png_with_renderer(doc, opts, ctl, true, rows, &mut progress, None)?
-            .ok_or_else(|| IoError::Unsupported("PNG export lost its alpha channel".into())),
+    } else {
+        let opaque = match single_layer(doc) {
+            Some(s) => opaque_surface(s, doc.bounds()),
+            None => opaque_bottom(doc),
+        };
+        let mut progress = 0.0;
+        match stream_png_with_renderer(doc, opts, ctl, !opaque, rows, &mut progress, None)? {
+            Some(r) => Ok(r),
+            None => stream_png_with_renderer(doc, opts, ctl, true, rows, &mut progress, None)?
+                .ok_or_else(|| IoError::Unsupported("PNG export lost its alpha channel".into())),
+        }
     }
 }
 
@@ -1388,7 +1522,7 @@ fn stream_png_with_renderer(
     let mut bytes = Vec::new();
     let mut png = codecs::PngRows::new(&mut bytes, &first, h, &encode)?;
     let (mut done, mut translucent) = (0u64, false);
-    let streamed = src.bands(alpha, ctl, renderer, |rows, data, see_through| {
+    let streamed = src.bands(alpha, ctl, renderer, &mut warnings, |rows, data, see_through| {
         if see_through && !alpha {
             translucent = true;
             return Err(IoError::Cancelled);

@@ -394,6 +394,7 @@ mod tests {
         assert!(!h.device_lost());
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn wait_slices_cancel_timeout_and_completion() {
         let never = || false;
@@ -421,6 +422,7 @@ mod tests {
         assert!(!called, "cancellation must be checked before polling");
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn wait_slices_observes_cancel_while_pending() {
         let flag = AtomicBool::new(false);

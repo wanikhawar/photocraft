@@ -94,8 +94,9 @@ use photocraft_psd::{PsdError, PsdFile};
 pub use adjust_map::ADJUSTMENT_KEYS;
 pub use flat::{
     DEFAULT_LOSSY_WEBP_QUALITY, apply_file_encoding, document_to_image, document_to_image_with_renderer, export_flat, export_flat_with_renderer,
-    export_png_streamed_with_renderer, export_preview_png_with_renderer, file_encoding, import_gif_frames, import_tiff_page, import_tiff_page_with_options,
-    import_webp_frames, tga_alpha_channel_to_transparency, tga_default_bits,
+    export_flat_with_renderer_diagnostics, export_png_streamed_with_renderer, export_png_streamed_with_renderer_diagnostics, export_preview_png_with_renderer,
+    export_preview_png_with_renderer_diagnostics, file_encoding, import_gif_frames, import_tiff_page, import_tiff_page_with_options, import_webp_frames,
+    tga_alpha_channel_to_transparency, tga_default_bits,
 };
 pub use psd_export::{PsdExportOptions, document_to_psd, document_to_psd_with};
 pub use psd_import::{psd_to_document, psd_to_document_with};
@@ -925,9 +926,35 @@ pub fn export_with_renderer(
     name_or_ext: &str,
     opts: &ExportOptions,
     ctl: &photocraft_raster::Interrupt,
-    renderer: Option<&mut dyn BandRenderer>,
+    mut renderer: Option<&mut dyn BandRenderer>,
 ) -> Result<ExportResult, IoError> {
-    let r = checked_stages(doc, name_or_ext, opts, ctl, renderer)?;
+    let mut diagnostics = Vec::new();
+    let reborrowed = renderer.as_mut().map(|r| &mut **r as &mut dyn BandRenderer);
+    match export_with_renderer_diagnostics(doc, name_or_ext, opts, ctl, reborrowed, &mut diagnostics) {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            // Keep the old API's contract for custom renderers that override `push_diagnostic`.
+            if let Some(renderer) = renderer.as_mut() {
+                for diagnostic in diagnostics {
+                    renderer.push_diagnostic(diagnostic);
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+/// [`export_with_renderer`] reporting the diagnostics of a failed attempt through `diagnostics`
+/// instead of the renderer's queue, which a custom renderer may leave unimplemented.
+pub fn export_with_renderer_diagnostics(
+    doc: &Document,
+    name_or_ext: &str,
+    opts: &ExportOptions,
+    ctl: &photocraft_raster::Interrupt,
+    renderer: Option<&mut dyn BandRenderer>,
+    diagnostics: &mut Vec<String>,
+) -> Result<ExportResult, IoError> {
+    let r = checked_stages(doc, name_or_ext, opts, ctl, renderer, diagnostics)?;
     let bytes = r.encoded.into_bytes()?;
     ctl.check().map_err(|_| IoError::Cancelled)?;
     ctl.progress(1.0);
@@ -940,7 +967,7 @@ pub fn export_with_renderer(
 /// [`export_with`] checks it) before this returns: the model holds the encoded channels, never a
 /// reference to the document's tiles. Reports progress up to `1.0` once the result is ready.
 pub fn encode_with(doc: &Document, name_or_ext: &str, opts: &ExportOptions, ctl: &photocraft_raster::Interrupt) -> Result<EncodedExport, IoError> {
-    let r = checked_stages(doc, name_or_ext, opts, ctl, None)?;
+    let r = checked_stages(doc, name_or_ext, opts, ctl, None, &mut Vec::new())?;
     ctl.check().map_err(|_| IoError::Cancelled)?;
     ctl.progress(1.0);
     Ok(r)
@@ -954,14 +981,23 @@ fn checked_stages(
     opts: &ExportOptions,
     ctl: &photocraft_raster::Interrupt,
     renderer: Option<&mut dyn BandRenderer>,
+    diagnostics: &mut Vec<String>,
 ) -> Result<EncodedExport, IoError> {
     ctl.check().map_err(|_| IoError::Cancelled)?;
     photocraft_compose::discard_unreadable_pixel_caches();
     doc.scratch_health().map_err(IoError::Unsupported)?;
     let scratch_generation = photocraft_raster::spill::read_error_generation();
-    let r = export_stages_with_renderer(doc, name_or_ext, opts, ctl, renderer)?;
-    photocraft_raster::spill::check_since(scratch_generation).map_err(IoError::Unsupported)?;
-    doc.scratch_health().map_err(IoError::Unsupported)?;
+    let mut r = export_stages_with_renderer(doc, name_or_ext, opts, ctl, renderer, diagnostics)?;
+    // The export succeeded provisionally, so it drained the renderer's diagnostics into its
+    // warnings. A scratch failure must keep them with the caller alongside the error.
+    if let Err(error) = photocraft_raster::spill::check_since(scratch_generation).map_err(IoError::Unsupported) {
+        diagnostics.extend(std::mem::take(&mut r.warnings));
+        return Err(error);
+    }
+    if let Err(error) = doc.scratch_health().map_err(IoError::Unsupported) {
+        diagnostics.extend(std::mem::take(&mut r.warnings));
+        return Err(error);
+    }
     ctl.check().map_err(|_| IoError::Cancelled)?;
     Ok(r)
 }
@@ -991,6 +1027,7 @@ fn export_stages_with_renderer(
     opts: &ExportOptions,
     ctl: &photocraft_raster::Interrupt,
     renderer: Option<&mut dyn BandRenderer>,
+    diagnostics: &mut Vec<String>,
 ) -> Result<EncodedExport, IoError> {
     let ext = extension(name_or_ext);
     if ext == "pdn" {
@@ -1010,7 +1047,7 @@ fn export_stages_with_renderer(
     if ext == "ora" {
         let mut res = ora::export(doc)?;
         if let Some(r) = renderer {
-            res.warnings.push("OpenRaster export uses CPU compositor; GPU rendering applies to flat formats".into());
+            res.warnings.push("OpenRaster export uses the CPU compositor; custom rendering applies to flat formats".into());
             res.warnings.extend(r.drain_diagnostics());
         }
         return Ok(res.into());
@@ -1018,7 +1055,7 @@ fn export_stages_with_renderer(
     if ext == "pdf" {
         let mut res = pdf::export(doc)?;
         if let Some(r) = renderer {
-            res.warnings.push("PDF export uses CPU compositor; GPU rendering applies to flat formats".into());
+            res.warnings.push("PDF export uses the CPU compositor; custom rendering applies to flat formats".into());
             res.warnings.extend(r.drain_diagnostics());
         }
         return Ok(res.into());
@@ -1076,7 +1113,7 @@ fn export_stages_with_renderer(
         // Never write a header the reader would refuse (e.g. a zero-sized canvas).
         file.header.validate()?;
         if let Some(r) = renderer {
-            warnings.push("PSD/PSB layered export uses CPU compositor; GPU rendering applies to flat formats".into());
+            warnings.push("PSD/PSB layered export uses the CPU compositor; custom rendering applies to flat formats".into());
             warnings.extend(r.drain_diagnostics());
         }
         return Ok(EncodedExport { encoded: Encoded::Psd(Box::new(file)), warnings });
@@ -1085,12 +1122,12 @@ fn export_stages_with_renderer(
     if format == photocraft_codecs::Format::Tiff && opts.tiff_layers && tiff_layers::would_write_layers(doc) {
         let mut res = tiff_layers::export_layered(doc, opts, ctl)?;
         if let Some(r) = renderer {
-            res.warnings.push("TIFF layered export uses CPU compositor; GPU rendering applies to flat formats".into());
+            res.warnings.push("TIFF layered export uses the CPU compositor; custom rendering applies to flat formats".into());
             res.warnings.extend(r.drain_diagnostics());
         }
         return Ok(res.into());
     }
-    flat::export_flat_with_renderer(doc, format, opts, ctl, renderer).map(EncodedExport::from)
+    flat::export_flat_with_renderer_diagnostics(doc, format, opts, ctl, renderer, diagnostics).map(EncodedExport::from)
 }
 
 /// The flattened document at its canvas size, in 8-bit RGBA like a `.pcraft` file's two previews,

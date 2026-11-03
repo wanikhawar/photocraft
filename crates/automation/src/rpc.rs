@@ -215,14 +215,17 @@ impl Headless {
                     }
                 };
                 let png = self.render_png(index_of(&p)?, max)?;
+                // Report a fallback (or CPU bypass) with this render, not with a later save.
+                let warnings = self.drain_diagnostics();
                 match str_of(&p, "path") {
                     Some(path) => {
                         self.write_render(&PathBuf::from(path), &png)?;
-                        Ok(json!({"path": path, "bytes": png.len()}))
+                        Ok(json!({"path": path, "bytes": png.len(), "warnings": warnings}))
                     }
                     None => Ok(json!({
                         "mime": "image/png",
                         "base64": base64::engine::general_purpose::STANDARD.encode(&png),
+                        "warnings": warnings,
                     })),
                 }
             }
@@ -308,6 +311,14 @@ pub fn respond(h: &Mutex<Headless>, line: &str) -> Value {
     // poisoned lock is safe to keep using, the same as the MCP server does.
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.lock().unwrap_or_else(PoisonError::into_inner).handle(method, params)))
         .unwrap_or_else(|_| Err(AutomationError::Other(format!("internal error: `{method}` panicked"))));
+    // A custom renderer can panic from `drain_diagnostics`: contain it so the server still
+    // writes this reply instead of unwinding out of `serve_lines`.
+    let diagnostics =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.lock().unwrap_or_else(PoisonError::into_inner).drain_diagnostics())).unwrap_or_default();
+    for diagnostic in diagnostics {
+        // A broken stderr pipe must not panic the server before it writes the reply.
+        let _ = writeln!(std::io::stderr(), "warning: {diagnostic}");
+    }
     match r {
         Ok(v) => json!({"id": id, "ok": true, "result": v}),
         Err(e) => {
