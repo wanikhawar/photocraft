@@ -23,10 +23,10 @@ jobs:
 
         '
       timeout-minutes: 120
-      command: "set -euo pipefail\ncargo build --locked -p photocraft\ncargo test\
+      command: "set -euo pipefail\nexport PHOTOCRAFT_PSD_MEMORY_EVIDENCE="$PWD/target/psd-memory-evidence"\ncargo build --locked -p photocraft\ncargo test\
         \ --locked -p photocraft-ui-egui --lib psd_memory_evidence -- --ignored --nocapture\
         \ --test-threads=1\nls -l \"$PHOTOCRAFT_PSD_MEMORY_EVIDENCE\"\npython3 - <<'PYPNG'\n\
-        import base64, pathlib\nfor p in sorted(pathlib.Path('target/psd-memory-evidence').glob('*.png')):\n\
+        import base64, pathlib, os\nfor p in sorted(pathlib.Path(os.environ['PHOTOCRAFT_PSD_MEMORY_EVIDENCE']).glob('*.png')):\n\
         \    print('PNG_BEGIN ' + p.name)\n    data = base64.b64encode(p.read_bytes()).decode()\n\
         \    for start in range(0, len(data), 1000):\n        print('PNG_DATA ' +\
         \ data[start:start+1000])\n    print('PNG_END ' + p.name)\nPYPNG\n"
