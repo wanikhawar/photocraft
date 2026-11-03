@@ -13,6 +13,7 @@ pub mod scratch;
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::ops::Bound;
 use std::sync::Arc;
 
 use photocraft_color::{ColorMode, PixelFormat, SampleType, read_sample, read_samples, write_sample};
@@ -166,6 +167,20 @@ fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
 fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
     let (k, (x, y)) = a.chunks(DIFF_BLOCK).zip(b.chunks(DIFF_BLOCK)).enumerate().rfind(|(_, (x, y))| x != y)?;
     x.iter().zip(y).rposition(|(p, q)| p != q).map(|i| k * DIFF_BLOCK + i)
+}
+
+/// Where [`Surface::prune_batch`] resumes: after the last tile it visited.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PruneCursor {
+    after: Option<TileCoord>,
+    done: bool,
+}
+
+impl PruneCursor {
+    /// True once every tile has been visited.
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -559,6 +574,41 @@ impl Surface {
         let dp = self.default_pixel.as_ref();
         let bpp = dp.len();
         self.tiles.retain(|_, t| t.data.chunks_exact(bpp).any(|px| px != dp));
+    }
+
+    /// A [`PruneCursor`] for [`Surface::prune_batch`], which drops the same tiles as [`Surface::prune`]
+    /// a batch at a time (for a caller that must not block: the web build has no threads).
+    pub fn prune_cursor(&self) -> PruneCursor {
+        PruneCursor::default()
+    }
+
+    /// Drops the tiles that are entirely the default pixel, visiting at most `max` tiles in
+    /// coordinate order and resuming after them on the next call; returns true when every tile
+    /// has been visited (and so [`Surface::prune`] has nothing left to drop). A `max` of zero
+    /// visits one tile. Tiles added after the scan started are not visited.
+    pub fn prune_batch(&mut self, cursor: &mut PruneCursor, max: usize) -> bool {
+        if cursor.done {
+            return true;
+        }
+        let dp = self.default_pixel.as_ref();
+        let bpp = dp.len();
+        let max = max.max(1);
+        let keys: Vec<TileCoord> = match cursor.after {
+            None => self.tiles.keys().take(max).copied().collect(),
+            Some(after) => self.tiles.range((Bound::Excluded(after), Bound::Unbounded)).take(max).map(|(c, _)| *c).collect(),
+        };
+        for c in &keys {
+            if self.tiles.get(c).is_some_and(|t| !t.data.chunks_exact(bpp).any(|px| px != dp)) {
+                self.tiles.remove(c);
+            }
+        }
+        let Some(last) = keys.last().copied() else {
+            cursor.done = true;
+            return true;
+        };
+        cursor.after = Some(last);
+        cursor.done = keys.len() < max || self.tiles.range((Bound::Excluded(last), Bound::Unbounded)).next().is_none();
+        cursor.done
     }
 
     #[inline]

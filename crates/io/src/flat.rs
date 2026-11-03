@@ -6,7 +6,7 @@ use photocraft_codecs::{self as codecs, ChannelLayout, Format, Image, SampleType
 use photocraft_color::{BlendMode, ColorMode, PixelFormat, SampleType};
 use photocraft_doc::{AlphaChannel, Document, Layer, LayerContent};
 use photocraft_geom::{Rect, Size, TILE_SIZE};
-use photocraft_raster::Surface;
+use photocraft_raster::{PruneCursor, Surface};
 
 use crate::{ExportOptions, ExportResult, ImportResult, IoError, TgaBits, XmpEmbed};
 
@@ -33,6 +33,140 @@ pub(crate) fn import_flat_with_limit(name: &str, bytes: &[u8], pixel_limit: u64)
 /// The document of a flat image `img` that was decoded from `bytes` (not a TIFF), which are of
 /// `format`.
 pub(crate) fn flat_document(name: &str, bytes: &[u8], format: Option<Format>, img: Image) -> Result<ImportResult, IoError> {
+    FlatBuilder::new(name, img).finish(bytes, format)
+}
+
+/// An image becoming a document's surface a bounded band of rows and a bounded batch of empty
+/// tiles at a time, so a caller that must not block (the web build has no threads) can step it.
+/// [`FlatBuilder::finish`] runs whatever is left, so it also gives the one-shot result.
+pub(crate) struct FlatBuilder {
+    name: String,
+    img: Image,
+    f: DocumentFormat,
+    surface: Surface,
+    warnings: Vec<String>,
+    /// Rows copied into `surface` so far.
+    rows: u32,
+    /// Rows per [`FlatBuilder::copy_step`].
+    band: u32,
+    prune: Option<PruneCursor>,
+}
+
+/// Bytes a copy step converts at most; a step is a band of whole rows, so it is never split.
+const COPY_BAND_BYTES: usize = 4 << 20;
+/// Rows a copy step writes at most (a narrow image would otherwise copy the whole one in one step).
+const COPY_BAND_ROWS: u32 = 256;
+/// Tiles a prune step visits at most.
+const PRUNE_BATCH: usize = 256;
+
+impl FlatBuilder {
+    /// Sets up the surface `img` becomes, without copying a pixel yet.
+    pub(crate) fn new(name: &str, img: Image) -> Self {
+        let (warnings, f) = flat_plan(&img);
+        let surface = Surface::new(PixelFormat::new(f.mode, f.depth, true));
+        let (_, h) = img.dimensions();
+        let row = (img.data().len() / h.max(1) as usize).max(1);
+        let band = (COPY_BAND_BYTES / row).clamp(1, COPY_BAND_ROWS as usize) as u32;
+        Self { name: name.to_string(), img, f, surface, warnings, rows: 0, band: band.min(h.max(1)), prune: None }
+    }
+
+    /// True once every row is in the surface.
+    pub(crate) fn copy_done(&self) -> bool {
+        self.rows >= self.img.dimensions().1
+    }
+
+    /// Copies one bounded band of rows, the same bytes `image_surface` writes.
+    pub(crate) fn copy_step(&mut self) -> Result<(), IoError> {
+        if self.copy_done() {
+            return Ok(());
+        }
+        let y1 = self.rows.saturating_add(self.band).min(self.img.dimensions().1);
+        copy_rows(&self.img, self.f.layout, self.f.sample, &mut self.surface, self.rows, y1)?;
+        self.rows = y1;
+        Ok(())
+    }
+
+    /// True once every tile has been through the prune scan.
+    pub(crate) fn prune_done(&self) -> bool {
+        self.prune.as_ref().is_some_and(|c| c.is_done())
+    }
+
+    /// Drops one bounded batch of tiles that are entirely the default pixel; true when done.
+    pub(crate) fn prune_step(&mut self) -> bool {
+        if self.prune.is_none() {
+            self.prune = Some(self.surface.prune_cursor());
+        }
+        let Some(cursor) = self.prune.as_mut() else { return true };
+        self.surface.prune_batch(cursor, PRUNE_BATCH)
+    }
+
+    /// The document, after copying and pruning whatever is left: the one-shot result and the last
+    /// step of a stepped one.
+    pub(crate) fn finish(mut self, bytes: &[u8], format: Option<Format>) -> Result<ImportResult, IoError> {
+        let copied = self.copy_done();
+        while !self.copy_done() {
+            self.copy_step()?;
+        }
+        if !copied {
+            // Any scan before the last rows missed the tiles they added: scan them all again.
+            self.prune = None;
+        }
+        while !self.prune_step() {}
+        let Self { name, img, f, surface, warnings, .. } = self;
+        let mut r = finish_document(&name, &img, f, surface, warnings);
+        apply_flat_format(&mut r, bytes, format, &img)?;
+        Ok(r)
+    }
+}
+
+/// The image as a single-layer document's surface, every row copied.
+fn finish_document(name: &str, img: &Image, f: DocumentFormat, surface: Surface, warnings: Vec<String>) -> ImportResult {
+    let mut r = single_layer_document(name, img.dimensions(), f, img.layout().has_alpha(), surface, img.icc.clone(), img.meta.clone(), warnings);
+    r.warnings.extend(crate::tiff_layers::channels_from_extras(&mut r.document, img));
+    r
+}
+
+/// The warnings the decoder left and the conversion will add, and the document format the image
+/// becomes.
+fn flat_plan(img: &Image) -> (Vec<String>, DocumentFormat) {
+    // What the decoder noticed (frames or pages left out, data ending early) comes first.
+    let mut warnings: Vec<String> = img.warnings.iter().map(ToString::to_string).collect();
+    let f = document_format(img.layout(), img.sample_type());
+    warnings.extend(f.warning.clone());
+    (warnings, f)
+}
+
+/// Copies rows `y0..y1` of `img` into `s` (of the target layout and sample type), converting a
+/// band at a time so no second full-size copy of the image is made.
+fn copy_rows(img: &Image, target_layout: ChannelLayout, csample: CSample, s: &mut Surface, y0: u32, y1: u32) -> Result<(), IoError> {
+    let (w, h) = img.dimensions();
+    if y1 <= y0 || y1 > h {
+        return Ok(());
+    }
+    let row = (img.data().len() / h.max(1) as usize).max(1);
+    let at = (y0 as usize).saturating_mul(row);
+    let end = (y1 as usize).saturating_mul(row);
+    let rows = img.data().get(at..end).ok_or_else(|| IoError::Unsupported("the decoded image is shorter than its size".into()))?;
+    let r = Rect::new(0, y0 as i32, w as i32, y1 as i32);
+    if img.layout() == target_layout && img.sample_type() == csample {
+        s.write_interleaved(r, rows);
+    } else {
+        // Band buffers cycle through the scratch pool: at this size each fresh one is an
+        // mmap that gets page-faulted in.
+        let mut src = photocraft_raster::scratch::take_cap::<u8>(rows.len());
+        src.extend_from_slice(rows);
+        let src = Image::from_raw(w, y1 - y0, img.layout(), img.sample_type(), src)?;
+        let part = src.convert(target_layout, csample);
+        s.write_interleaved(r, part.data());
+        photocraft_raster::scratch::give(src.into_data());
+        photocraft_raster::scratch::give(part.into_data());
+    }
+    Ok(())
+}
+
+/// What every flat format does to the document of its pixels: the palette mode, the save
+/// settings, a Targa's alpha channel and the profile an untagged image needs.
+fn apply_flat_format(r: &mut ImportResult, bytes: &[u8], format: Option<Format>, img: &Image) -> Result<(), IoError> {
     // A palette BMP, PNG or GIF opens in Indexed Color mode with its colour table, as in
     // Photoshop (#3802, #4804, #7886). A GIF is always palette-based: the first frame's table.
     let palette = match format {
@@ -41,7 +175,6 @@ pub(crate) fn flat_document(name: &str, bytes: &[u8], format: Option<Format>, im
         Some(Format::Gif) => codecs::gif_palette(bytes),
         _ => None,
     };
-    let mut r = image_to_document(name, &img)?;
     if let Some((colors, transparent)) = palette.filter(|(c, _)| !c.is_empty())
         && r.document.mode == ColorMode::Rgb
     {
@@ -64,15 +197,15 @@ pub(crate) fn flat_document(name: &str, bytes: &[u8], format: Option<Format>, im
         };
     }
     if d.icc_profile.is_none() && d.mode == ColorMode::Rgb {
-        d.icc_profile = cicp_profile(&img);
+        d.icc_profile = cicp_profile(img);
         if d.icc_profile.is_none()
-            && let Some((profile, warning)) = hdr_fallback(&img)
+            && let Some((profile, warning)) = hdr_fallback(img)
         {
             d.icc_profile = Some(profile);
             r.warnings.push(warning);
         }
     }
-    Ok(r)
+    Ok(())
 }
 
 /// A PQ or HLG image, which the decoder turned into linear light, on primaries
@@ -382,15 +515,10 @@ fn document_format(layout: ChannelLayout, sample: CSample) -> DocumentFormat {
 /// A decoded flat image as a single-layer document: a locked "Background" when it is opaque, a
 /// normal "Layer 0" when it has transparency.
 pub(crate) fn image_to_document(name: &str, img: &Image) -> Result<ImportResult, IoError> {
-    // What the decoder noticed (frames or pages left out, data ending early) comes first.
-    let mut warnings: Vec<String> = img.warnings.iter().map(ToString::to_string).collect();
-    let f = document_format(img.layout(), img.sample_type());
-    warnings.extend(f.warning.clone());
+    let (warnings, f) = flat_plan(img);
     let mut s = image_surface(img, f.layout, f.sample)?;
     s.prune();
-    let mut r = single_layer_document(name, img.dimensions(), f, img.layout().has_alpha(), s, img.icc.clone(), img.meta.clone(), warnings);
-    r.warnings.extend(crate::tiff_layers::channels_from_extras(&mut r.document, img));
-    Ok(r)
+    Ok(finish_document(name, img, f, s, warnings))
 }
 
 /// The document of one layer holding `s`, with the image's profile and metadata.
@@ -1662,5 +1790,39 @@ mod streamed_png_tests {
         assert!(streams_png(&doc(10_000, 8000, SampleType::U8)));
         assert!(streams_png(&doc(8000, 6000, SampleType::U16)));
         assert!(streams_png(&doc(117_504, 22_464, SampleType::U8)));
+    }
+}
+
+#[cfg(test)]
+mod build_tests {
+    use super::*;
+
+    /// The stepped builder gives exactly what [`image_to_document`] gives, for every layout, over
+    /// a surface of several tiles.
+    #[test]
+    fn a_stepped_build_equals_image_to_document() {
+        for (layout, sample) in
+            [(ChannelLayout::Gray, CSample::U8), (ChannelLayout::GrayA, CSample::U16), (ChannelLayout::Rgb, CSample::U8), (ChannelLayout::Rgba, CSample::U16)]
+        {
+            let len = 300 * 260 * layout.channels() * sample.bytes();
+            let data: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
+            let mut img = Image::from_raw(300, 260, layout, sample, data).unwrap();
+            img.meta.dpi = Some((300.0, 300.0));
+            img.meta.text.push(("Comment".into(), "kept".into()));
+            let expected = image_to_document("a.png", &img).unwrap();
+            let mut build = FlatBuilder::new("a.png", img);
+            while !build.copy_done() {
+                build.copy_step().unwrap();
+            }
+            while !build.prune_step() {}
+            let got = build.finish(&[], None).unwrap();
+            let (mut a, mut b) = (expected.document, got.document);
+            b.id = a.id;
+            for (x, y) in a.layers.iter_mut().zip(&mut b.layers) {
+                y.id = x.id;
+            }
+            assert!(a == b, "{layout:?} {sample:?}: the stepped build differs");
+            assert_eq!(expected.warnings, got.warnings, "{layout:?} {sample:?}");
+        }
     }
 }

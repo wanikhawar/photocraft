@@ -3,13 +3,15 @@
 
 use std::sync::Arc;
 
-use photocraft_codecs::{self as codecs, DecodeOptions, Format, Image, Limits, PngDecodeRows, SharedBytes};
+use photocraft_codecs::{self as codecs, DecodeOptions, Format, Limits, PngDecodeRows, SharedBytes};
 
+use crate::flat::FlatBuilder;
 use crate::{ImportResult, IoError, Route};
 
 enum Stage {
     Rows(Box<PngDecodeRows<SharedBytes>>),
-    Decoded(Box<Image>),
+    /// The decoded image becoming the document, a band of rows and a batch of tiles at a time.
+    Build(Box<FlatBuilder>),
     Spent,
 }
 
@@ -32,30 +34,49 @@ impl PngImport {
         Ok(Some(Self { name: name.to_string(), bytes: Arc::clone(bytes), stage: Stage::Rows(Box::new(rows)) }))
     }
 
-    /// How much of the decoding is done, `0.0..=1.0`.
+    /// How much of the import is done, `0.0..=1.0`.
     pub fn progress(&self) -> f32 {
         match &self.stage {
             Stage::Rows(rows) => rows.progress(),
-            Stage::Decoded(_) | Stage::Spent => 1.0,
+            Stage::Build(_) | Stage::Spent => 1.0,
         }
     }
 
-    /// Decodes rows while `more()` returns true (at least one per call); then, in a step of its
-    /// own, turns the image into a document. `Some` once that is done, after which the import is
-    /// spent.
+    /// Works while `more()` returns true (at least one bounded piece per call): rows, then the
+    /// image's rows into the document's tiles, then the prune scan. `Some` once the document is
+    /// built, after which the import is spent.
     pub fn step(&mut self, more: &mut dyn FnMut() -> bool) -> Result<Option<ImportResult>, IoError> {
         match std::mem::replace(&mut self.stage, Stage::Spent) {
             Stage::Rows(mut rows) => {
                 self.stage = match rows.step(more)? {
-                    Some(img) => Stage::Decoded(Box::new(img)),
+                    Some(img) => {
+                        // The resolution, upright orientation and final limit checks `decode` does.
+                        let img = codecs::finish_png_decode(img, &DecodeOptions::default())?;
+                        Stage::Build(Box::new(FlatBuilder::new(&self.name, img)))
+                    }
                     None => Stage::Rows(rows),
                 };
                 Ok(None)
             }
-            Stage::Decoded(img) => {
-                let img = codecs::finish_png_decode(*img, &DecodeOptions::default())?;
-                crate::flat::flat_document(&self.name, &self.bytes, Some(Format::Png), img).map(Some)
-            }
+            Stage::Build(mut build) => loop {
+                if !build.copy_done() {
+                    build.copy_step()?;
+                    if !more() {
+                        self.stage = Stage::Build(build);
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                if !build.prune_done() {
+                    build.prune_step();
+                    if !more() {
+                        self.stage = Stage::Build(build);
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                return build.finish(self.bytes.as_slice(), Some(Format::Png)).map(Some);
+            },
             Stage::Spent => Err(IoError::Unsupported("the PNG was already imported".into())),
         }
     }

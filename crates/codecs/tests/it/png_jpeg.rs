@@ -286,6 +286,79 @@ fn png_rows_share_their_bytes_without_copying_them() {
     assert_eq!(std::sync::Arc::strong_count(&bytes), 1, "the decoder let go of the bytes");
 }
 
+/// A CRC-valid PNG chunk.
+fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut crc = flate2::Crc::new();
+    crc.update(kind);
+    crc.update(data);
+    let mut out = u32::try_from(data.len()).unwrap().to_be_bytes().to_vec();
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    out.extend_from_slice(&crc.sum().to_be_bytes());
+    out
+}
+
+fn zlib(text: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(text).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// A `zTXt` chunk (`deflated`) or a compressed `iTXt` one (`!deflated`) with `text` as its value.
+fn png_text_chunk(kind: &[u8; 4], keyword: &[u8], text: &[u8]) -> Vec<u8> {
+    let mut data = keyword.to_vec();
+    data.push(0);
+    if kind == b"zTXt" {
+        data.push(0);
+    } else {
+        data.extend_from_slice(&[1, 0, 0, 0]);
+    }
+    data.extend_from_slice(&zlib(text));
+    png_chunk(kind, &data)
+}
+
+/// `png` with `chunks` between the image data and `IEND` (the text-after-IDAT case).
+fn with_chunks_before_iend(png: &[u8], chunks: &[Vec<u8>]) -> Vec<u8> {
+    let mut at = 8;
+    loop {
+        let len = u32::from_be_bytes(png[at..at + 4].try_into().unwrap()) as usize;
+        if &png[at + 4..at + 8] == b"IEND" {
+            let mut out = png[..at].to_vec();
+            for c in chunks {
+                out.extend_from_slice(c);
+            }
+            out.extend_from_slice(&png[at..]);
+            return out;
+        }
+        at += len + 12;
+    }
+}
+
+#[test]
+fn png_rows_read_compressed_text_in_bounded_batches() {
+    let img = synth(19, 23, ChannelLayout::Rgba, SampleType::U8, 9, 0.4);
+    let base = encode(&img, Format::Png, &EncodeOptions::default()).unwrap();
+    let text = "A".repeat(150_000);
+    for kind in [b"zTXt", b"iTXt"] {
+        let bytes = with_chunks_before_iend(&base, &[png_text_chunk(kind, b"Comment", text.as_bytes())]);
+        let mut rows = PngDecodeRows::new(bytes.as_slice(), &Limits::default()).unwrap();
+        let mut calls = 0;
+        // An empty budget: every step reads one bounded batch and stops.
+        let stepped = loop {
+            calls += 1;
+            if let Some(img) = rows.step(&mut || false).unwrap() {
+                break img;
+            }
+            assert!(calls < 100_000, "the decoder never finished");
+        };
+        assert_eq!(stepped, decode(&bytes).unwrap(), "{kind:?}");
+        assert_eq!(stepped.meta.text, vec![("Comment".into(), text.clone())], "{kind:?}: the whole value is kept");
+        assert!(calls > 20, "{kind:?}: {calls} bounded calls, not one blocking pass");
+        assert_steps_equal_decode(&bytes, &format!("compressed {kind:?} text"));
+    }
+}
+
 #[test]
 fn png_rows_fail_like_decode_on_damaged_files() {
     let img = synth(64, 64, ChannelLayout::Rgb, SampleType::U8, 11, 1.0);

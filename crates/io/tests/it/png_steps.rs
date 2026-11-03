@@ -84,12 +84,12 @@ fn stepped_png_import_keeps_a_palette_as_indexed_colour() {
 }
 
 #[test]
-fn stepped_png_import_takes_a_step_per_row_and_one_to_build_the_document() {
+fn stepped_png_import_takes_a_step_per_row_and_bounded_steps_to_build_the_document() {
     let bytes = encode(&noise(8, 20, ChannelLayout::Rgba, SampleType::U8), Format::Png, &EncodeOptions::default()).unwrap();
     let (_, calls) = stepped("a.png", &bytes, 1);
     // 19 calls that each decode a row, one that decodes the last and finishes the file, one that
-    // builds the document.
-    assert_eq!(calls, 21);
+    // copies its rows into the surface, one that prunes it, and one that builds the document.
+    assert_eq!(calls, 23);
     let arc = Arc::new(bytes);
     let mut import = PngImport::new("a.png", &arc).unwrap().unwrap();
     assert_eq!(import.progress(), 0.0);
@@ -97,6 +97,82 @@ fn stepped_png_import_takes_a_step_per_row_and_one_to_build_the_document() {
         assert!(import.progress() <= 1.0);
     }
     assert!(import.step(&mut || true).is_err(), "a finished import is spent");
+}
+
+/// Imports `bytes` with an empty budget (one bounded piece per call); returns the result and the
+/// number of calls.
+fn stepped_zero_budget(name: &str, bytes: &[u8]) -> (ImportResult, usize) {
+    let bytes = Arc::new(bytes.to_vec());
+    let mut import = PngImport::new(name, &bytes).unwrap().expect("a plain PNG");
+    let mut calls = 0;
+    loop {
+        calls += 1;
+        if let Some(r) = import.step(&mut || false).unwrap() {
+            return (r, calls);
+        }
+        assert!(calls < 100_000, "the import never finished");
+    }
+}
+
+/// A CRC-valid PNG chunk.
+fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut crc = flate2::Crc::new();
+    crc.update(kind);
+    crc.update(data);
+    let mut out = u32::try_from(data.len()).unwrap().to_be_bytes().to_vec();
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    out.extend_from_slice(&crc.sum().to_be_bytes());
+    out
+}
+
+/// A compressed `zTXt` chunk with `text` as its value.
+fn ztxt_chunk(keyword: &[u8], text: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(text).unwrap();
+    let packed = encoder.finish().unwrap();
+    let mut data = keyword.to_vec();
+    data.extend_from_slice(&[0, 0]);
+    data.extend_from_slice(&packed);
+    png_chunk(b"zTXt", &data)
+}
+
+/// `png` with `chunks` between the image data and `IEND`.
+fn with_chunks_before_iend(png: &[u8], chunks: &[Vec<u8>]) -> Vec<u8> {
+    let mut at = 8;
+    loop {
+        let len = u32::from_be_bytes(png[at..at + 4].try_into().unwrap()) as usize;
+        if &png[at + 4..at + 8] == b"IEND" {
+            let mut out = png[..at].to_vec();
+            for c in chunks {
+                out.extend_from_slice(c);
+            }
+            out.extend_from_slice(&png[at..]);
+            return out;
+        }
+        at += len + 12;
+    }
+}
+
+#[test]
+fn stepped_png_import_copies_a_multi_tile_image_in_bounded_steps() {
+    // Four tiles (300 × 260 at 256 px), with a compressed text chunk after the image data.
+    let mut img = noise(300, 260, ChannelLayout::Rgba, SampleType::U16);
+    img.meta.dpi = Some((240.0, 240.0));
+    let base = encode(&img, Format::Png, &EncodeOptions::default()).unwrap();
+    let text = "A".repeat(120_000);
+    let bytes = with_chunks_before_iend(&base, &[ztxt_chunk(b"Comment", text.as_bytes())]);
+    assert_stepped_equals_import("tiles.png", &bytes, "multi-tile with compressed text");
+
+    let expected = whole("tiles.png", &bytes);
+    let (got, calls) = stepped_zero_budget("tiles.png", &bytes);
+    assert_same(&got.document, &expected.document, "zero budget");
+    assert_eq!(got.warnings, expected.warnings);
+    assert_eq!(got.document.metadata.text, vec![("Comment".into(), text)], "the compressed text survives the steps");
+    // One call per row, then its copy bands, its prune batch and the document step, each a call
+    // of its own with an empty budget.
+    assert!(calls >= 260 + 4, "{} calls: an empty budget must not make one step do it all", calls);
 }
 
 #[test]

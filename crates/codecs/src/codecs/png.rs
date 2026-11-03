@@ -121,6 +121,13 @@ pub struct PngDecodeRows<B: AsRef<[u8]>> {
     rows: usize,
     interlaced: bool,
     images: u64,
+    /// The chunks after the pixels: scanned from `text_at` up to `text_end`, a batch at a time,
+    /// with `text` keeping what was accepted and the decompressor's state.
+    text_at: usize,
+    text_end: usize,
+    text: TextScan,
+    /// True once the pixel reader has been finished and the tail is known.
+    tail: bool,
     done: bool,
 }
 
@@ -182,7 +189,27 @@ impl<B: AsRef<[u8]>> PngDecodeRows<B> {
         let mut buf = Vec::new();
         buf.try_reserve_exact(size).map_err(|_| CodecError::LimitExceeded(format!("cannot allocate {size} bytes for the image")))?;
         let interlaced = info.interlaced;
-        Ok(Self { reader, at, bytes, limits: *limits, buf, layout, sample, width, height, line, size, rows: 0, interlaced, images, done: false })
+        Ok(Self {
+            reader,
+            at,
+            bytes,
+            limits: *limits,
+            buf,
+            layout,
+            sample,
+            width,
+            height,
+            line,
+            size,
+            rows: 0,
+            interlaced,
+            images,
+            text_at: 8,
+            text_end: 0,
+            text: TextScan::default(),
+            tail: false,
+            done: false,
+        })
     }
 
     /// The image's width and height in pixels.
@@ -236,17 +263,166 @@ impl<B: AsRef<[u8]>> PngDecodeRows<B> {
             }
             self.buf.truncate(self.line.saturating_mul(self.height));
         }
+        // The chunks after the pixels, one bounded batch at a time: a large text chunk never
+        // makes one step block, and what was accepted stays accepted when a step stops.
+        if !self.tail {
+            self.begin_tail()?;
+        }
+        while !self.text.done {
+            self.text_batch()?;
+            if !self.text.done && !more() {
+                return Ok(None);
+            }
+        }
         self.done = true;
         self.finish().map(Some)
     }
 
-    /// The chunks after the image, and the image itself.
-    fn finish(&mut self) -> Result<Image, CodecError> {
-        // Collect ancillary chunks after IDAT. Tolerate malformed tails once pixels
-        // are complete, but never swallow an allocation-limit failure.
+    /// Finishes the pixel reader and fixes where the metadata scan ends. Tolerate malformed
+    /// tails once pixels are complete, but never swallow an allocation-limit failure.
+    fn begin_tail(&mut self) -> Result<(), CodecError> {
         if let Err(e @ png::DecodingError::LimitsExceeded) = self.reader.finish() {
             return Err(map_png_err(e));
         }
+        self.text_end = usize::try_from(self.at.load(std::sync::atomic::Ordering::Relaxed)).map_err(|_| err("invalid PNG reader position"))?;
+        self.text.remaining = self.limits.alloc_usize();
+        self.tail = true;
+        Ok(())
+    }
+
+    /// Reads one bounded batch of the chunks after the pixels: up to [`TEXT_CHUNK_BATCH`] chunks,
+    /// or one batch of one text chunk's value while its decompressor is mid-stream.
+    fn text_batch(&mut self) -> Result<(), CodecError> {
+        let bytes = self.bytes.clone();
+        let bytes = bytes.as_ref();
+        if let Some(pending) = self.text.pending.take() {
+            match inflate_text(pending, bytes)? {
+                TextBatch::More(p) => self.text.pending = Some(p),
+                TextBatch::Finished(p) => {
+                    let (keyword, keyword_len, kind, text) = (p.keyword, p.keyword_len, p.kind, p.out);
+                    self.text.accept(keyword, keyword_len, kind, text)?;
+                }
+                TextBatch::Invalid => {}
+            }
+            return Ok(());
+        }
+        let mut chunks = 0;
+        while chunks < TEXT_CHUNK_BATCH && !self.text.done {
+            if self.scan_text_chunk(bytes)? {
+                break;
+            }
+            chunks += 1;
+        }
+        Ok(())
+    }
+
+    /// Reads the header of the next chunk, accepting it when it is a CRC-valid text chunk (which
+    /// it then starts reading) or stepping over any other. False when the scan can go on in this
+    /// batch; true when a text chunk was started and its bytes need their own batches. Sets
+    /// [`TextScan::done`] at the end of the tail, at `IEND`, or at a malformed one, as the
+    /// previous one-pass reader did.
+    fn scan_text_chunk(&mut self, bytes: &[u8]) -> Result<bool, CodecError> {
+        let Some(rest) = bytes.get(self.text_at..self.text_end) else {
+            self.text.done = true;
+            return Ok(false);
+        };
+        let Some((length, rest)) = rest.split_first_chunk::<4>() else {
+            self.text.done = true;
+            return Ok(false);
+        };
+        let length = u32::from_be_bytes(*length);
+        // PNG chunk lengths are at most 2^31-1. Broken tails remain tolerated.
+        if length > i32::MAX as u32 {
+            self.text.done = true;
+            return Ok(false);
+        }
+        let Ok(length) = usize::try_from(length) else {
+            self.text.done = true;
+            return Ok(false);
+        };
+        let Some((kind, rest)) = rest.split_first_chunk::<4>() else {
+            self.text.done = true;
+            return Ok(false);
+        };
+        let Some((data, rest)) = rest.split_at_checked(length) else {
+            self.text.done = true;
+            return Ok(false);
+        };
+        let Some((checksum, _)) = rest.split_first_chunk::<4>() else {
+            self.text.done = true;
+            return Ok(false);
+        };
+        let Some(next) = self.text_at.checked_add(12).and_then(|at| at.checked_add(length)).filter(|&at| at <= self.text_end) else {
+            self.text.done = true;
+            return Ok(false);
+        };
+        let Some(data_at) = self.text_at.checked_add(8) else {
+            self.text.done = true;
+            return Ok(false);
+        };
+        self.text_at = next;
+        if kind == b"IEND" {
+            self.text.done = true;
+            return Ok(false);
+        }
+        if !matches!(kind, b"tEXt" | b"zTXt" | b"iTXt") {
+            return Ok(false);
+        }
+        let mut crc = flate2::Crc::new();
+        crc.update(kind);
+        crc.update(data);
+        if crc.sum() != u32::from_be_bytes(*checksum) {
+            return Ok(false);
+        }
+        let Some((keyword, value)) = split_nul(data) else { return Ok(false) };
+        if keyword.is_empty() || keyword.len() > 79 {
+            return Ok(false);
+        }
+        let (value, compressed, latin1, kind) = match kind {
+            b"tEXt" => (value, false, true, TextKind::Plain),
+            b"zTXt" => {
+                let Some((&0, value)) = value.split_first() else { return Ok(false) };
+                (value, true, true, TextKind::Compressed)
+            }
+            _ => {
+                let Some(([flag, method], value)) = value.split_first_chunk::<2>() else { return Ok(false) };
+                if *flag > 1 || (*flag == 1 && *method != 0) {
+                    return Ok(false);
+                }
+                let Some((language, value)) = split_nul(value) else { return Ok(false) };
+                let Some((translated, value)) = split_nul(value) else { return Ok(false) };
+                if !language.is_ascii() || std::str::from_utf8(translated).is_err() {
+                    return Ok(false);
+                }
+                (value, *flag == 1, false, TextKind::International)
+            }
+        };
+        let keyword_len = latin1_len(keyword).ok_or_else(text_limit)?;
+        let keyword: String = keyword.iter().map(|&b| char::from(b)).collect();
+        let Some(value_at) = data_at.checked_add(data.len().saturating_sub(value.len())) else {
+            self.text.done = true;
+            return Ok(false);
+        };
+        let Some(value_end) = value_at.checked_add(value.len()) else {
+            self.text.done = true;
+            return Ok(false);
+        };
+        self.text.pending = Some(PendingText {
+            kind,
+            keyword,
+            keyword_len,
+            limit: self.text.remaining.saturating_sub(keyword_len),
+            input: value_at..value_end,
+            at: value_at,
+            latin1,
+            decoder: compressed.then(|| flate2::Decompress::new(true)),
+            out: Vec::new(),
+        });
+        Ok(true)
+    }
+
+    /// The image itself, with what the metadata scan accepted.
+    fn finish(&mut self) -> Result<Image, CodecError> {
         let height = u32::try_from(self.height).map_err(|_| err("image too large"))?;
         let mut img = Image::from_raw(self.width, height, self.layout, self.sample, std::mem::take(&mut self.buf))?;
         let info = self.reader.info();
@@ -259,9 +435,10 @@ impl<B: AsRef<[u8]>> PngDecodeRows<B> {
         {
             meta.dpi = Some((dpi_of_ppm(d.xppu), dpi_of_ppm(d.yppu)));
         }
-        let end = usize::try_from(self.at.load(std::sync::atomic::Ordering::Relaxed)).map_err(|_| err("invalid PNG reader position"))?;
-        let consumed = self.bytes.as_ref().get(..end).ok_or_else(|| err("invalid PNG reader position"))?;
-        read_text_metadata(consumed, self.limits.alloc_usize(), &mut meta)?;
+        meta.text = std::mem::take(&mut self.text.plain);
+        meta.text.extend(std::mem::take(&mut self.text.compressed));
+        meta.text.extend(std::mem::take(&mut self.text.international));
+        meta.xmp = self.text.xmp.take();
         img.meta = meta;
         if self.images > 1 {
             img.warnings.push(DecodeWarning::MoreFrames { total: u32::try_from(self.images).ok() });
@@ -361,124 +538,133 @@ fn latin1_len(bytes: &[u8]) -> Option<usize> {
     bytes.len().checked_add(bytes.iter().filter(|&&b| b >= 128).count())
 }
 
-/// Read only CRC-valid text chunks, including those after IDAT, with one shared
-/// budget for decoded UTF-8 keywords and values (including overwritten XMP).
-/// Invalid ancillary text stays optional, as it was with png's text decoder.
-fn read_text_metadata(bytes: &[u8], mut remaining: usize, meta: &mut Metadata) -> Result<(), CodecError> {
-    let Some(mut rest) = bytes.get(8..) else { return Ok(()) };
-    let (mut plain, mut compressed, mut international) = (Vec::new(), Vec::new(), Vec::new());
-    while let Some((length, tail)) = rest.split_first_chunk::<4>() {
-        let Some((kind, tail)) = tail.split_first_chunk::<4>() else { break };
-        let length = u32::from_be_bytes(*length);
-        // PNG chunk lengths are at most 2^31-1. Broken tails remain tolerated.
-        if length > i32::MAX as u32 {
-            break;
-        }
-        let Ok(length) = usize::try_from(length) else { break };
-        let Some(data) = tail.get(..length) else { break };
-        let Some((checksum, next)) = tail.get(length..).and_then(<[u8]>::split_first_chunk::<4>) else { break };
-        rest = next;
-        if kind == b"IEND" {
-            break;
-        }
-        if !matches!(kind, b"tEXt" | b"zTXt" | b"iTXt") {
-            continue;
-        }
-        let mut crc = flate2::Crc::new();
-        crc.update(kind);
-        crc.update(data);
-        if crc.sum() != u32::from_be_bytes(*checksum) {
-            continue;
-        }
-        let Some((keyword, value)) = split_nul(data) else { continue };
-        if keyword.is_empty() || keyword.len() > 79 {
-            continue;
-        }
-        let (value, deflated, latin1) = match kind {
-            b"tEXt" => (value, false, true),
-            b"zTXt" => {
-                let Some((&0, value)) = value.split_first() else { continue };
-                (value, true, true)
-            }
-            _ => {
-                let Some(([flag, method], value)) = value.split_first_chunk::<2>() else { continue };
-                if *flag > 1 || (*flag == 1 && *method != 0) {
-                    continue;
-                }
-                let Some((language, value)) = split_nul(value) else { continue };
-                let Some((translated, value)) = split_nul(value) else { continue };
-                if !language.is_ascii() || std::str::from_utf8(translated).is_err() {
-                    continue;
-                }
-                (value, *flag == 1, false)
-            }
-        };
-        let keyword_len = latin1_len(keyword).ok_or_else(text_limit)?;
-        let limit = remaining.saturating_sub(keyword_len);
-        let Some(text) = bounded_text(value, deflated, latin1, limit)? else { continue };
-        remaining = remaining.checked_sub(keyword_len).and_then(|left| left.checked_sub(text.len())).ok_or_else(text_limit)?;
-        let keyword: String = keyword.iter().map(|&b| char::from(b)).collect();
+/// The text chunks after the pixels, accepted one bounded batch at a time: one shared budget for
+/// decoded UTF-8 keywords and values (including overwritten XMP), and the decompressor of a
+/// compressed chunk kept between batches. Invalid ancillary text stays optional, as it was with
+/// png's text decoder.
+#[derive(Default)]
+struct TextScan {
+    /// UTF-8 bytes left of [`Limits::max_alloc`] for the text.
+    remaining: usize,
+    plain: Vec<(String, String)>,
+    compressed: Vec<(String, String)>,
+    international: Vec<(String, String)>,
+    xmp: Option<String>,
+    pending: Option<PendingText>,
+    done: bool,
+}
+
+impl TextScan {
+    /// Keeps a decoded value, charging the keyword and text to the shared budget; invalid UTF-8
+    /// text is dropped without charging, as before.
+    fn accept(&mut self, keyword: String, keyword_len: usize, kind: TextKind, out: Vec<u8>) -> Result<(), CodecError> {
+        let Ok(text) = String::from_utf8(out) else { return Ok(()) };
+        self.remaining = self.remaining.checked_sub(keyword_len).and_then(|left| left.checked_sub(text.len())).ok_or_else(text_limit)?;
         match kind {
             // Some writers put XMP in Latin-1 text chunks instead of the usual iTXt.
             // Treat the reserved keyword consistently, after the same budget checks.
-            _ if keyword == XMP_KEYWORD => meta.xmp = Some(text),
-            b"tEXt" => plain.push((keyword, text)),
-            b"zTXt" => compressed.push((keyword, text)),
-            _ => international.push((keyword, text)),
-        }
-    }
-    // Preserve the previous decoder's grouping of text entries by chunk type.
-    meta.text.extend(plain);
-    meta.text.extend(compressed);
-    meta.text.extend(international);
-    Ok(())
-}
-
-/// No input-sized allocation until its decoded size fits. Inflation uses a
-/// fixed scratch buffer and checks each batch before growing the output.
-fn bounded_text(input: &[u8], compressed: bool, latin1: bool, limit: usize) -> Result<Option<String>, CodecError> {
-    let mut output = Vec::new();
-    let mut append = |bytes: &[u8]| -> Result<(), CodecError> {
-        let added = if latin1 { latin1_len(bytes).ok_or_else(text_limit)? } else { bytes.len() };
-        if output.len().checked_add(added).is_none_or(|len| len > limit) {
-            return Err(text_limit());
-        }
-        output.try_reserve(added).map_err(|_| text_limit())?;
-        if latin1 {
-            // Every Latin-1 code point fits in at most two UTF-8 bytes.
-            let mut utf8 = [0; 2];
-            for &b in bytes {
-                output.extend_from_slice(char::from(b).encode_utf8(&mut utf8).as_bytes());
-            }
-        } else {
-            output.extend_from_slice(bytes);
+            _ if keyword == XMP_KEYWORD => self.xmp = Some(text),
+            TextKind::Plain => self.plain.push((keyword, text)),
+            TextKind::Compressed => self.compressed.push((keyword, text)),
+            TextKind::International => self.international.push((keyword, text)),
         }
         Ok(())
-    };
-    if compressed {
-        let mut decoder = flate2::Decompress::new(true);
-        let mut scratch = [0; 8192];
-        loop {
-            let start_in = decoder.total_in();
-            let start_out = decoder.total_out();
-            let Some(tail) = usize::try_from(start_in).ok().and_then(|at| input.get(at..)) else { return Ok(None) };
-            let Ok(status) = decoder.decompress(tail, &mut scratch, flate2::FlushDecompress::None) else { return Ok(None) };
-            let Some(batch) = usize::try_from(decoder.total_out() - start_out).ok().and_then(|len| scratch.get(..len)) else { return Ok(None) };
-            append(batch)?;
-            if status == flate2::Status::StreamEnd {
-                break;
-            }
-            if start_in == decoder.total_in() && start_out == decoder.total_out() {
-                return Ok(None); // Truncated stream: never keep partial text.
-            }
+    }
+}
+
+/// Which list a text chunk is kept in, as the previous decoder grouped them by chunk type.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextKind {
+    Plain,
+    Compressed,
+    International,
+}
+
+/// A text chunk's value being read, with its position in the file and (when compressed) the
+/// inflator kept between batches.
+struct PendingText {
+    kind: TextKind,
+    keyword: String,
+    keyword_len: usize,
+    /// The most decoded bytes this value may take: the budget left minus its keyword.
+    limit: usize,
+    /// The value's bytes in the file (the compressed ones for zTXt and compressed iTXt).
+    input: std::ops::Range<usize>,
+    /// The next byte of `input` a batch reads or inflates.
+    at: usize,
+    latin1: bool,
+    /// Some for a compressed value.
+    decoder: Option<flate2::Decompress>,
+    out: Vec<u8>,
+}
+
+/// What one batch of a text value produced.
+enum TextBatch {
+    /// The value needs another batch.
+    More(PendingText),
+    /// Every byte of the value was read; `out` is its UTF-8 text.
+    Finished(PendingText),
+    /// A broken chunk: drop it, as the previous reader did.
+    Invalid,
+}
+
+/// How much of one text value one batch reads or inflates.
+const TEXT_BATCH: usize = 8192;
+/// How many chunks one batch scans when it isn't continuing a text value.
+const TEXT_CHUNK_BATCH: usize = 64;
+
+/// Reads one batch of a text value. Inflation uses a fixed scratch buffer and checks each batch
+/// against the budget before growing the output, so no input-sized allocation is made first.
+fn inflate_text(mut p: PendingText, bytes: &[u8]) -> Result<TextBatch, CodecError> {
+    let Some(input) = bytes.get(p.input.clone()) else { return Ok(TextBatch::Invalid) };
+    let mut scratch = [0; TEXT_BATCH];
+    if let Some(decoder) = p.decoder.as_mut() {
+        let Some(tail) = input.get(p.at.saturating_sub(p.input.start)..) else { return Ok(TextBatch::Invalid) };
+        let start_in = decoder.total_in();
+        let start_out = decoder.total_out();
+        let Ok(status) = decoder.decompress(tail, &mut scratch, flate2::FlushDecompress::None) else { return Ok(TextBatch::Invalid) };
+        let used = usize::try_from(decoder.total_in().saturating_sub(start_in)).unwrap_or(usize::MAX);
+        let made = usize::try_from(decoder.total_out().saturating_sub(start_out)).unwrap_or(usize::MAX);
+        let (Some(used), Some(batch)) = (p.at.checked_add(used), scratch.get(..made)) else { return Ok(TextBatch::Invalid) };
+        p.at = used;
+        append_text(&mut p.out, batch, p.latin1, p.limit)?;
+        if status == flate2::Status::StreamEnd {
+            return Ok(TextBatch::Finished(p));
+        }
+        if start_in == decoder.total_in() && start_out == decoder.total_out() {
+            return Ok(TextBatch::Invalid); // Truncated stream: never keep partial text.
         }
     } else {
-        if !latin1 && std::str::from_utf8(input).is_err() {
-            return Ok(None);
+        let remaining = input.len().saturating_sub(p.at.saturating_sub(p.input.start));
+        let take = remaining.min(TEXT_BATCH);
+        let start = p.at.saturating_sub(p.input.start);
+        let Some(batch) = input.get(start..start.saturating_add(take)) else { return Ok(TextBatch::Invalid) };
+        p.at = p.at.saturating_add(take);
+        append_text(&mut p.out, batch, p.latin1, p.limit)?;
+        if take == remaining {
+            return Ok(TextBatch::Finished(p));
         }
-        append(input)?;
     }
-    Ok(String::from_utf8(output).ok())
+    Ok(TextBatch::More(p))
+}
+
+/// Appends one batch of decoded bytes, refusing to grow past the budget. Every Latin-1 code
+/// point fits in at most two UTF-8 bytes.
+fn append_text(out: &mut Vec<u8>, bytes: &[u8], latin1: bool, limit: usize) -> Result<(), CodecError> {
+    let added = if latin1 { latin1_len(bytes).ok_or_else(text_limit)? } else { bytes.len() };
+    if out.len().checked_add(added).is_none_or(|len| len > limit) {
+        return Err(text_limit());
+    }
+    out.try_reserve(added).map_err(|_| text_limit())?;
+    if latin1 {
+        let mut utf8 = [0; 2];
+        for &b in bytes {
+            out.extend_from_slice(char::from(b).encode_utf8(&mut utf8).as_bytes());
+        }
+    } else {
+        out.extend_from_slice(bytes);
+    }
+    Ok(())
 }
 
 fn is_latin1_keyword(k: &str) -> bool {
