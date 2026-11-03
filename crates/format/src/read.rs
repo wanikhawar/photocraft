@@ -102,7 +102,13 @@ fn read_all_with(reader: &mut impl Read, size_hint: u64, chunk: usize, max: u64)
                 break;
             }
             let needed = buf.len() as u64 + n as u64;
-            buf.try_reserve(n.max(chunk)).map_err(|_| out_of_memory(needed))?;
+            // Refuse a file that has outgrown the limit before its growth is reserved, and never
+            // reserve past what the limit leaves: a small `max` must not grow by `chunk`.
+            if needed > max {
+                return Err(too_large(max));
+            }
+            let room = max.saturating_sub(buf.len() as u64).min(usize::MAX as u64) as usize;
+            buf.try_reserve(n.max(chunk).min(room)).map_err(|_| out_of_memory(needed))?;
             buf.extend_from_slice(&probe[..n]);
         }
         let room = u64::try_from((buf.capacity() - buf.len()).min(chunk)).unwrap_or(u64::MAX);
@@ -234,6 +240,44 @@ mod tests {
         let e = buffer_for(1 << 62).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::OutOfMemory);
         assert_eq!(buffer_for(1024).unwrap().capacity(), 1024);
+    }
+
+    /// A reader that records how many reads it took.
+    struct CountingReader {
+        inner: std::io::Cursor<Vec<u8>>,
+        reads: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.reads.set(self.reads.get() + 1);
+            self.inner.read(buf)
+        }
+    }
+
+    /// A size hint over the limit is refused before the reader is touched at all: no probe read
+    /// and no reservation.
+    #[test]
+    fn an_oversize_hint_is_refused_without_a_read() {
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut reader = CountingReader { inner: std::io::Cursor::new(vec![0u8; 10_000]), reads: std::rc::Rc::clone(&reads) };
+        let e = read_all_with(&mut reader, 10_001, READ_CHUNK, 10_000).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(reads.get(), 0, "an oversize hint must not read anything");
+    }
+
+    /// Growth stays within a small total limit: a fresh buffer reserves only what is left rather
+    /// than a full read chunk, and a reader that outgrows the limit is refused before growing.
+    #[test]
+    fn growth_is_capped_by_the_remaining_allowance() {
+        let data: Vec<u8> = (0..5_000u32).map(|i| (i % 251) as u8).collect();
+        let buf = read_all_with(&mut std::io::Cursor::new(&data), 0, READ_CHUNK, 5_000).unwrap();
+        assert_eq!(buf, data);
+        assert!(buf.capacity() < READ_CHUNK, "a 5,000 byte limit reserved {}", buf.capacity());
+        assert!(buf.capacity() <= 8_192, "a 5,000 byte limit reserved {}", buf.capacity());
+
+        let e = read_all_with(&mut std::io::Cursor::new(vec![0u8; 5_001]), 4_096, READ_CHUNK, 5_000).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::FileTooLarge);
     }
 
     #[test]
