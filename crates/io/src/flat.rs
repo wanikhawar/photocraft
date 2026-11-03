@@ -859,7 +859,7 @@ pub fn export_preview_png_with_renderer_diagnostics(
                     }
                 };
                 res.warnings.extend(r.drain_diagnostics());
-                return Ok(res);
+                Ok(res)
             }
             Err(IoError::Render(render_err)) if render_err.is_retryable() => {
                 let fallback_warning = format!("rendering backend unavailable ({render_err}); falling back to CPU");
@@ -1005,7 +1005,7 @@ impl<'a> FlatSource<'a> {
         &self,
         alpha: bool,
         ctl: &Interrupt<'_>,
-        mut renderer: Option<&mut dyn BandRenderer>,
+        renderer: Option<&mut dyn BandRenderer>,
         warnings: &mut Vec<String>,
         mut sink: impl FnMut(u32, Vec<u8>, bool) -> Result<(), IoError>,
     ) -> Result<(), IoError> {
@@ -1287,7 +1287,7 @@ pub fn export_flat_with_renderer_diagnostics(
                     }
                 };
                 res.warnings.extend(r.drain_diagnostics());
-                return Ok(res);
+                Ok(res)
             }
             Err(IoError::Render(render_err)) if render_err.is_retryable() => {
                 let fallback_warning = format!("rendering backend unavailable ({render_err}); falling back to CPU");
