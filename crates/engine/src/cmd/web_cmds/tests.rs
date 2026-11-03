@@ -567,8 +567,8 @@ fn quick_export_uses_the_supplied_renderer_and_reports_cpu_fallback() {
             rect: Rect,
             band_rows: i32,
             ctl: &photocraft_raster::Interrupt<'_>,
-            sink: &mut dyn FnMut(photocraft_io::RenderBand) -> Result<(), photocraft_io::IoError>,
-        ) -> Result<(), photocraft_io::RenderError> {
+            sink: &mut dyn FnMut(photocraft_io::RenderBand) -> std::result::Result<(), photocraft_io::IoError>,
+        ) -> std::result::Result<(), photocraft_io::RenderError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut cpu = photocraft_io::CpuRenderer;
             cpu.render_bands(doc, rect, band_rows, ctl, sink)
@@ -584,8 +584,8 @@ fn quick_export_uses_the_supplied_renderer_and_reports_cpu_fallback() {
             _rect: Rect,
             _band_rows: i32,
             _ctl: &photocraft_raster::Interrupt<'_>,
-            _sink: &mut dyn FnMut(photocraft_io::RenderBand) -> Result<(), photocraft_io::IoError>,
-        ) -> Result<(), photocraft_io::RenderError> {
+            _sink: &mut dyn FnMut(photocraft_io::RenderBand) -> std::result::Result<(), photocraft_io::IoError>,
+        ) -> std::result::Result<(), photocraft_io::RenderError> {
             Err(photocraft_io::RenderError::Unavailable("forced unavailable backend".into()))
         }
     }
