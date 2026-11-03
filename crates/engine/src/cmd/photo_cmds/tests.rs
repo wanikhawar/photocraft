@@ -388,19 +388,50 @@ fn photomerge_estimate_is_the_largest_phase_not_the_sum() {
     let (rois, accumulators) = (20_000 * 20, 15_000 * 21);
     let (peak, fixed) = estimate_photomerge_memory(&sizes, &sizes, cw, ch, cc, bpp, true, false);
     assert_eq!(fixed, rois + accumulators);
-    // The bands phase (ROIs, accumulators and one band) is the largest here.
-    let bands = rois + accumulators + band;
-    let collapse = rois + accumulators + 15_000 * 12;
-    let output = rois + 15_000 * 16 + 15_000 * 4 + 20_000 * 5;
-    assert!(bands > collapse && bands > output);
-    assert_eq!(peak, bands);
+    // Surfaces are whole 256 px tiles; a warped surface and an output layer and mask at a
+    // misaligned origin take one extra tile per axis.
+    let source = surface_bytes(100, 100, bpp);
+    let warped = surface_bytes_misaligned(100, 100, bpp);
+    let layer = surface_bytes_misaligned(100, 100, bpp) + surface_bytes_misaligned(100, 100, 1);
+    let composite = surface_bytes(150, 100, bpp);
+    assert_eq!(source, 256 * 256 * bpp);
+    assert_eq!(warped, 4 * 256 * 256 * bpp);
+    assert_eq!(layer, 4 * 256 * 256 * bpp + 4 * 256 * 256);
+    // The output phase (ROIs, blended colour, composite and both layers) is the largest here.
+    let bands = fixed + band;
+    let collapse = fixed + 15_000 * 3 * 4;
+    let output = rois + 15_000 * (cc + 1) * 4 + composite + 2 * layer;
+    assert!(output > bands && output > collapse);
+    assert_eq!(peak, output);
     // A sum of every buffer would be far more.
-    assert!(peak < rois + accumulators + 15_000 * 16 + 20_000 * 5 + band);
-    // Filling adds its own phase, which does not exceed the bands here.
+    assert!(peak < 2 * source + 2 * warped + rois + accumulators + 15_000 * (cc + 1) * 4 + 2 * layer + band);
+    // Filling keeps the layers and the composite and adds the filled surface and its planes.
     let (with_fill, _) = estimate_photomerge_memory(&sizes, &sizes, cw, ch, cc, bpp, true, true);
-    assert_eq!(with_fill, (20_000 * 5 + 15_000 * 4 + 15_000 * 4 + (24 << 20)).max(peak));
-    // Without blending only the sources and warped layers are held.
-    assert_eq!(estimate_photomerge_memory(&sizes, &sizes, cw, ch, cc, bpp, false, false), (80_000 + 80_000, 0));
+    let fill = 2 * layer + composite + composite + (24 << 20);
+    assert_eq!(with_fill, fill.max(peak));
+    // Without blending only the sources and warped layers are held, tile-rounded.
+    assert_eq!(estimate_photomerge_memory(&sizes, &sizes, cw, ch, cc, bpp, false, false), (2 * source + 2 * warped, 0));
+}
+
+#[test]
+fn photomerge_estimate_tile_rounds_tiny_and_misaligned_surfaces() {
+    let side = TILE_SIZE as usize;
+    for &(w, h) in &[(1usize, 1usize), (1, 1000), (1000, 1), (255, 255), (256, 256), (257, 257)] {
+        let source = surface_bytes(w, h, 4);
+        let misaligned = surface_bytes_misaligned(w, h, 4);
+        let expect = w.div_ceil(side).saturating_add(1).saturating_mul(h.div_ceil(side).saturating_add(1)).saturating_mul(side * side).saturating_mul(4);
+        assert_eq!(misaligned, expect, "{w}×{h}");
+        assert!(misaligned >= source, "{w}×{h}");
+        let (peak, _) = estimate_photomerge_memory(&[(w, h)], &[(w, h)], w.max(1), h.max(1), 3, 4, true, false);
+        assert!(peak >= misaligned, "{w}×{h}: {peak} < {misaligned}");
+    }
+    // A 256 px square is one tile at the origin but 2×2 as a worst-case warp.
+    assert_eq!(surface_bytes(256, 256, 4), side * side * 4);
+    assert_eq!(surface_bytes_misaligned(256, 256, 4), 4 * side * side * 4);
+    // An empty dimension allocates nothing, aligned or not.
+    assert_eq!(surface_bytes(0, 10, 4), 0);
+    assert_eq!(surface_bytes_misaligned(0, 10, 4), 0);
+    assert_eq!(surface_bytes_misaligned(10, 0, 4), 0);
 }
 
 #[test]
@@ -449,21 +480,32 @@ fn photomerge_succeeds_with_a_large_enough_memory_budget() {
 
 #[test]
 fn photomerge_memory_budget_precedence_and_defaults() {
-    // The param wins over the environment and the machine.
-    assert_eq!(budget_from(Some(123), Some("64"), Some(64 << 30)), 123);
+    // The param wins over the environment, the host and the container.
+    assert_eq!(budget_from(Some(123), Some("64"), Some(64 << 30), Some(1 << 30)), 123);
+    // An explicit zero is a zero budget, not a request for the default.
+    assert_eq!(budget_from(Some(0), Some("64"), Some(64 << 30), Some(1 << 30)), 0);
+    assert_eq!(budget_from(None, Some("0"), Some(64 << 30), Some(1 << 30)), 0);
     // Then the environment variable (MiB).
-    assert_eq!(budget_from(None, Some(" 64 "), Some(64 << 30)), 64 << 20);
+    assert_eq!(budget_from(None, Some(" 64 "), Some(64 << 30), Some(1 << 30)), 64 << 20);
     // An unparsable variable falls through to the machine.
-    assert_eq!(budget_from(None, Some("lots"), Some(8 << 30)), 4 << 30);
-    // Half of RAM with no upper ceiling.
-    assert_eq!(budget_from(None, None, Some(64 << 30)), 32 << 30);
-    // At least 1 GiB, and 4 GiB of RAM assumed when unknown.
-    assert_eq!(budget_from(None, None, Some(1 << 30)), 1 << 30);
-    assert_eq!(budget_from(None, None, None), 2 << 30);
+    assert_eq!(budget_from(None, Some("lots"), Some(8 << 30), None), 4 << 30);
+    // Half of host RAM with no upper ceiling.
+    assert_eq!(budget_from(None, None, Some(64 << 30), None), 32 << 30);
+    // At least 1 GiB, and 4 GiB of host RAM assumed when unknown.
+    assert_eq!(budget_from(None, None, Some(1 << 30), None), 1 << 30);
+    assert_eq!(budget_from(None, None, None, None), 2 << 30);
+    // A small container caps the default at half of its available memory, below the host half.
+    assert_eq!(budget_from(None, None, Some(64 << 30), Some(1 << 30)), 512 << 20);
+    // The 1 GiB floor never overrides the container cap.
+    assert_eq!(budget_from(None, None, Some(1 << 30), Some(256 << 20)), 128 << 20);
+    // Zero available memory is zero capacity, not unknown: nothing may floor it back up.
+    assert_eq!(budget_from(None, None, Some(64 << 30), Some(0)), 0);
+    // Unknown available memory keeps the host half.
+    assert_eq!(budget_from(None, None, Some(8 << 30), None), 4 << 30);
     // Huge values saturate instead of panicking or truncating.
-    assert_eq!(budget_from(Some(u64::MAX), None, None), usize::try_from(u64::MAX).unwrap_or(usize::MAX));
-    let _ = budget_from(None, Some("18446744073709551615"), None);
-    let _ = budget_from(None, None, Some(u64::MAX));
+    assert_eq!(budget_from(Some(u64::MAX), None, None, None), usize::try_from(u64::MAX).unwrap_or(usize::MAX));
+    let _ = budget_from(None, Some("18446744073709551615"), None, None);
+    let _ = budget_from(None, None, Some(u64::MAX), Some(u64::MAX));
 }
 
 #[test]
@@ -511,6 +553,35 @@ fn photomerge_source_load_charges_the_document_and_both_flatten_surfaces() {
     assert!(SourceLoad::new(Some(1 << 40)).admit(cmd, &one, usize::MAX, usize::MAX).is_err());
     // Without a budget (Merge to HDR Pro) nothing is assessed.
     assert!(SourceLoad::new(None).admit(cmd, &one, usize::MAX, usize::MAX).is_ok());
+}
+
+#[test]
+fn photomerge_import_options_use_the_whole_remainder() {
+    let cmd = "file.automate.photomerge";
+    let doc = doc_from("src", &scene(20, 20, 2), 20, 20, SampleType::U8);
+    let s = Session::new();
+    let available = 1_000_000usize;
+    for (name, kind) in [("src.png", 0u8), ("src.tiff", 1), ("src.psd", 2)] {
+        let bytes = photocraft_io::export(&doc, name, &Default::default()).unwrap().bytes;
+        let opts = SourceLoad::import_options(&s, name, &bytes, available, cmd).unwrap();
+        match kind {
+            0 => {
+                // A flat raster is bounded both per decoded buffer and across its whole working peak.
+                assert_eq!(opts.flat_max_pixel_bytes, available as u64, "{name}");
+                assert_eq!(opts.flat_max_working_bytes, available as u64, "{name}");
+                assert_eq!(opts.psd_max_pixel_bytes, 0, "{name}");
+            }
+            1 => {
+                // A layered TIFF keeps the PSD preflight; a flat page gets the working-peak cap.
+                assert_eq!(opts.psd_max_pixel_bytes, available as u64, "{name}");
+                assert_eq!(opts.flat_max_working_bytes, available as u64, "{name}");
+            }
+            _ => {
+                assert_eq!(opts.psd_max_pixel_bytes, available as u64, "{name}");
+                assert_eq!(opts.flat_max_working_bytes, 0, "{name}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -562,13 +633,57 @@ fn photomerge_refuses_an_oversized_file_before_reading_or_decoding_it() {
     let path = dir.join("big.png");
     // Not a valid image: reaching the decoder would report a format error instead.
     std::fs::write(&path, vec![0xAB; 4096]).unwrap();
-    let err = load_sources(&Session::new(), &json!({"paths": [path.to_string_lossy()]}), cmd, Some(1024))
-        .err()
-        .expect("a file larger than the budget must be refused");
+    let mut s = Session::new();
+    s.add_document(doc_from("open", &scene(8, 8, 1), 8, 8, SampleType::U8), None);
+    let err = load_sources(&s, &json!({"paths": [path.to_string_lossy()]}), cmd, Some(1024)).err().expect("a file larger than the budget must be refused");
+    assert!(err.to_string().contains("not enough memory for file.automate.photomerge"), "{err}");
     assert!(err.to_string().contains("was not read"), "{err}");
     assert!(err.to_string().contains("only 1 KiB is left"), "{err}");
     assert!(!err.to_string().contains("unrecognized"), "{err}");
     assert!(!err.to_string().contains("image format"), "{err}");
+    // The refusal changed nothing.
+    assert_eq!(s.documents().len(), 1);
+    assert_eq!(s.active().unwrap().doc.name, "open");
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn photomerge_missing_file_keeps_its_io_error_not_a_budget_error() {
+    let cmd = "file.automate.photomerge";
+    let dir = temp_dir("missing-file");
+    let path = dir.join("absent.png");
+    let mut s = Session::new();
+    s.add_document(doc_from("open", &scene(8, 8, 1), 8, 8, SampleType::U8), None);
+    let err =
+        load_sources(&s, &json!({"useOpenDocuments": true, "paths": [path.to_string_lossy()]}), cmd, Some(1u64 << 30)).err().expect("a missing file must fail");
+    let message = err.to_string();
+    assert!(matches!(err, EngineError::Other(_)), "{message}");
+    assert!(message.contains("absent.png"), "{message}");
+    assert!(!message.contains("not enough memory"), "{message}");
+    // The open document is untouched.
+    assert_eq!(s.documents().len(), 1);
+    assert_eq!(s.active().unwrap().doc.name, "open");
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn photomerge_directory_source_keeps_its_io_error_not_a_budget_error() {
+    let cmd = "file.automate.photomerge";
+    let dir = temp_dir("directory-source");
+    let path = dir.join("folder");
+    std::fs::create_dir(&path).unwrap();
+    let mut s = Session::new();
+    s.add_document(doc_from("open", &scene(8, 8, 1), 8, 8, SampleType::U8), None);
+    let err = load_sources(&s, &json!({"useOpenDocuments": true, "paths": [path.to_string_lossy()]}), cmd, Some(1u64 << 30))
+        .err()
+        .expect("a directory is not an image file");
+    let message = err.to_string();
+    assert!(matches!(err, EngineError::Other(_)), "{message}");
+    assert!(message.contains("folder"), "{message}");
+    assert!(!message.contains("not enough memory"), "{message}");
+    // The open document is untouched.
+    assert_eq!(s.documents().len(), 1);
+    assert_eq!(s.active().unwrap().doc.name, "open");
 }
 
 #[test]

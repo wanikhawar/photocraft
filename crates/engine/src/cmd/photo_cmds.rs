@@ -87,6 +87,16 @@ fn surface_bytes(w: usize, h: usize, bpp: usize) -> usize {
     w.div_ceil(side).saturating_mul(h.div_ceil(side)).saturating_mul(side.saturating_mul(side)).saturating_mul(bpp)
 }
 
+/// [`surface_bytes`] for a surface whose origin need not lie on a tile boundary (a warp's bounds,
+/// a layer or mask ROI): the worst placement spans one extra tile on each non-empty axis.
+fn surface_bytes_misaligned(w: usize, h: usize, bpp: usize) -> usize {
+    if w == 0 || h == 0 {
+        return 0;
+    }
+    let side = TILE_SIZE as usize;
+    w.div_ceil(side).saturating_add(1).saturating_mul(h.div_ceil(side).saturating_add(1)).saturating_mul(side.saturating_mul(side)).saturating_mul(bpp)
+}
+
 /// `bytes` for people ("12 MiB", "900 KiB", "17 B").
 fn bytes_text(bytes: usize) -> String {
     if bytes >= 1 << 20 {
@@ -173,10 +183,17 @@ impl SourceLoad {
             return Ok((name.clone(), import(&name, &bytes)?, bytes.len()));
         }
         let left = self.remaining(cmd)?;
-        let bytes = read_file_limited(path, u64::try_from(left).unwrap_or(u64::MAX))
-            .map_err(|e| crate::allocation::error(cmd, &format!("{e} (only {} is left of the budget for a source file's bytes)", bytes_text(left))))?;
+        let bytes = read_file_limited(path, u64::try_from(left).unwrap_or(u64::MAX)).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::FileTooLarge {
+                crate::allocation::error(cmd, &format!("{path}: {e} (only {} is left of the budget for a source file's bytes)", bytes_text(left)))
+            } else {
+                // A missing, unreadable or non-regular file is not a memory problem: keep its
+                // own I/O error so the user can fix the path or permissions.
+                EngineError::Other(format!("{path}: {e}"))
+            }
+        })?;
         let available = left.saturating_sub(bytes.len());
-        let opts = self.import_options(s, &name, &bytes, available, cmd)?;
+        let opts = Self::import_options(s, &name, &bytes, available, cmd)?;
         let doc = import_with_options(&name, &bytes, &opts).map_err(|e| match e {
             // The caller limit is this command's remainder, not the machine's hard limit.
             EngineError::PsdHardBudget { required, limit, .. } if limit == u64::try_from(available).unwrap_or(u64::MAX) => crate::allocation::error(
@@ -195,7 +212,7 @@ impl SourceLoad {
     /// The importer options that lower this import to what is left after the retained sources
     /// and the encoded buffer: the importer's own PSD/TIFF preflight, or a flat decode limit.
     /// The decoded document and the flatten are still charged by [`Self::admit`].
-    fn import_options(&self, s: &Session, name: &str, bytes: &[u8], available: usize, cmd: &str) -> Result<photocraft_io::ImportOptions> {
+    fn import_options(s: &Session, name: &str, bytes: &[u8], available: usize, cmd: &str) -> Result<photocraft_io::ImportOptions> {
         use photocraft_io::ImportPreflight;
         let mut opts = crate::jobs::import_options(s.prefs());
         if available == 0 {
@@ -208,20 +225,16 @@ impl SourceLoad {
         match photocraft_io::import_preflight(name, bytes) {
             ImportPreflight::Psd => opts.psd_max_pixel_bytes = limit,
             ImportPreflight::Tiff => {
-                self.admit_tiff_header(name, bytes, available, cmd)?;
+                // A layered page keeps the PSD-style preflight; a flat page is bounded by the
+                // flat importer's whole working peak, which it checks before decoding.
                 opts.psd_max_pixel_bytes = limit;
+                opts.flat_max_working_bytes = limit;
             }
             ImportPreflight::Flat => {
-                // The decoded buffer, the document built from it and the flatten's output are
-                // alive together, so keep a third of the remainder for each.
-                let decode = available / 3;
-                if decode == 0 {
-                    return Err(crate::allocation::error(
-                        cmd,
-                        &format!("no room is left to decode {name} after the {} of sources already loaded", bytes_text(self.retained)),
-                    ));
-                }
-                opts.flat_max_pixel_bytes = u64::try_from(decode).unwrap_or(u64::MAX);
+                // The importer caps its whole working peak (decode, conversion and tiles) at
+                // what is left, before it converts anything.
+                opts.flat_max_pixel_bytes = limit;
+                opts.flat_max_working_bytes = limit;
             }
             ImportPreflight::Unbounded => {
                 return Err(bad(
@@ -233,31 +246,6 @@ impl SourceLoad {
             }
         }
         Ok(opts)
-    }
-
-    /// Refuses a TIFF whose default page alone would not fit in `available`; a layered TIFF is
-    /// also bounded by the importer's own PSD-style preflight.
-    fn admit_tiff_header(&self, name: &str, bytes: &[u8], available: usize, cmd: &str) -> Result<()> {
-        let info = photocraft_codecs::tiff_info(bytes).map_err(|e| bad(cmd, format!("{name}: {e}")))?;
-        let page = info.default_page().and_then(|i| info.pages.get(i)).ok_or_else(|| bad(cmd, format!("{name}: the TIFF has no readable page")))?;
-        let bpp = u64::from(page.samples_per_pixel).saturating_mul(u64::from(page.bits_per_sample).div_ceil(8));
-        let needed = u64::from(page.width).saturating_mul(u64::from(page.height)).saturating_mul(bpp);
-        let available = u64::try_from(available).unwrap_or(u64::MAX);
-        if needed > available {
-            let needed = usize::try_from(needed).unwrap_or(usize::MAX);
-            let available = usize::try_from(available).unwrap_or(usize::MAX);
-            return Err(crate::allocation::error(
-                cmd,
-                &format!(
-                    "{name} needs about {} for its {}×{} page, which exceeds the {} left",
-                    bytes_text(needed),
-                    page.width,
-                    page.height,
-                    bytes_text(available)
-                ),
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -478,23 +466,39 @@ pub(crate) fn plane_matrix(pl: &Placement, origin: (f64, f64)) -> Option<Homogra
 }
 
 /// Photomerge's working-memory budget in bytes, from [`budget_from`]: the `memoryBudget` param,
-/// else `PHOTOCRAFT_PHOTOMERGE_BUDGET_MB`, else half of the machine's physical memory.
+/// else `PHOTOCRAFT_PHOTOMERGE_BUDGET_MB`, else a conservative share of this machine's memory
+/// (half of the host's, capped by half of what is currently available, which a container's cgroup
+/// limit lowers).
 fn photomerge_memory_budget(p: &Value) -> usize {
     let env_mb = std::env::var("PHOTOCRAFT_PHOTOMERGE_BUDGET_MB").ok();
-    budget_from(p.get("memoryBudget").and_then(Value::as_u64), env_mb.as_deref(), crate::memory::physical_memory())
+    budget_from(
+        p.get("memoryBudget").and_then(Value::as_u64),
+        env_mb.as_deref(),
+        crate::memory::physical_memory(),
+        photocraft_io::memory::MemorySnapshot::current().available_ram,
+    )
 }
 
-/// The budget: `param` (bytes) wins, then `env_mb` (a budget in MiB), then half of `ram` bytes
-/// (4 GiB assumed when unknown) but at least 1 GiB.
-fn budget_from(param: Option<u64>, env_mb: Option<&str>, ram: Option<u64>) -> usize {
+/// The budget: `param` (bytes) wins, then `env_mb` (a budget in MiB), then half of `host` bytes
+/// (4 GiB assumed when unknown) but at least 1 GiB. When `available` is known it caps that
+/// default at half of the current availability, and the 1 GiB floor never overrides it: a small
+/// container (`Some(0)` is zero capacity, not unknown) gets a proportionally small budget.
+fn budget_from(param: Option<u64>, env_mb: Option<&str>, host: Option<u64>, available: Option<u64>) -> usize {
     if let Some(b) = param {
         return usize::try_from(b).unwrap_or(usize::MAX);
     }
     if let Some(mb) = env_mb.and_then(|v| v.trim().parse::<u64>().ok()) {
         return usize::try_from(mb.saturating_mul(1 << 20)).unwrap_or(usize::MAX);
     }
-    let ram = ram.unwrap_or(4 << 30);
-    usize::try_from((ram / 2).max(1 << 30)).unwrap_or(usize::MAX)
+    let host = host.unwrap_or(4 << 30);
+    let host_half = (host / 2).max(1 << 30);
+    let cap = available.map_or(host_half, |a| host_half.min(a / 2));
+    usize::try_from(cap).unwrap_or(usize::MAX)
+}
+
+/// Sums `f` over `sizes`, saturating instead of wrapping for hostile dimensions.
+fn sum_surfaces(sizes: &[(usize, usize)], f: impl Fn(usize, usize) -> usize) -> usize {
+    sizes.iter().map(|&(w, h)| f(w, h)).fold(0usize, usize::saturating_add)
 }
 
 /// Estimated peak working memory of a Photomerge and the part of it that stays allocated while
@@ -503,11 +507,16 @@ fn budget_from(param: Option<u64>, env_mb: Option<&str>, ram: Option<u64>) -> us
 /// and warped sizes of the placed images, `cw` × `ch` the canvas, `cc` its colour channels and
 /// `bpp` its bytes per pixel.
 ///
+/// Surfaces are charged as whole tiles ([`surface_bytes`]); warped surfaces and output layers and
+/// masks take the worst-case extra tile per axis their origins can span
+/// ([`surface_bytes_misaligned`]). The ROI pixels and the f32 planes (weights, accumulators,
+/// blended colour) stay geometric.
+///
 /// The peak is the largest of the phases, since each frees what the next no longer needs: warping
 /// (sources and warped images), ROI conversion (ROIs, weights, warped images), the bands (ROIs,
 /// accumulators and the largest band), the collapse (ROIs, accumulators and the running result),
 /// the output (ROIs, blended colour, composite and output layers) and the fill (layers, composite
-/// and the fill's own planes).
+/// and the fill's own surface and planes).
 #[allow(clippy::too_many_arguments)]
 fn estimate_photomerge_memory(
     source_sizes: &[(usize, usize)],
@@ -519,22 +528,23 @@ fn estimate_photomerge_memory(
     blend: bool,
     fill: bool,
 ) -> (usize, usize) {
-    let px_sum = |sizes: &[(usize, usize)]| sizes.iter().map(|&(w, h)| w.saturating_mul(h)).fold(0usize, usize::saturating_add);
-    let sources = px_sum(source_sizes).saturating_mul(bpp);
-    let roi_px = px_sum(placed_sizes);
-    let warped = roi_px.saturating_mul(bpp);
+    let sources = sum_surfaces(source_sizes, |w, h| surface_bytes(w, h, bpp));
+    let warped = sum_surfaces(placed_sizes, |w, h| surface_bytes_misaligned(w, h, bpp));
     if !blend {
-        return (sources.saturating_add(warped).max(warped), 0);
+        return (sources.saturating_add(warped), 0);
     }
+    let roi_px = sum_surfaces(placed_sizes, |w, h| w.saturating_mul(h));
     // ROI colours, alpha and the seam weights (f32 each).
     let rois_weights = roi_px.saturating_mul((cc + 2) * 4);
     let canvas_px = cw.saturating_mul(ch);
     // The accumulator and weight-sum pyramids (4/3 of a plane each).
     let accumulators = canvas_px.saturating_mul((cc + 1) * 4 * 4 / 3);
     let blend_out = canvas_px.saturating_mul((cc + 1) * 4);
-    let output_layers = roi_px.saturating_mul(bpp + 1);
-    let composite = canvas_px.saturating_mul(bpp);
-    let fill_bytes = if fill { composite.saturating_add(24 << 20) } else { 0 };
+    // The output layers and their masks are surfaces at the warped ROIs' origins.
+    let output_layers = sum_surfaces(placed_sizes, |w, h| surface_bytes_misaligned(w, h, bpp).saturating_add(surface_bytes_misaligned(w, h, 1)));
+    let composite = surface_bytes(cw, ch, bpp);
+    let fill_surface = if fill { surface_bytes(cw, ch, bpp) } else { 0 };
+    let fill_planes = if fill { 24 << 20 } else { 0 };
 
     // The levels `seam_blend` blends with.
     let levels = panorama::blend_levels(cw, ch).min(7);
@@ -547,7 +557,7 @@ fn estimate_photomerge_memory(
         fixed_during_bands.saturating_add(max_band_cost),
         fixed_during_bands.saturating_add(canvas_px.saturating_mul(cc * 4)),
         rois_weights.saturating_add(blend_out).saturating_add(composite).saturating_add(output_layers),
-        output_layers.saturating_add(composite).saturating_add(fill_bytes),
+        output_layers.saturating_add(composite).saturating_add(fill_surface).saturating_add(fill_planes),
     ];
     (phases.into_iter().max().unwrap_or(0), fixed_during_bands)
 }
@@ -1362,7 +1372,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Photomerge…",
             menu: &["File", "Automate"],
             shortcut: None,
-            params: r##"{"paths":[str]|folder,"useOpenDocuments":bool=false,"layout":"auto|perspective|cylindrical|spherical|collage|reposition","blend":bool=true,"vignetteRemoval":bool=false,"geometricCorrection":bool=false,"contentAwareFill":bool=false,"focalLength":mm=0 (35 mm equivalent; 0 = EXIF or estimated),"memoryBudget":bytes?=half of RAM} → new document, one masked layer per image"##,
+            params: r##"{"paths":[str]|folder,"useOpenDocuments":bool=false,"layout":"auto|perspective|cylindrical|spherical|collage|reposition","blend":bool=true,"vignetteRemoval":bool=false,"geometricCorrection":bool=false,"contentAwareFill":bool=false,"focalLength":mm=0 (35 mm equivalent; 0 = EXIF or estimated),"memoryBudget":bytes?=half of RAM and available memory} → new document, one masked layer per image"##,
             enabled: always,
             run: photomerge,
             journal: true,
