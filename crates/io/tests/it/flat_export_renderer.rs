@@ -288,7 +288,7 @@ fn cancelled_export_leaves_queued_diagnostics_on_the_renderer() {
 fn ora_and_pdf_exports_report_cpu_use_when_a_renderer_is_set() {
     let doc = synthetic_doc();
     let opts = ExportOptions::default();
-    for (name, marker) in [("out.ora", "OpenRaster export uses CPU compositor"), ("out.pdf", "PDF export uses CPU compositor")] {
+    for (name, marker) in [("out.ora", "OpenRaster export uses the CPU compositor"), ("out.pdf", "PDF export uses the CPU compositor")] {
         let mut renderer = RecordingRenderer::default();
         let res = photocraft_io::export_with_renderer(&doc, name, &opts, &Interrupt::NONE, Some(&mut renderer)).expect("CPU-only format export");
         assert!(res.warnings.iter().any(|w| w.contains(marker)), "{name} must report CPU use: {:?}", res.warnings);
@@ -527,8 +527,8 @@ fn a_cancelled_retry_keeps_the_fallback_reason_for_the_caller() {
     let doc = synthetic_doc();
     let opts = ExportOptions::default();
     let cancelled = Arc::new(AtomicBool::new(false));
-    let cancel = || cancelled.load(Ordering::SeqCst);
-    let ctl = Interrupt::cancel_only(&cancel);
+    let is_cancelled = || cancelled.load(Ordering::SeqCst);
+    let ctl = Interrupt::cancel_only(&is_cancelled);
     let mut renderer = CancellingFailingRenderer { cancelled: cancelled.clone() };
     let mut diagnostics = Vec::new();
     let res = export_flat_with_renderer_diagnostics(&doc, Format::Png, &opts, &ctl, Some(&mut renderer), &mut diagnostics);
