@@ -234,11 +234,27 @@ fn execute(case: &Recipe, corpus: &Path, cli: &Path, output: &Path) -> Result<Va
     args.extend(["--out".into(), candidate.to_str().ok_or("non-UTF-8 output path")?.to_string()]);
     let (_, warnings) = invoke(cli, &args, &dir, "export")?;
     let bytes = read_limited(&candidate)?;
-    let after = inspect(cli, &candidate, &dir, "after")?;
-    let checks = verify(&case.checks, layer, target(&after, &case.target)?);
+    let candidate_path = format!("{}/candidate.psd", case.id);
+    let candidate_sha256 = crate::sha256::hex(&bytes);
+    let identity = json!({"id": layer_id, "name": layer.get("name"), "kind": layer.get("kind")});
+    let failure = |error: String| {
+        json!({"id": case.id, "status": "fail", "error": error,
+        "base": case.base, "base_sha256": case.base_sha256, "target": identity,
+        "candidate": candidate_path, "candidate_sha256": candidate_sha256,
+        "photoshop": {"opens": "not_run", "meaning": "not_run", "rendering": "not_run"}})
+    };
+    let after = match inspect(cli, &candidate, &dir, "after") {
+        Ok(after) => after,
+        Err(error) => return Ok(failure(error)),
+    };
+    let reopened = match target(&after, &case.target) {
+        Ok(layer) => layer,
+        Err(error) => return Ok(failure(error)),
+    };
+    let checks = verify(&case.checks, layer, reopened);
     let passed = checks.iter().all(|v| v.get("status").and_then(Value::as_str) == Some("pass"));
     Ok(json!({"id": case.id, "status": if passed { "pass" } else { "fail" }, "base": case.base, "base_sha256": case.base_sha256,
-        "candidate": format!("{}/candidate.psd", case.id), "candidate_sha256": crate::sha256::hex(&bytes), "checks": checks,
+        "candidate": candidate_path, "candidate_sha256": candidate_sha256, "target": identity, "checks": checks,
         "warnings": {"input": before.get("warnings"), "export": warnings, "output": after.get("warnings")},
         "photoshop": {"opens": "not_run", "meaning": "not_run", "rendering": "not_run"}}))
 }
@@ -337,6 +353,15 @@ mod tests {
         assert!(validate(&serde_json::from_value(edit).unwrap()).is_err());
     }
 
+    #[test]
+    fn rejects_unknown_keys_and_reports_missing_recipe_path() {
+        let recipe = json!({"version":1,"corpus_revision":"pin","cases":[{"id":"x","base":"x.psd","base_sha256":"a".repeat(64),"target":{"kind":"Type"},"checks":[{"op":"unchanged","path":"/name"}],"unexpected":true}]});
+        assert!(serde_json::from_value::<Recipes>(recipe).is_err());
+        let missing = std::env::temp_dir().join(format!("missing-psd-recipe-{}", std::process::id()));
+        let path = missing.to_str().unwrap();
+        assert!(run(Path::new("."), &[path, ".", ".", "."]).unwrap_err().contains(path));
+    }
+
     #[cfg(unix)]
     #[test]
     fn export_batch_checks_reopened_result_and_propagates_command_failure() {
@@ -355,8 +380,10 @@ mod tests {
             r##"#!/bin/sh
 if [ "$1" = info ]; then
     case "$2" in
-      */candidate.psd) echo '{"layers":[{"kind":"Type","id":4,"text":{"antialias":"Crisp"}}]}' ;;
-      *) echo '{"layers":[{"kind":"Type","id":4,"text":{"antialias":"None"}}]}' ;;
+      */inspect-fail/candidate.psd) echo 'broken inspection' >&2; exit 1 ;;
+      */target-fail/candidate.psd) echo '{"layers":[]}' ;;
+      */candidate.psd) echo '{"layers":[{"kind":"Type","id":4,"name":"Fixture","text":{"antialias":"Crisp"}}]}' ;;
+      *) echo '{"layers":[{"kind":"Type","id":4,"name":"Fixture","text":{"antialias":"None"}}]}' ;;
     esac
     exit 0
 fi
@@ -385,7 +412,33 @@ exit 1
         let good = execute(&make_case("good", "type.antiAlias.crisp"), &corpus, &cli, &output).unwrap();
         assert_eq!(good["status"], "pass");
         assert_eq!(good["photoshop"]["opens"], "not_run");
+        assert_eq!(good["target"]["id"], 4);
+        assert_eq!(good["target"]["name"], "Fixture");
         assert!(execute(&make_case("bad", "type.bad"), &corpus, &cli, &output).unwrap_err().contains("bad command"));
+        let recipes = Recipes {
+            version: 1,
+            corpus_revision: "test".into(),
+            cases: vec![make_case("inspect-fail", "type.antiAlias.crisp"), make_case("target-fail", "type.antiAlias.crisp")],
+        };
+        let recipe_path = root.join("recipes.json");
+        fs::write(&recipe_path, serde_json::to_vec(&recipes).unwrap()).unwrap();
+        let report_dir = root.join("report");
+        assert!(run(&root, &[recipe_path.to_str().unwrap(), corpus.to_str().unwrap(), cli.to_str().unwrap(), report_dir.to_str().unwrap()]).is_err());
+        let report: Value = serde_json::from_slice(&fs::read(report_dir.join("report.json")).unwrap()).unwrap();
+        let manifest: Value = serde_json::from_slice(&fs::read(report_dir.join("manifest.json")).unwrap()).unwrap();
+        for (i, id) in ["inspect-fail", "target-fail"].iter().enumerate() {
+            let case = &report["cases"][i];
+            let candidate = format!("{id}/candidate.psd");
+            assert_eq!(case["status"], "fail");
+            assert!(case["error"].as_str().is_some_and(|s| !s.is_empty()));
+            assert_eq!(case["base"], "base.psd");
+            assert_eq!(case["base_sha256"], crate::sha256::hex(b"base"));
+            assert_eq!(case["target"]["id"], 4);
+            assert_eq!(case["candidate"], candidate);
+            assert_eq!(case["candidate_sha256"], crate::sha256::hex(b"base"));
+            assert_eq!(manifest["candidates"][i]["path"], candidate);
+            assert_eq!(manifest["candidates"][i]["sha256"], crate::sha256::hex(b"base"));
+        }
         fs::remove_dir_all(root).unwrap();
     }
 }
