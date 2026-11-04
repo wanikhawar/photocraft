@@ -316,7 +316,9 @@ impl<B: AsRef<[u8]>> PngDecodeRows<B> {
                         let (keyword, keyword_len, kind, text) = (p.keyword, p.keyword_len, p.kind, p.out);
                         self.text.accept(keyword, keyword_len, kind, text)?;
                     }
-                    TextBatch::Invalid => {}
+                    TextBatch::Invalid(produced) => {
+                        self.text.remaining = self.text.remaining.checked_sub(produced).ok_or_else(text_limit)?;
+                    }
                 },
             }
             return Ok(());
@@ -605,7 +607,13 @@ impl TextScan {
     /// Keeps a decoded value, charging the keyword and text to the shared budget; invalid UTF-8
     /// text is dropped without charging, as before.
     fn accept(&mut self, keyword: String, keyword_len: usize, kind: TextKind, out: Vec<u8>) -> Result<(), CodecError> {
-        let Ok(text) = String::from_utf8(out) else { return Ok(()) };
+        let text = match String::from_utf8(out) {
+            Ok(text) => text,
+            Err(err) => {
+                self.remaining = self.remaining.checked_sub(err.as_bytes().len()).ok_or_else(text_limit)?;
+                return Ok(());
+            }
+        };
         self.remaining = self.remaining.checked_sub(keyword_len).and_then(|left| left.checked_sub(text.len())).ok_or_else(text_limit)?;
         match kind {
             // Some writers put XMP in Latin-1 text chunks instead of the usual iTXt.
@@ -736,7 +744,7 @@ enum TextBatch {
     /// Every byte of the value was read; `out` is its UTF-8 text.
     Finished(PendingText),
     /// A broken chunk: drop it, as the previous reader did.
-    Invalid,
+    Invalid(usize),
 }
 
 /// How much of one text value one batch reads or inflates.
@@ -747,38 +755,50 @@ const TEXT_CHUNK_BATCH: usize = 64;
 /// Reads one batch of a text value. Inflation uses a fixed scratch buffer and checks each batch
 /// against the budget before growing the output, so no input-sized allocation is made first.
 fn inflate_text(mut p: PendingText, bytes: &[u8]) -> Result<TextBatch, CodecError> {
-    let Some(input) = bytes.get(p.input.clone()) else { return Ok(TextBatch::Invalid) };
+    let Some(input) = bytes.get(p.input.clone()) else { return Ok(TextBatch::Invalid(if p.decoder.is_some() { p.out.len() } else { 0 })) };
     let mut scratch = [0; TEXT_BATCH];
     if let Some(decoder) = p.decoder.as_mut() {
-        let Some(tail) = input.get(p.at.saturating_sub(p.input.start)..) else { return Ok(TextBatch::Invalid) };
+        let Some(tail) = input.get(p.at.saturating_sub(p.input.start)..) else { return Ok(TextBatch::Invalid(p.out.len())) };
         let start_in = decoder.total_in();
         let start_out = decoder.total_out();
-        let Ok(status) = decoder.decompress(tail, &mut scratch, flate2::FlushDecompress::None) else { return Ok(TextBatch::Invalid) };
+        let status = match decoder.decompress(tail, &mut scratch, flate2::FlushDecompress::None) {
+            Ok(status) => status,
+            Err(_) => {
+                let written = usize::try_from(decoder.total_out().saturating_sub(start_out)).unwrap_or(usize::MAX);
+                let charged = match scratch.get(..written) {
+                    Some(batch) if p.latin1 => latin1_len(batch).unwrap_or(usize::MAX),
+                    _ => written,
+                };
+                return Ok(TextBatch::Invalid(p.out.len().saturating_add(charged)));
+            }
+        };
         let used = usize::try_from(decoder.total_in().saturating_sub(start_in)).unwrap_or(usize::MAX);
         let made = usize::try_from(decoder.total_out().saturating_sub(start_out)).unwrap_or(usize::MAX);
-        let (Some(used), Some(batch)) = (p.at.checked_add(used), scratch.get(..made)) else { return Ok(TextBatch::Invalid) };
+        let (Some(used), Some(batch)) = (p.at.checked_add(used), scratch.get(..made)) else { return Ok(TextBatch::Invalid(p.out.len())) };
         p.at = used;
         if !append_checked(&mut p.out, &mut p.utf8, &mut p.over, batch, p.latin1, p.limit)? {
-            return Ok(TextBatch::Invalid);
+            return Ok(TextBatch::Invalid(p.out.len()));
         }
         if status == flate2::Status::StreamEnd {
             return Ok(TextBatch::Finished(p));
         }
         if start_in == decoder.total_in() && start_out == decoder.total_out() {
-            return Ok(TextBatch::Invalid); // Truncated stream: never keep partial text.
+            return Ok(TextBatch::Invalid(p.out.len())); // Truncated stream: never keep partial text.
         }
     } else {
         let remaining = input.len().saturating_sub(p.at.saturating_sub(p.input.start));
         let take = remaining.min(TEXT_BATCH);
         let start = p.at.saturating_sub(p.input.start);
-        let Some(batch) = input.get(start..start.saturating_add(take)) else { return Ok(TextBatch::Invalid) };
+        let Some(batch) = input.get(start..start.saturating_add(take)) else {
+            return Ok(TextBatch::Invalid(if p.decoder.is_some() { p.out.len() } else { 0 }));
+        };
         p.at = p.at.saturating_add(take);
         if !append_checked(&mut p.out, &mut p.utf8, &mut p.over, batch, p.latin1, p.limit)? {
-            return Ok(TextBatch::Invalid);
+            return Ok(TextBatch::Invalid(if p.decoder.is_some() { p.out.len() } else { 0 }));
         }
         if take == remaining {
             if p.utf8.as_ref().is_some_and(|check| !check.complete()) {
-                return Ok(TextBatch::Invalid);
+                return Ok(TextBatch::Invalid(if p.decoder.is_some() { p.out.len() } else { 0 }));
             }
             if p.over {
                 return Err(text_limit());
@@ -1907,5 +1927,38 @@ mod rows_tests {
         assert!(calls > 1, "the metadata took more than the pixel step");
         assert_eq!(rows.pixel_finalizations, 1, "a metadata yield must not finalize the pixels again");
         assert_eq!(got.meta.text, vec![("Comment".into(), text)]);
+    }
+}
+
+#[cfg(test)]
+mod text_budget_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// A compressed iTXt chunk whose text inflates to `len` bytes of invalid UTF-8.
+    fn bad_itxt(len: usize) -> Vec<u8> {
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        z.write_all(&vec![0xff; len]).unwrap();
+        let mut data = b"Comment\0\x01\x00\0\0".to_vec();
+        data.extend_from_slice(&z.finish().unwrap());
+        let mut out = (data.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(b"iTXt");
+        out.extend_from_slice(&data);
+        let mut crc = flate2::Crc::new();
+        crc.update(b"iTXt");
+        crc.update(&data);
+        out.extend_from_slice(&crc.sum().to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn dropped_text_still_counts_against_the_budget() {
+        let image = Image::from_raw(1, 1, ChannelLayout::Rgb, SampleType::U8, vec![0, 0, 0]).unwrap();
+        let png = crate::encode(&image, Format::Png, &EncodeOptions::default()).unwrap();
+        let insert = png.len() - 12; // Before IEND.
+        let make = |count| [png[..insert].to_vec(), bad_itxt(100_000).repeat(count), png[insert..].to_vec()].concat();
+        let limits = Limits { max_alloc: 1 << 20, ..Limits::default() };
+        assert!(decode(&make(1), &limits).unwrap().meta.text.is_empty());
+        assert!(matches!(decode(&make(20), &limits), Err(CodecError::LimitExceeded(_))));
     }
 }

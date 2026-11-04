@@ -7,7 +7,7 @@
 //! is one unit and native code keeps its parallel resize and flatten.
 
 use photocraft_algo::resample::ResizeSteps;
-use photocraft_geom::{Rect, TILE_SIZE};
+use photocraft_geom::{Rect, TILE_SIZE, TileCoord};
 use photocraft_io::PngImport;
 use photocraft_raster::Surface;
 use web_time::Instant;
@@ -51,7 +51,7 @@ enum Stage {
     Flatten(Box<Flatten>),
     Resize(Box<ResizeSteps>),
     /// The fitted pixels, to move into place and wrap in a layer.
-    Finish(Surface),
+    Finish(Box<Translation>),
     Spent,
 }
 
@@ -104,11 +104,14 @@ impl PlaceSteps {
             Stage::Resize(mut resize) => {
                 ctx.progress(0.7 + 0.2 * resize.progress(), "Resizing");
                 self.stage = match resize.step(&mut || Instant::now() < deadline) {
-                    Some(px) => Stage::Finish(px),
+                    Some(px) => Stage::Finish(Box::new(Translation::new(px, self.plan.dx as i32, self.plan.dy as i32, self.fine))),
                     None => Stage::Resize(resize),
                 };
             }
-            Stage::Finish(px) => return self.finish(px, ctx).map(Some),
+            Stage::Finish(mut translation) => match translation.advance() {
+                Some(px) => return self.finish(px, ctx).map(Some),
+                None => self.stage = Stage::Finish(translation),
+            },
             Stage::Spent => return Err(EngineError::Other("internal error: the place was already prepared".into())),
         }
         Ok(None)
@@ -147,12 +150,12 @@ impl PlaceSteps {
     fn flattened(&mut self, px: Surface, ctx: &JobCtx) {
         let scale = self.plan.scale;
         self.stage = if (scale - 1.0).abs() <= 1e-9 {
-            Stage::Finish(px)
+            Stage::Finish(Box::new(Translation::new(px, self.plan.dx as i32, self.plan.dy as i32, self.fine)))
         } else if self.fine {
             Stage::Resize(Box::new(ResizeSteps::new(px, scale, scale, Resample::Bicubic, None)))
         } else {
             ctx.progress(0.7, "Resizing");
-            Stage::Finish(resize_surface(&px, scale, scale, Resample::Bicubic))
+            Stage::Finish(Box::new(Translation::new(resize_surface(&px, scale, scale, Resample::Bicubic), self.plan.dx as i32, self.plan.dy as i32, self.fine)))
         };
     }
 
@@ -160,7 +163,6 @@ impl PlaceSteps {
     fn finish(&mut self, px: Surface, ctx: &JobCtx) -> Result<Prepared> {
         let Plan { w, h, scale, dx, dy } = self.plan;
         let input = &self.input;
-        let px = translate_surface(&px, dx as i32, dy as i32);
         let label = if input.linked.is_some() { "Place Linked" } else { PLACE_EMBEDDED };
         let content = if input.smart {
             let source = match &input.linked {
@@ -197,6 +199,63 @@ impl StepWork<Prepared> for PlaceSteps {
                 return Ok(None);
             }
         }
+    }
+}
+
+/// Translates one target tile per advance in cooperative sessions.
+struct Translation {
+    source: Surface,
+    out: Surface,
+    targets: std::collections::btree_set::IntoIter<TileCoord>,
+    bounds: Rect,
+    dx: i32,
+    dy: i32,
+    one_shot: bool,
+}
+
+impl Translation {
+    fn new(source: Surface, dx: i32, dy: i32, fine: bool) -> Self {
+        let bounds = source.content_bounds();
+        // Saturating coordinate shifts need the one-shot implementation's edge handling.
+        let safe_shift = dx != i32::MIN
+            && dy != i32::MIN
+            && bounds.x0.checked_add(dx).is_some()
+            && bounds.x1.checked_add(dx).is_some()
+            && bounds.y0.checked_add(dy).is_some()
+            && bounds.y1.checked_add(dy).is_some();
+        let one_shot = !fine || !safe_shift || (dx % TILE_SIZE == 0 && dy % TILE_SIZE == 0);
+        let moved = bounds.translate(dx, dy);
+        let targets = if one_shot {
+            Default::default()
+        } else {
+            source
+                .tiles()
+                .filter(|(c, _)| !c.rect().intersect(&bounds).is_empty())
+                .flat_map(|(c, _)| c.rect().translate(dx, dy).intersect(&moved).tiles())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let out = Surface::with_default(source.format(), &source.default_pixel());
+        Self { source, out, targets: targets.into_iter(), bounds, dx, dy, one_shot }
+    }
+
+    fn advance(&mut self) -> Option<Surface> {
+        if self.one_shot {
+            return Some(translate_surface(&self.source, self.dx, self.dy));
+        }
+        if let Some(target) = self.targets.next() {
+            let dst = target.rect().intersect(&self.bounds.translate(self.dx, self.dy));
+            let src = dst.translate(self.dx.saturating_neg(), self.dy.saturating_neg()).intersect(&self.bounds);
+            if !src.is_empty() {
+                let dst = src.translate(self.dx, self.dy);
+                let mut tile = Surface::with_default(self.source.format(), &self.source.default_pixel());
+                tile.write_interleaved(dst, &self.source.to_interleaved(src));
+                tile.prune();
+                self.out.put_tiles(tile.tiles().map(|(c, t)| (*c, Arc::clone(t))));
+            }
+            return None;
+        }
+        // Each target is built once; dropping default-only tiles does not change pixels.
+        Some(std::mem::replace(&mut self.out, Surface::new(self.source.format())))
     }
 }
 
@@ -247,5 +306,38 @@ impl Flatten {
         out.put_tiles(band.tiles().map(|(c, t)| (*c, Arc::clone(t))));
         self.at = if x1 >= self.bounds.x1 { (self.bounds.x0, y1) } else { (x1, y) };
         Ok(if self.at.1 >= self.bounds.y1 { Some(self.out.take().unwrap_or_else(|| Surface::new(self.fmt))) } else { None })
+    }
+}
+
+#[cfg(test)]
+mod translation_tests {
+    use super::*;
+    use photocraft_color::{ColorMode, PixelFormat, SampleType};
+
+    #[test]
+    fn translation_is_resumable_and_matches_one_shot() {
+        for sample in [SampleType::U8, SampleType::U16, SampleType::F32] {
+            let fmt = PixelFormat::new(ColorMode::Rgb, sample, true);
+            let mut src = Surface::new(fmt);
+            let rect = Rect::new(0, 0, 520, 270);
+            let bpp = fmt.bytes_per_pixel();
+            let data: Vec<u8> = (0..520 * 270 * bpp).map(|i| (i * 37 % 251) as u8).collect();
+            src.write_interleaved(rect, &data);
+            for (dx, dy) in [(256, -256), (17, -29), (-267, 5)] {
+                let expected = translate_surface(&src, dx, dy);
+                let mut step = Translation::new(src.clone(), dx, dy, true);
+                let mut calls = 0;
+                let got = loop {
+                    calls += 1;
+                    if let Some(out) = step.advance() {
+                        break out;
+                    }
+                };
+                if dx % TILE_SIZE != 0 || dy % TILE_SIZE != 0 {
+                    assert!(calls > 2);
+                }
+                assert_eq!(got, expected, "{sample:?} ({dx}, {dy})");
+            }
+        }
     }
 }

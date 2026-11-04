@@ -10,6 +10,7 @@ use crate::{ImportResult, IoError, Route};
 
 enum Stage {
     Rows(Box<PngDecodeRows<SharedBytes>>),
+    Orient(Box<codecs::orientation::PngOrientation>),
     /// The decoded image becoming the document, a band of rows and a batch of tiles at a time.
     Build(Box<FlatBuilder>),
     Spent,
@@ -38,12 +39,12 @@ impl PngImport {
     pub fn progress(&self) -> f32 {
         match &self.stage {
             Stage::Rows(rows) => rows.progress(),
-            Stage::Build(_) | Stage::Spent => 1.0,
+            Stage::Orient(_) | Stage::Build(_) | Stage::Spent => 1.0,
         }
     }
 
     /// Works while `more()` returns true (at least one bounded piece per call): rows, then the
-    /// image's rows into the document's tiles, then the prune scan. `Some` once the document is
+    /// orientation bands, then the image's rows into the document's tiles and the prune scan. `Some` once the document is
     /// built, after which the import is spent.
     pub fn step(&mut self, more: &mut dyn FnMut() -> bool) -> Result<Option<ImportResult>, IoError> {
         match std::mem::replace(&mut self.stage, Stage::Spent) {
@@ -51,10 +52,16 @@ impl PngImport {
                 self.stage = match rows.step(more)? {
                     Some(img) => {
                         // The resolution, upright orientation and final limit checks `decode` does.
-                        let img = codecs::finish_png_decode(img, &DecodeOptions::default())?;
-                        Stage::Build(Box::new(FlatBuilder::new(&self.name, img)))
+                        Stage::Orient(Box::new(codecs::png_orientation(img, &DecodeOptions::default())?))
                     }
                     None => Stage::Rows(rows),
+                };
+                Ok(None)
+            }
+            Stage::Orient(mut orient) => {
+                self.stage = match orient.step(more)? {
+                    Some(img) => Stage::Build(Box::new(FlatBuilder::new(&self.name, img))),
+                    None => Stage::Orient(orient),
                 };
                 Ok(None)
             }

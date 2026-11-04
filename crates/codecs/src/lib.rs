@@ -7,8 +7,9 @@
 //!   metadata (EXIF, XMP, DPI, text) are preserved where the format allows.
 //! * [`caps`] declares per-format capabilities and [`fidelity_warnings`]
 //!   tells the UI exactly what an export will lose.
-//! * The API is I/O free (`&[u8]` in, `Vec<u8>` out) and builds for
-//!   `wasm32-unknown-unknown`. Decoders enforce [`Limits`] before allocating.
+//! * APIs use bytes or caller-provided readers, with no ambient filesystem access,
+//!   and build for `wasm32-unknown-unknown`. Byte decoders enforce [`Limits`];
+//!   [`exr_stream`] instead bounds metadata and one decoded compression block.
 
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -17,6 +18,7 @@ pub mod cicp;
 mod codecs;
 mod error;
 pub mod exif_color;
+pub mod exr_stream;
 mod fidelity;
 mod format;
 mod image;
@@ -45,7 +47,8 @@ pub use crate::image::{
     MAX_EXTRA_SAMPLES, Metadata, SampleType,
 };
 pub use crate::options::{
-    DdsCompression, DdsOptions, DecodeOptions, DpxBits, EncodeOptions, ExrCompression, JpegFormat, Limits, PngCompression, PngStereo, TiffCompression,
+    DdsCompression, DdsOptions, DecodeOptions, DpxBits, EncodeOptions, ExrCompression, JpegFormat, Limits, PngCompression, PngStereo, TIFF_PYRAMID_MIN,
+    TiffCompression,
 };
 pub use crate::orientation::{exif_orientation, upright_exif, upright_xmp};
 pub use crate::resolution::{exif_resolution, export_exif, export_xmp, photoshop_resolution, xmp_resolution};
@@ -104,6 +107,19 @@ pub fn decode_as_with(format: Format, bytes: &[u8], opts: &DecodeOptions) -> Res
 /// result equals [`decode_as_with`]'s on the same file.
 pub fn finish_png_decode(img: Image, opts: &DecodeOptions) -> Result<Image, CodecError> {
     finish_format(Format::Png, &[], img, opts)
+}
+
+/// Prepare a stepped PNG orientation with the same metadata and limits as `finish_png_decode`.
+pub fn png_orientation(mut img: Image, opts: &DecodeOptions) -> Result<orientation::PngOrientation, CodecError> {
+    if img.meta.dpi.is_none() {
+        img.meta.dpi = resolution::from_metadata(img.meta.exif.as_deref(), img.meta.xmp.as_deref());
+    }
+    let o = img.meta.exif.as_deref().map_or(1, exif_orientation);
+    opts.limits.check(img.width(), img.height(), img.layout(), img.sample_type())?;
+    if !opts.keep_orientation && (5..=8).contains(&o) {
+        opts.limits.check(img.height(), img.width(), img.layout(), img.sample_type())?;
+    }
+    orientation::PngOrientation::new(img, if opts.keep_orientation { 1 } else { o })
 }
 
 /// The steps after a decoder of `format` has produced `img` from `bytes`.
@@ -286,6 +302,7 @@ pub fn decode_exr_channels(bytes: &[u8], part: usize, names: &[&str], opts: &Dec
 /// [`decode_as_with`] instead flattens a deep file into a normal [`Image`] with a
 /// [`DecodeWarning::DeepFlattened`]. `Err(Unsupported)` when the file has no deep part.
 pub fn decode_deep_exr(bytes: &[u8], limits: &Limits) -> Result<DeepImage, CodecError> {
+    codecs::exr::check_previews(bytes)?;
     let mut cur = std::io::Cursor::new(bytes);
     let meta = ::exr::meta::MetaData::read_from_buffered(&mut cur, false).map_err(|e| CodecError::malformed(Format::OpenExr, e))?;
     codecs::deep_exr::decode_deep(&meta, bytes, limits)

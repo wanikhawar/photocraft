@@ -311,6 +311,92 @@ fn orient_bytes(src: &[u8], bpp: usize, o: u16, (w, h): (usize, usize), ow: usiz
     }
 }
 
+/// An image orientation computed in bounded output bands. PNG images have no extra sample planes.
+pub struct PngOrientation {
+    image: Option<Image>,
+    output: Vec<u8>,
+    orientation: u16,
+    row: usize,
+}
+
+impl PngOrientation {
+    pub(crate) fn new(image: Image, orientation: u16) -> Result<Self, CodecError> {
+        if !image.meta.extra_samples.is_empty() {
+            return Err(CodecError::InvalidImage("PNG cannot contain extra sample planes".into()));
+        }
+        let mut output = Vec::new();
+        if (2..=8).contains(&orientation) {
+            output.try_reserve_exact(image.data().len()).map_err(|_| CodecError::LimitExceeded("cannot allocate oriented PNG".into()))?;
+        }
+        Ok(Self { image: Some(image), output, orientation, row: 0 })
+    }
+
+    /// Process at least one band, then continue while `more` permits. Returns the finished image.
+    pub fn step(&mut self, more: &mut dyn FnMut() -> bool) -> Result<Option<Image>, CodecError> {
+        let Some(img) = self.image.as_ref() else { return Err(CodecError::InvalidImage("PNG orientation already finished".into())) };
+        let o = self.orientation;
+        if !(2..=8).contains(&o) {
+            return Ok(self.image.take());
+        }
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let (ow, oh) = if o >= 5 { (h, w) } else { (w, h) };
+        let bpp = img.layout().channels() * img.sample_type().bytes();
+        loop {
+            // Cap the band by pixels as well as rows for unusually wide images.
+            let rows = (65536 / ow.max(1)).clamp(1, BAND).min(oh - self.row);
+            let start = self.output.len();
+            self.output.resize(start + rows * ow * bpp, 0);
+            macro_rules! run {
+                ($n:expr) => {{
+                    let (src, _) = img.data().as_chunks::<$n>();
+                    let (dst, _) = self.output[start..].as_chunks_mut::<$n>();
+                    band(src, dst, o, (w, h), ow, self.row);
+                }};
+            }
+            match bpp {
+                1 => run!(1),
+                2 => run!(2),
+                3 => run!(3),
+                4 => run!(4),
+                5 => run!(5),
+                6 => run!(6),
+                8 => run!(8),
+                10 => run!(10),
+                12 => run!(12),
+                16 => run!(16),
+                20 => run!(20),
+                _ => return Err(CodecError::InvalidImage("invalid PNG pixel size".into())),
+            }
+            self.row += rows;
+            if self.row == oh {
+                break;
+            }
+            if !more() {
+                return Ok(None);
+            }
+        }
+        let Some(img) = self.image.take() else { return Err(CodecError::InvalidImage("PNG orientation already finished".into())) };
+        let (layout, sample) = (img.layout(), img.sample_type());
+        let mut meta = img.meta;
+        if let Some(e) = &mut meta.exif
+            && let Cow::Owned(fixed) = upright_exif(e)
+        {
+            *e = fixed;
+        }
+        if let Some(x) = &mut meta.xmp
+            && let Cow::Owned(fixed) = upright_xmp(x)
+        {
+            *x = fixed;
+        }
+        if o >= 5 {
+            meta.dpi = meta.dpi.map(|(x, y)| (y, x));
+        }
+        let mut out = Image::from_raw(ow as u32, oh as u32, layout, sample, std::mem::take(&mut self.output))?.with_icc(img.icc).with_meta(meta);
+        out.warnings = img.warnings;
+        Ok(Some(out))
+    }
+}
+
 impl Image {
     /// The image turned upright for orientation `o` (1–8; anything else is
     /// treated as 1 and returns the image unchanged). Width and height swap
@@ -359,6 +445,27 @@ impl Image {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stepped_png_orientation_preserves_limits_and_metadata() {
+        use crate::{ChannelLayout, DecodeOptions, Limits, SampleType, finish_png_decode, png_orientation};
+        let mut img = Image::from_raw(3, 2, ChannelLayout::Rgb, SampleType::U8, (0..18).collect()).unwrap();
+        let mut exif = b"II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
+        exif.extend_from_slice(&6u16.to_le_bytes());
+        exif.extend_from_slice(&[0; 6]);
+        img.meta.exif = Some(exif);
+        img.meta.dpi = Some((120.0, 240.0));
+        let opts = DecodeOptions { limits: Limits { max_width: 3, max_height: 2, ..Limits::default() }, ..Default::default() };
+        assert!(png_orientation(img.clone(), &opts).is_err());
+        assert!(finish_png_decode(img.clone(), &opts).is_err());
+        let opts = DecodeOptions::default();
+        let expected = finish_png_decode(img.clone(), &opts).unwrap();
+        let got = png_orientation(img, &opts).unwrap().step(&mut || false).unwrap().unwrap();
+        assert_eq!(got.data(), expected.data());
+        assert_eq!((got.width(), got.height()), (expected.width(), expected.height()));
+        assert_eq!(got.meta.dpi, expected.meta.dpi);
+        assert_eq!(got.meta.exif, expected.meta.exif);
+    }
 
     #[test]
     fn an_impossible_allocation_is_an_error_not_an_abort() {
