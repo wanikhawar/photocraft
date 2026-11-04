@@ -67,7 +67,7 @@ impl PlaceSteps {
     fn io_error(&self, e: photocraft_io::IoError) -> EngineError {
         match e {
             photocraft_io::IoError::Cancelled => EngineError::Cancelled,
-            e => EngineError::Other(format!("{}: {e}", self.input.name)),
+            e => crate::error::io_open_error(&self.input.name, e),
         }
     }
 
