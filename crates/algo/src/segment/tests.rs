@@ -1033,6 +1033,7 @@ fn select_subject_leaves_a_table_along_the_bottom_edge_out() {
     assert!(v > 0.9, "IoU {v}");
 }
 
+/// Keep the figure while excluding a door-frame patch entering from just one edge.
 #[test]
 fn select_subject_leaves_a_nearby_single_edge_object_out() {
     // A horizontal door-frame piece enters only from the left and stops just short of the

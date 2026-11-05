@@ -149,6 +149,7 @@ fn backdrop_pass(img: &super::RgbImage, blob: &[bool], ctl: &Interrupt) -> Resul
 /// the largest, and smaller ones (not specks) that lie close to it. A part of the subject the
 /// cut separated from the rest, such as a head whose thin neck the working resolution lost, a
 /// tail or something held, would otherwise go missing; clutter further away is still dropped.
+/// Small elongated edge strips are excluded; the main and independently large parts are kept.
 fn keep_main_and_nearby(mask: &[bool], w: usize, h: usize) -> Vec<bool> {
     let (lab, sizes) = super::components(mask, w, h);
     let Some((main, largest)) = sizes.iter().copied().enumerate().skip(1).max_by_key(|(_, n)| *n) else { return vec![false; w * h] };
@@ -194,6 +195,7 @@ mod component_tests {
     use crate::segment::RgbImage;
 
     #[test]
+    /// Pin rounding at the proximity margin and relative/absolute component-size floors.
     fn nearby_component_margin_and_size_boundaries() {
         // The main 20x20 component has margin ceil(20 * .15) = 3 and a four-pixel floor.
         // A 30x30 component raises the floor to ceil(900 * .005) = 5.
@@ -216,6 +218,7 @@ mod component_tests {
         // A qualifying nearby island is kept whether it is a head or unrelated clutter.
     }
 
+    /// Rotate a fixture coordinate so the same geometry exercises every image edge.
     fn rotate(x: usize, y: usize, side: usize, turns: usize) -> (usize, usize) {
         let (mut x, mut y) = (x, y);
         for _ in 0..turns {
@@ -225,6 +228,7 @@ mod component_tests {
     }
 
     #[test]
+    /// Protect cropped subject parts from the small edge-strip veto in all orientations.
     fn cropped_heads_and_large_limbs_survive_on_every_edge() {
         let side = 240;
         for turns in 0..4 {
@@ -246,6 +250,7 @@ mod component_tests {
     }
 
     #[test]
+    /// Check that the narrow edge-clutter exclusion is independent of edge orientation.
     fn small_nearby_elongated_edge_strips_are_excluded() {
         let side = 240;
         for turns in 0..4 {
@@ -265,6 +270,7 @@ mod component_tests {
     }
 
     #[test]
+    /// Separate subject-colored edge patches from equally narrow backdrop clutter.
     fn narrow_edge_parts_matching_subject_are_released_on_every_edge() {
         let side = 240;
         let frame = 12;
