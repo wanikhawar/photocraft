@@ -1819,6 +1819,7 @@ fn an_aliased_stroke_at_partial_opacity_is_one_flat_colour() {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn large_tips_render_the_same_in_parallel_and_serially() {
+    let _lock = crate::render::PARALLEL_THRESHOLD_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut sel = Surface::new(PixelFormat::GRAY8);
     sel.fill_rect(Rect::new(0, 0, 900, 700), &[1.0]);
     sel.fill_rect(Rect::new(300, 0, 400, 700), &[0.0]);
@@ -1870,7 +1871,7 @@ fn large_tips_render_the_same_in_parallel_and_serially() {
         assert_eq!(p.len(), s.len());
         let diff = p.iter().zip(s).filter(|(a, b)| a != b).count();
         assert_eq!(diff, 0, "stroke {i}: {diff} pixels differ between the parallel and the serial render");
-        assert!(p.iter().any(|v| (*v - 0.5).abs() > 0.1), "stroke {i} painted something");
+        assert!(p.chunks_exact(4).any(|pixel| pixel[..3].iter().any(|v| (*v - 0.5).abs() > 0.1)), "stroke {i} painted something");
     }
 }
 
@@ -1879,6 +1880,7 @@ fn large_tips_render_the_same_in_parallel_and_serially() {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn general_loop_strokes_render_the_same_in_parallel_and_serially_at_every_depth() {
+    let _lock = crate::render::PARALLEL_THRESHOLD_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let tip = GrayTile::from_fn(16, 16, |x, y| if (x + y) % 3 == 0 { 1.0 } else { 0.4 });
     let mut textured = BrushSettings { size: 120.0, hardness: 0.3, ..brush() };
     textured.texture = Texture { enabled: true, pattern: Pattern::Tile(tip.clone()), each_tip: true, ..Default::default() };
@@ -1906,7 +1908,7 @@ fn general_loop_strokes_render_the_same_in_parallel_and_serially_at_every_depth(
             assert_eq!(parallel.len(), serial.len());
             let diff = parallel.iter().zip(&serial).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
             assert_eq!(diff, 0, "stroke {i} at {fmt:?}: {diff} pixels differ between the parallel and the serial render");
-            assert!(parallel.iter().any(|v| (*v - 0.5).abs() > 0.1), "stroke {i} at {fmt:?} painted something");
+            assert!(parallel.chunks_exact(4).any(|pixel| pixel[..3].iter().any(|v| (*v - 0.5).abs() > 0.1)), "stroke {i} at {fmt:?} painted something");
         }
     }
 }
@@ -1917,6 +1919,7 @@ fn general_loop_strokes_render_the_same_in_parallel_and_serially_at_every_depth(
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn a_parallel_composite_converts_through_the_documents_cmyk_profile() {
+    let _lock = crate::render::PARALLEL_THRESHOLD_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     use photocraft_cms::synth::{CmykParams, cmyk_profile};
     use photocraft_color::convert::{CmykSpace, with_cmyk_space};
     let profile =

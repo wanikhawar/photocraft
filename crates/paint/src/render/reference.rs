@@ -391,6 +391,7 @@ fn bits(v: &[f32]) -> Vec<u32> {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn general_loop_rows_match_serially_and_in_parallel() {
+    let _lock = PARALLEL_THRESHOLD_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let _restore = RestoreThreshold;
     for (label, ctx, d, dual, with_depth) in general_loop_cases() {
         let rect = ctx.dab_rect(&d, dual);
@@ -419,6 +420,7 @@ fn general_loop_rows_match_serially_and_in_parallel() {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn parallel_general_loop_matches_the_frozen_reference() {
+    let _lock = PARALLEL_THRESHOLD_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let _restore = RestoreThreshold;
     set_parallel_min_pixels(0);
     for (label, ctx, d, dual, with_depth) in general_loop_cases() {
@@ -437,6 +439,7 @@ fn parallel_general_loop_matches_the_frozen_reference() {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn general_loop_survives_empty_rects_and_nan_dabs() {
+    let _lock = PARALLEL_THRESHOLD_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let _restore = RestoreThreshold;
     let tip = GrayTile::from_fn(8, 5, |x, y| ((x + y) % 7) as f32 / 6.0);
     let sampled = BrushContext::new(&BrushSettings { tip: TipShape::Sampled(tip), ..Default::default() });
@@ -503,4 +506,14 @@ fn cached_profile_preserves_public_coverage_at_boundaries() {
             }
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn general_loop_parallel_gate_uses_weighted_work() {
+    assert!(!parallel_general(16_383, DEFAULT_PARALLEL_MIN_PIXELS));
+    assert!(parallel_general(16_384, DEFAULT_PARALLEL_MIN_PIXELS));
+    assert!(parallel_general(32_768, DEFAULT_PARALLEL_MIN_PIXELS));
+    assert!(!parallel_general(32_768, 262_144));
+    assert!(parallel_general(usize::MAX, DEFAULT_PARALLEL_MIN_PIXELS));
 }

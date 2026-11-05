@@ -64,6 +64,15 @@ fn parallel(pixels: usize) -> bool {
     pixels >= PARALLEL_MIN_PIXELS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether the more expensive general loop is worth parallelizing at this threshold.
+#[cfg(not(target_arch = "wasm32"))]
+fn parallel_general(pixels: usize, threshold: usize) -> bool {
+    pixels.saturating_mul(GENERAL_LOOP_COST) >= threshold
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) static PARALLEL_THRESHOLD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Tests: the pixel count from which work runs in parallel (`usize::MAX` keeps everything serial).
 /// The static is process-wide, so brush tests on other threads see the change too; that is
 /// harmless, because every stage gives the same pixels serially and in parallel (the point of
@@ -392,7 +401,7 @@ impl BrushContext {
         // plain loop over an inlined row (a closure called from several sites cost a small dab a
         // tenth of its time).
         #[cfg(not(target_arch = "wasm32"))]
-        if parallel(out.len().saturating_mul(GENERAL_LOOP_COST)) {
+        if parallel_general(out.len(), PARALLEL_MIN_PIXELS.load(std::sync::atomic::Ordering::Relaxed)) {
             use rayon::prelude::*;
             if let Some(dp) = depth.as_deref_mut() {
                 out.par_chunks_exact_mut(w).zip(dp.par_chunks_exact_mut(w)).enumerate().for_each(|(yy, (row, drow))| tip.row(yy, row, Some(drow)));
