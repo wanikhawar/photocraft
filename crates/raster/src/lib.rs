@@ -584,8 +584,8 @@ impl Surface {
 
     /// Drops the tiles that are entirely the default pixel, visiting at most `max` tiles in
     /// coordinate order and resuming after them on the next call; returns true when every tile
-    /// has been visited (and so [`Surface::prune`] has nothing left to drop). A `max` of zero
-    /// visits one tile. Tiles added after the scan started are not visited.
+    /// has been visited. A `max` of zero visits one tile. Insertions at or before the last
+    /// visited coordinate are not revisited; later coordinates can be visited until completion.
     pub fn prune_batch(&mut self, cursor: &mut PruneCursor, max: usize) -> bool {
         if cursor.done {
             return true;
