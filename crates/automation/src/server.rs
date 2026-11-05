@@ -1,6 +1,7 @@
 //! The MCP server (rmcp). Tool names use `snake_case` with underscores (dots
 //! are not valid in every client's tool-name grammar).
 
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -183,6 +184,17 @@ pub struct SaveParams {
     /// TIFF: keep the layers (Photoshop layer data). Off by default: a flat TIFF.
     #[serde(default, rename = "tiffLayers")]
     pub tiff_layers: bool,
+    /// TIFF: image compression, "none" (the default), "lzw" or "zip".
+    #[serde(default, rename = "tiffCompression")]
+    pub tiff_compression: Option<String>,
+    /// TIFF: Save Transparency. On keeps the transparency, ahead of any alpha or spot channels;
+    /// off composites the image over white. Unset: kept unless the document has alpha or spot
+    /// channels.
+    #[serde(default, rename = "tiffTransparency")]
+    pub tiff_transparency: Option<bool>,
+    /// TIFF: Save Image Pyramid, half-size copies after the full image.
+    #[serde(default, rename = "tiffPyramid")]
+    pub tiff_pyramid: bool,
     /// TGA: 24 or 32 bits per pixel. 32 writes the alpha channel (or else the transparency) as the
     /// alpha, 24 none. Unset: 32 with an alpha channel or transparency, else 24.
     #[serde(default, rename = "tgaBits")]
@@ -358,11 +370,17 @@ pub struct UiSetParams {
     /// dashes, dashOffset and opacity; null disables the stroke). Shape stroke fields use
     /// `shape.edit` names and units; colour comes from `tools.setColors`. camTransformOnDrop (bool,
     /// the Content-Aware Move tool's Transform On Drop). tileGrid (bool, a developer overlay of the
-    /// active layer's storage tiles). layerFilter (an object patching by ("kind", "name" or
-    /// "mode"), kinds (a list of layer kinds), name (matches part of the layer name) and mode (a
-    /// blend mode name) for the Layers panel filter). strokeTrace (true, false, "stderr" or "off":
-    /// the stroke latency trace at runtime; a CSV file is set at launch with --stroke-trace, not
-    /// over this channel). updatesOpen (bool, the Help › Check for Updates window).
+    /// active layer's storage tiles). layerFilter (an object patching by ("kind", "name", "effect",
+    /// "mode", "attribute", "color", "smartObject" or "artboard", which lists the artboards that
+    /// hold the selected layers), kinds (a list of layer kinds), name (matches part of the layer
+    /// name), effect ("bevelEmboss", "stroke", "innerShadow", "innerGlow", "satin", "overlay",
+    /// "outerGlow" or "dropShadow"), mode (a blend mode name), attribute ("visible", "locked",
+    /// "empty", "linked", "clipped", "layerMask", "vectorMask", "layerEffects",
+    /// "advancedBlending", or "notVisible" … "noAdvancedBlending"), color (a layer colour label,
+    /// or "none") and smart (a list of "linked", "missing" and "embedded") for the Layers panel
+    /// filter). strokeTrace (true, false, "stderr" or "off": the stroke latency trace at runtime; a
+    /// CSV file is set at launch with --stroke-trace, not over this channel). updatesOpen (bool,
+    /// the Help › Check for Updates window).
     /// histogramPanel (an object patching view ("compact", "expanded" or "allChannels"), channel
     /// ("composite", "red", "green", "blue", "cyan", "magenta", "yellow", "black", "a", "b",
     /// "luminosity" or "colors"), showChannelsInColor, showStatistics and source ("entireImage",
@@ -561,8 +579,12 @@ impl PhotocraftMcp {
         Self::with_backend(Backend::Headless(Arc::new(Mutex::new(Headless::new()))))
     }
 
+    pub fn with_headless(headless: Headless) -> Self {
+        Self::with_backend(Backend::Headless(Arc::new(Mutex::new(headless))))
+    }
+
     pub fn headless_with_workspace(workspace: AuthorizedWorkspace) -> Self {
-        Self::with_backend(Backend::Headless(Arc::new(Mutex::new(Headless::with_workspace(workspace)))))
+        Self::with_headless(Headless::with_workspace(workspace))
     }
 
     pub fn bridge(addr: &str, token: &str) -> Result<Self, AutomationError> {
@@ -885,7 +907,17 @@ impl PhotocraftMcp {
     #[tool(description = "Render the flattened document and return it as a PNG image (bridge mode: window screenshot).")]
     async fn doc_render_preview(&self, Parameters(p): Parameters<PreviewParams>) -> Result<CallToolResult, McpError> {
         let max = p.max_side.unwrap_or(1024);
-        if let Some(r) = self.headless_op(move |h| h.render_png(p.index, max)).await {
+        if let Some(r) = self
+            .headless_op(move |h| {
+                let res = h.render_png(p.index, max);
+                for d in h.drain_diagnostics() {
+                    // Ignore a failed stderr write: the completed render must still be returned.
+                    let _ = writeln!(std::io::stderr(), "warning: {d}");
+                }
+                res
+            })
+            .await
+        {
             return Ok(match r {
                 Ok(png) => png_result(&png, format!("flattened preview (max side {max})")),
                 Err(e) => fail(e),
@@ -1122,6 +1154,10 @@ impl PhotocraftMcp {
             Some((_, Some(bits))) => Some(bits),
             Some((b, None)) => return Ok(fail(format!("`dpxBits` must be 8, 10, 12 or 16, got {b}"))),
         };
+        let tiff_compression = match photocraft_engine::file_cmds::tiff_compression_param(&json!({"tiffCompression": p.tiff_compression}), "save") {
+            Ok(c) => c,
+            Err(e) => return Ok(fail(e.to_string())),
+        };
         if let Some(q) = p.quality.filter(|q| !(1..=100).contains(q)) {
             return Ok(fail(format!("`quality` must be a whole number from 1 to 100, got {q}")));
         }
@@ -1133,8 +1169,9 @@ impl PhotocraftMcp {
         if let Some(b) = self.bridge_client() {
             // The bridge forwards to the running app's `app.save`, which takes only an optional
             // path (without one it writes back to the document's own layered file, as headless
-            // does), the Targa bits and the DDS options, so the other options are headless-only. Saying so beats
-            // saving with defaults while the caller believes their quality or format was applied.
+            // does), the Targa bits, the DDS options and the TIFF compression, transparency and
+            // pyramid, so the other options are headless-only. Saying so beats saving with
+            // defaults while the caller believes their quality or format was applied.
             let unsupported: Vec<&str> = [
                 p.format.is_some().then_some("format"),
                 p.quality.is_some().then_some("quality"),
@@ -1162,17 +1199,32 @@ impl PhotocraftMcp {
             if p.dds_mipmaps {
                 params["ddsMipmaps"] = json!(true);
             }
+            // The app's TIFF Options answer, as its Save As takes it.
+            if let Some(c) = &p.tiff_compression {
+                params["tiffCompression"] = json!(c);
+            }
+            if let Some(t) = p.tiff_transparency {
+                params["tiffTransparency"] = json!(t);
+            }
+            if p.tiff_pyramid {
+                params["tiffPyramid"] = json!(true);
+            }
             return to_result(b.call("app.save", params).await);
         }
         let Some(r) = self
             .headless_op(move |h| {
                 let mut opts = photocraft_io::ExportOptions {
                     tiff_layers: p.tiff_layers,
+                    tiff_transparency: p.tiff_transparency,
                     tga_bits,
                     pcraft_full_composite: p.pcraft_full_composite.unwrap_or(false),
                     ..Default::default()
                 };
                 opts.encode.dpx_bits = dpx_bits;
+                if let Some(c) = tiff_compression {
+                    opts.encode.tiff_compression = c;
+                }
+                opts.encode.tiff_pyramid = p.tiff_pyramid;
                 opts.encode.dds = photocraft_io::DdsOptions { compression: dds_compression.unwrap_or_default(), mipmaps: p.dds_mipmaps };
                 if let Some(q) = p.quality {
                     opts.encode.jpeg_quality = q;
@@ -1180,7 +1232,12 @@ impl PhotocraftMcp {
                     opts.encode.webp_lossless = false;
                 }
                 let path = p.path.map(PathBuf::from);
-                h.save(p.index, path.as_deref(), p.format.as_deref(), &opts)
+                let res = h.save(p.index, path.as_deref(), p.format.as_deref(), &opts);
+                for d in h.drain_diagnostics() {
+                    // Ignore a failed stderr write: the completed save must still be returned.
+                    let _ = writeln!(std::io::stderr(), "warning: {d}");
+                }
+                res
             })
             .await
         else {
