@@ -114,10 +114,13 @@ fn import_flat_impl_with_options(
         return Ok(r);
     }
     // A PNG whose rows come in final order is decoded straight into the tiles. A caller's
-    // decoded-pixel allowance (`flat_max_pixel_bytes`) is enforced by the whole-image decoder's
-    // limits, so a capped import takes that path.
+    // decoded-pixel allowance (`flat_max_pixel_bytes`) lowers the same codec limits, which are
+    // checked from the header before the first tile exists, so a capped import streams too.
     let streamed = match stream_min {
-        Some(min) if opts.flat_max_pixel_bytes == 0 && format == Some(Format::Png) => import_png_streamed(name, bytes, ctl, min)?,
+        Some(min) if format == Some(Format::Png) => {
+            let dopts = codecs::DecodeOptions { limits: decode_limits(opts), ..Default::default() };
+            import_png_streamed(name, bytes, &dopts, ctl, min)?
+        }
         _ => None,
     };
     let (mut r, img) = match streamed {
@@ -742,9 +745,10 @@ fn flat_document(
 /// `min_bytes` decoded): an interlaced or animated file, or one whose `eXIf` (which may follow the image data) calls for turning the pixels
 /// upright; the caller then decodes the whole image as for any other format. Errors, limits and
 /// metadata are the whole-image decoder's. The tiles and one group of rows are checked against
-/// free memory before the first tile exists (see [`crate::memory`]).
-fn import_png_streamed(name: &str, bytes: &[u8], ctl: &Interrupt, min_bytes: u64) -> Result<Option<ImportResult>, IoError> {
-    import_png_streamed_with(name, bytes, ctl, min_bytes, crate::memory::available)
+/// free memory before the first tile exists (see [`crate::memory`]). `dopts` carries the codec
+/// limits (dimensions, `max_alloc`), checked from the header before then.
+fn import_png_streamed(name: &str, bytes: &[u8], dopts: &codecs::DecodeOptions, ctl: &Interrupt, min_bytes: u64) -> Result<Option<ImportResult>, IoError> {
+    import_png_streamed_with(name, bytes, dopts, ctl, min_bytes, crate::memory::available)
 }
 
 /// [`import_png_streamed`], with the memory the machine can still use given (see
@@ -752,6 +756,7 @@ fn import_png_streamed(name: &str, bytes: &[u8], ctl: &Interrupt, min_bytes: u64
 fn import_png_streamed_with(
     name: &str,
     bytes: &[u8],
+    dopts: &codecs::DecodeOptions,
     ctl: &Interrupt,
     min_bytes: u64,
     available: impl FnOnce() -> Option<u64>,
@@ -819,7 +824,7 @@ fn import_png_streamed_with(
         ctl.progress(0.02 + 0.53 * (y0 + n) as f32 / h.max(1) as f32);
         Ok(())
     };
-    let Some(extras) = codecs::decode_png_rows::<IoError>(bytes, &codecs::DecodeOptions::default(), TILE_SIZE as u32, &mut begin, &mut rows)? else {
+    let Some(extras) = codecs::decode_png_rows::<IoError>(bytes, dopts, TILE_SIZE as u32, &mut begin, &mut rows)? else {
         return Ok(None);
     };
     ctl.check().map_err(|_| IoError::Cancelled)?;

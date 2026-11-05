@@ -134,7 +134,7 @@ fn forced(bytes: &[u8]) -> Result<ImportResult, IoError> {
 }
 
 fn streamed(bytes: &[u8]) -> Result<Option<ImportResult>, IoError> {
-    import_png_streamed("t", bytes, &Interrupt::NONE, 0)
+    import_png_streamed("t", bytes, &codecs::DecodeOptions::default(), &Interrupt::NONE, 0)
 }
 
 fn assert_same(a: &ImportResult, b: &ImportResult, what: &str) {
@@ -436,15 +436,15 @@ fn progress_is_monotonic_streamed_and_after_a_fallback() {
 fn only_images_of_the_minimum_decoded_size_stream() {
     // 300 x 270 RGB8 decodes to 243000 bytes.
     let bytes = Png::new(300, 270, 2, 8).bytes();
-    let at = |min| import_png_streamed("t", &bytes, &Interrupt::NONE, min).unwrap().is_some();
+    let at = |min| import_png_streamed("t", &bytes, &codecs::DecodeOptions::default(), &Interrupt::NONE, min).unwrap().is_some();
     assert!(at(243_000) && !at(243_001));
     // The size the importer uses by default: this one is far under it, so `import_flat` opens it whole.
     assert!(!at(STREAM_MIN_BYTES));
     assert_same(&import_flat("t", &bytes).unwrap(), &whole(&bytes).unwrap(), "small");
     // 16-bit RGBA is 8 bytes a pixel.
     let wide = Png::new(100, 100, 6, 16).bytes();
-    assert!(import_png_streamed("t", &wide, &Interrupt::NONE, 80_000).unwrap().is_some());
-    assert!(import_png_streamed("t", &wide, &Interrupt::NONE, 80_001).unwrap().is_none());
+    assert!(import_png_streamed("t", &wide, &codecs::DecodeOptions::default(), &Interrupt::NONE, 80_000).unwrap().is_some());
+    assert!(import_png_streamed("t", &wide, &codecs::DecodeOptions::default(), &Interrupt::NONE, 80_001).unwrap().is_none());
 }
 
 /// A failed reservation is one tile or row band, so the error names the image by its pixel
@@ -463,15 +463,15 @@ fn allocation_errors_name_the_image_not_the_reservation() {
 #[test]
 fn a_streamed_png_the_machine_can_not_hold_is_refused_before_any_tile() {
     let bytes = Png::new(400, 300, 6, 8).bytes();
-    match import_png_streamed_with("t", &bytes, &Interrupt::NONE, 0, || Some(0)) {
+    match import_png_streamed_with("t", &bytes, &codecs::DecodeOptions::default(), &Interrupt::NONE, 0, || Some(0)) {
         Err(e) => assert!(e.to_string().contains("not enough memory to open this 400 × 300 px image"), "{e}"),
         Ok(_) => panic!("opened with no free memory"),
     }
     // Unknown free memory is no refusal: the image opens as before.
-    assert!(import_png_streamed_with("t", &bytes, &Interrupt::NONE, 0, || None).unwrap().is_some());
+    assert!(import_png_streamed_with("t", &bytes, &codecs::DecodeOptions::default(), &Interrupt::NONE, 0, || None).unwrap().is_some());
     // A cancelled stream is cancelled, not refused for the memory it would have needed.
     let yes = || true;
-    match import_png_streamed_with("t", &bytes, &Interrupt::cancel_only(&yes), 0, || Some(0)) {
+    match import_png_streamed_with("t", &bytes, &codecs::DecodeOptions::default(), &Interrupt::cancel_only(&yes), 0, || Some(0)) {
         Err(IoError::Cancelled) => {}
         other => panic!("{:?}", other.map(|_| ())),
     }
@@ -491,4 +491,34 @@ fn the_whole_image_path_refuses_tiles_the_machine_can_not_hold() {
     }
     assert!(check_layer_fits(4000, 3000, ChannelLayout::Rgba, CSample::U8, None).is_ok());
     assert!(check_layer_fits(4000, 3000, ChannelLayout::Rgba, CSample::U8, Some(1 << 40)).is_ok());
+}
+
+/// A caller's decoded-pixel cap (`flat_max_pixel_bytes`) is honoured by the stream: an image over
+/// it is refused with the whole-image path's error before any tile exists, and one under it
+/// streams to the same document as the uncapped import.
+#[test]
+fn a_streamed_png_honours_the_callers_pixel_cap() {
+    let bytes = Png::new(400, 300, 2, 8).bytes();
+    let capped = |cap: u64| {
+        let opts = crate::ImportOptions { flat_max_pixel_bytes: cap, ..Default::default() };
+        let stream = import_flat_impl_with_options("t", &bytes, &opts, &Interrupt::NONE, Some(0));
+        let whole = import_flat_impl_with_options("t", &bytes, &opts, &Interrupt::NONE, None);
+        (stream, whole)
+    };
+    let (stream, whole) = capped(100_000);
+    match (stream, whole) {
+        (Err(a), Err(b)) => {
+            assert!(matches!(a, IoError::Codec(codecs::CodecError::LimitExceeded(_))), "{a}");
+            assert_eq!(a.to_string(), b.to_string());
+        }
+        (a, b) => panic!("over the cap: {:?} / {:?}", a.map(|_| ()), b.map(|_| ())),
+    }
+    let (stream, whole) = capped(100_000_000);
+    match (stream, whole) {
+        (Ok(a), Ok(b)) => assert_same(&a, &b, "under the cap"),
+        (a, b) => panic!("under the cap: {:?} / {:?}", a.map(|_| ()), b.map(|_| ())),
+    }
+    // The stream itself reads the limits it is given.
+    let tight = codecs::DecodeOptions { limits: codecs::Limits { max_alloc: 100_000, ..codecs::Limits::default() }, ..Default::default() };
+    assert!(matches!(import_png_streamed("t", &bytes, &tight, &Interrupt::NONE, 0), Err(IoError::Codec(codecs::CodecError::LimitExceeded(_)))));
 }
