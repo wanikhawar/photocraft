@@ -1009,16 +1009,6 @@ fn alloc_error(e: AllocationError, w: u32, h: u32) -> IoError {
     }
 }
 
-/// The error an out-of-memory or oversized surface allocation is reported as.
-fn alloc_error(e: AllocationError) -> IoError {
-    match e {
-        AllocationError::LengthMismatch { .. } => IoError::Unsupported("the decoded image does not match its size".into()),
-        AllocationError::SizeOverflow => IoError::Unsupported("image too large".into()),
-        AllocationError::NotEnoughMemory { .. } => IoError::OutOfMemory("opening this image".into()),
-        AllocationError::ScratchRead(error) => IoError::Unsupported(format!("could not read tile from scratch: {error}")),
-    }
-}
-
 /// `Some(surface)` when the document is exactly one visible, unmasked,
 /// normal, fully opaque raster layer: its pixels can be written natively
 /// (keeping CMYK / depth exactly) instead of going through the compositor.
