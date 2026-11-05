@@ -355,14 +355,22 @@ impl eframe::App for WebShell {
             // Decided now, where the drop landed: on the document's canvas the files are placed
             // as layers (as on the desktop), elsewhere opened.
             let places = self.app.dropped_on_canvas(ctx, &names);
-            let target_doc = self.app.session.active().map(|st| st.doc.id);
-            let files: Vec<_> = dropped.into_iter().zip(names).zip(places).map(|((f, name), place)| (f, name, place, target_doc)).collect();
+            let files: Vec<_> = dropped
+                .into_iter()
+                .zip(names)
+                .zip(places)
+                .map(|((f, name), place)| {
+                    let read = crate::drop_read::captured_read(|| self.app.session.active().map(|st| st.doc.id), async move { f.bytes_async().await });
+                    (read, name, place)
+                })
+                .collect();
             let (inbox, place_inbox) = (self.inbox.clone(), self.place_inbox.clone());
             let ctx = ctx.clone();
             // One after another, so they open or place in the order they were dropped.
             wasm_bindgen_futures::spawn_local(async move {
-                for (f, name, place, target_doc) in files {
-                    match f.bytes_async().await {
+                for (read, name, place) in files {
+                    let (target_doc, result) = read.await;
+                    match result {
                         Ok(bytes) => {
                             if place {
                                 if let Some(doc) = target_doc {
