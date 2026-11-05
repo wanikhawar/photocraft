@@ -65,7 +65,8 @@ impl PlaceSteps {
     fn io_error(&self, e: photocraft_io::IoError) -> EngineError {
         match e {
             photocraft_io::IoError::Cancelled => EngineError::Cancelled,
-            e => EngineError::Other(format!("{}: {e}", self.input.name)),
+            // Typed, as the one-shot place reports it: a refused memory budget keeps its fields.
+            e => crate::error::io_open_error(&self.input.name, e),
         }
     }
 
