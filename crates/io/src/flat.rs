@@ -580,7 +580,9 @@ fn conversion_band_bytes(w: u32, h: u32, layout: ChannelLayout, sample: CSample)
     let row = u64::from(w).saturating_mul(layout.channels() as u64).saturating_mul(sample.bytes() as u64);
     let out_row = u64::from(w).saturating_mul(f.layout.channels() as u64).saturating_mul(f.sample.bytes() as u64);
     let rows = (BAND_BYTES as u64 / row.max(1)).clamp(1, u64::from(h));
-    row.saturating_add(out_row).saturating_mul(rows)
+    // The general conversion also holds normalized input and output f32 planes.
+    let floats = u64::from(w).saturating_mul((layout.channels() + f.layout.channels()) as u64).saturating_mul(4);
+    row.saturating_add(out_row).saturating_add(floats).saturating_mul(rows)
 }
 
 /// Bytes a whole decoded image, its banded conversion and the document built from it need at
@@ -606,7 +608,11 @@ fn streamed_tiff_bytes(w: u32, h: u32, layout: ChannelLayout, sample: CSample, g
     let fmt = PixelFormat::new(f.mode, f.depth, true);
     let in_bpp = (layout.channels() as u64).saturating_mul(sample.bytes() as u64).max(1);
     let group_px = group / in_bpp;
-    surface_bytes(w, h, fmt).saturating_add(group.saturating_mul(3)).saturating_add(group_px.saturating_mul(fmt.bytes_per_pixel() as u64))
+    let floats = group_px.saturating_mul((layout.channels() + f.layout.channels()) as u64).saturating_mul(4);
+    surface_bytes(w, h, fmt)
+        .saturating_add(group.saturating_mul(3))
+        .saturating_add(group_px.saturating_mul(fmt.bytes_per_pixel() as u64))
+        .saturating_add(floats)
 }
 
 /// Bytes a whole-image flat TIFF page needs at its peak before it is decoded: the decoded image
@@ -2086,6 +2092,14 @@ mod flat_working_budget_tests {
                 .expect("within the working allowance");
         assert_eq!((opened.document.mode, opened.document.depth), (ColorMode::Grayscale, SampleType::F32));
         assert_eq!(converted.get(), 1, "the admitted image converts exactly once");
+    }
+
+    #[test]
+    fn conversion_accounting_includes_float_intermediates() {
+        let pixels = 16 * 8;
+        let bytes = conversion_band_bytes(16, 8, ChannelLayout::Gray, CSample::F16);
+        // Input, GrayA output, and both normalized input and output planes.
+        assert!(bytes >= pixels * (2 + 8 + 4 + 8));
     }
 
     fn encoded_tiff(img: &Image) -> Vec<u8> {

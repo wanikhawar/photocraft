@@ -651,16 +651,21 @@ fn apply_photometric(rois: &mut [RoiImage], fmt: PixelFormat, geometry: Option<B
 }
 
 /// Per-image seam weights (1 inside an image's seam region, else 0) over each ROI.
-fn compute_seam_weights(rois: &[RoiImage], canvas: Rect, order: &[usize]) -> Vec<Vec<f32>> {
+fn compute_seam_weights(rois: &[RoiImage], canvas: Rect, order: &[usize]) -> Result<Vec<Vec<f32>>> {
     let n = rois.len();
     // Seams on a ≤ 1000 px grid.
     let (cw, chh) = (canvas.width().max(1) as usize, canvas.height().max(1) as usize);
     let s = cw.max(chh).div_ceil(1000).max(1);
     let (gw, gh) = (cw.div_ceil(s), chh.div_ceil(s));
-    let mut luma = vec![vec![0.0f32; gw * gh]; n];
-    let mut cover = vec![vec![false; gw * gh]; n];
+    let cells = gw.checked_mul(gh).ok_or_else(|| crate::allocation::error("seam weights", "grid size overflowed"))?;
+    let mut luma = crate::allocation::capacity(n, "seam luminance")?;
+    let mut cover = crate::allocation::capacity(n, "seam coverage")?;
+    for _ in 0..n {
+        luma.push(crate::allocation::filled(cells, 0.0f32, "seam luminance")?);
+        cover.push(crate::allocation::filled(cells, false, "seam coverage")?);
+    }
     for (i, roi) in rois.iter().enumerate() {
-        let mut acc = vec![(0.0f32, 0.0f32, 0u32); gw * gh];
+        let mut acc = crate::allocation::filled(cells, (0.0f32, 0.0f32, 0u32), "seam accumulator")?;
         for y in 0..roi.h {
             for x in 0..roi.w {
                 let (u, v) = ((roi.x0 - canvas.x0) as usize + x, (roi.y0 - canvas.y0) as usize + y);
@@ -684,7 +689,7 @@ fn compute_seam_weights(rois: &[RoiImage], canvas: Rect, order: &[usize]) -> Vec
     // Full-resolution weights: the seam label, falling back to the earliest covering image in
     // `order` where the label's image doesn't cover the pixel.
     let rank: Vec<usize> = {
-        let mut r = vec![usize::MAX; n];
+        let mut r = crate::allocation::filled(n, usize::MAX, "seam order")?;
         for (k, &i) in order.iter().enumerate() {
             r[i] = k;
         }
@@ -695,40 +700,43 @@ fn compute_seam_weights(rois: &[RoiImage], canvas: Rect, order: &[usize]) -> Vec
         let (lx, ly) = (x - r.x0, y - r.y0);
         if lx < 0 || ly < 0 || lx as usize >= r.w || ly as usize >= r.h { 0.0 } else { r.alpha[ly as usize * r.w + lx as usize] }
     };
-    rois.iter()
-        .enumerate()
-        .map(|(i, roi)| {
-            (0..roi.w * roi.h)
-                .map(|k| {
-                    let (x, y) = (roi.x0 + (k % roi.w) as i32, roi.y0 + (k / roi.w) as i32);
-                    if roi.alpha[k] < 0.5 {
-                        return 0.0;
-                    }
-                    let (u, v) = ((x - canvas.x0) as usize, (y - canvas.y0) as usize);
-                    let lab = labels[(v / s).min(gh - 1) * gw + (u / s).min(gw - 1)];
-                    if lab == i as i32 {
-                        return 1.0;
-                    }
-                    if lab >= 0 && alpha_at(lab as usize, x, y) >= 0.5 {
-                        return 0.0;
-                    }
-                    // Fallback: the earliest covering image wins.
-                    let first = (0..n).filter(|&j| alpha_at(j, x, y) >= 0.5).min_by_key(|&j| rank[j]);
-                    if first == Some(i) { 1.0 } else { 0.0 }
-                })
-                .collect()
-        })
-        .collect()
+    let mut weights = crate::allocation::capacity(n, "seam weights")?;
+    for (i, roi) in rois.iter().enumerate() {
+        let len = roi.w.checked_mul(roi.h).ok_or_else(|| crate::allocation::error("seam weights", "ROI size overflowed"))?;
+        let mut weight = crate::allocation::capacity(len, "seam weights")?;
+        for k in 0..len {
+            weight.push((|| {
+                let (x, y) = (roi.x0 + (k % roi.w) as i32, roi.y0 + (k / roi.w) as i32);
+                if roi.alpha[k] < 0.5 {
+                    return 0.0;
+                }
+                let (u, v) = ((x - canvas.x0) as usize, (y - canvas.y0) as usize);
+                let lab = labels[(v / s).min(gh - 1) * gw + (u / s).min(gw - 1)];
+                if lab == i as i32 {
+                    return 1.0;
+                }
+                if lab >= 0 && alpha_at(lab as usize, x, y) >= 0.5 {
+                    return 0.0;
+                }
+                // Fallback: the earliest covering image wins.
+                let first = (0..n).filter(|&j| alpha_at(j, x, y) >= 0.5).min_by_key(|&j| rank[j]);
+                if first == Some(i) { 1.0 } else { 0.0 }
+            })());
+        }
+        weights.push(weight);
+    }
+    Ok(weights)
 }
 
 /// The blended composite over `canvas`, its alpha the coverage.
-fn build_composite(canvas: Rect, fmt: PixelFormat, blend: &[f32], cov: &[f32]) -> Surface {
+fn build_composite(canvas: Rect, fmt: PixelFormat, blend: &[f32], cov: &[f32]) -> Result<Surface> {
     let (cw, chh) = (canvas.width().max(1) as usize, canvas.height().max(1) as usize);
     let cc = fmt.mode.color_channels();
     let nch = fmt.channels();
     let mut composite = Surface::new(fmt);
     if cw > 0 && chh > 0 {
-        let mut row_comp = vec![0.0f32; cw * nch];
+        let row_len = cw.checked_mul(nch).ok_or_else(|| crate::allocation::error("composite row", "row size overflowed"))?;
+        let mut row_comp = crate::allocation::filled(row_len, 0.0f32, "composite row")?;
         for y in 0..chh {
             for x in 0..cw {
                 let i = y * cw + x;
@@ -739,11 +747,11 @@ fn build_composite(canvas: Rect, fmt: PixelFormat, blend: &[f32], cov: &[f32]) -
                 row_comp[x * nch + nch - 1] = cov[i];
             }
             let row_area = Rect::new(canvas.x0, canvas.y0 + y as i32, canvas.x1, canvas.y0 + y as i32 + 1);
-            composite.write_region(row_area, &row_comp);
+            composite.try_write_region(row_area, &row_comp).map_err(|e| crate::allocation::error("composite surface", &e.to_string()))?;
         }
         composite.prune();
     }
-    composite
+    Ok(composite)
 }
 
 /// Per input, its pixels (blended inside its seam region when `seamless`) and its seam mask.
@@ -759,7 +767,7 @@ fn build_layers(
     let cw = canvas.width().max(1) as usize;
     let cc = fmt.mode.color_channels();
     let nch = fmt.channels();
-    let mut layers = Vec::with_capacity(rois.len());
+    let mut layers = crate::allocation::capacity(rois.len(), "blend layers")?;
     for (roi, wt) in rois.iter().zip(weights) {
         if let Some(check) = check_cancel {
             check()?;
@@ -768,8 +776,9 @@ fn build_layers(
         let mut ls = Surface::new(fmt);
         let mut ms = Surface::with_default(PixelFormat::GRAY8, &[0.0]);
         if !area.is_empty() && roi.w > 0 && roi.h > 0 {
-            let mut row_px = vec![0.0f32; roi.w * nch];
-            let mut row_mask = vec![0.0f32; roi.w];
+            let row_len = roi.w.checked_mul(nch).ok_or_else(|| crate::allocation::error("blend row", "row size overflowed"))?;
+            let mut row_px = crate::allocation::filled(row_len, 0.0f32, "blend row")?;
+            let mut row_mask = crate::allocation::filled(roi.w, 0.0f32, "blend mask row")?;
             for y in 0..roi.h {
                 let v = (roi.y0 - canvas.y0) as usize + y;
                 for x in 0..roi.w {
@@ -784,8 +793,8 @@ fn build_layers(
                     row_mask[x] = wt[k];
                 }
                 let row_area = Rect::new(roi.x0, roi.y0 + y as i32, roi.x0 + roi.w as i32, roi.y0 + y as i32 + 1);
-                ls.write_region(row_area, &row_px);
-                ms.write_region(row_area, &row_mask);
+                ls.try_write_region(row_area, &row_px).map_err(|e| crate::allocation::error("blend layer", &e.to_string()))?;
+                ms.try_write_region(row_area, &row_mask).map_err(|e| crate::allocation::error("blend mask", &e.to_string()))?;
             }
         }
         ls.prune();
@@ -806,7 +815,7 @@ pub(crate) fn seam_blend(
 ) -> Result<Blended> {
     let n = warped.len();
     let fmt = warped.first().map_or(PixelFormat::RGBA8, Surface::format);
-    let mut rois: Vec<RoiImage> = Vec::with_capacity(n);
+    let mut rois: Vec<RoiImage> = crate::allocation::capacity(n, "blend ROIs")?;
     for s in warped {
         if let Some(check) = check_cancel {
             check()?;
@@ -819,7 +828,7 @@ pub(crate) fn seam_blend(
         }
     }
     let (gains, vignette) = apply_photometric(&mut rois, fmt, opt.geometry, opt.seamless, opt.gains);
-    let weights = compute_seam_weights(&rois, canvas, order);
+    let weights = compute_seam_weights(&rois, canvas, order)?;
     // Shift ROIs to canvas-relative coordinates for the blend, and back after: a shifted copy
     // would hold every source's pixels twice (#7758).
     for r in &mut rois {
@@ -840,7 +849,7 @@ pub(crate) fn seam_blend(
     if let Some(check) = check_cancel {
         check()?;
     }
-    let composite = build_composite(canvas, fmt, &blend, &cov);
+    let composite = build_composite(canvas, fmt, &blend, &cov)?;
     let layers = build_layers(&rois, &weights, canvas, fmt, &blend, opt.seamless, check_cancel)?;
     Ok(Blended { layers, composite, gains, vignette })
 }
@@ -978,7 +987,7 @@ fn photomerge(s: &mut Session, p: &Value) -> Result<Value> {
                 ctx.check()?;
                 if fill {
                     ctx.progress(0.85, "Photomerge: filling edges");
-                    let filled = content_aware_fill(&b.composite, canvas);
+                    let filled = content_aware_fill(&b.composite, canvas)?;
                     doc.layers.push(Layer::new("Content-Aware Fill", LayerContent::Raster(filled)));
                 }
             } else {
@@ -1018,7 +1027,7 @@ fn photomerge(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// Fills the transparent areas of a composite (inside its bounding rectangle) with
 /// content-aware fill, at a reduced scale for large panoramas.
-fn content_aware_fill(comp: &Surface, canvas: Rect) -> Surface {
+fn content_aware_fill(comp: &Surface, canvas: Rect) -> Result<Surface> {
     use photocraft_algo::content_aware::{FillOptions, fill};
     let fmt = comp.format();
     let n = fmt.channels();
@@ -1026,12 +1035,14 @@ fn content_aware_fill(comp: &Surface, canvas: Rect) -> Surface {
     let k = ((w * h) as f64 / 1.5e6).sqrt().ceil().max(1.0) as usize;
     let (sw, sh) = (w.div_ceil(k), h.div_ceil(k));
     let cc = n - 1;
-    let mut small = vec![0.0f32; sw * sh * cc];
-    let mut hole = vec![false; sw * sh];
-    let mut acc_a = vec![0.0f32; sw * sh];
-    let mut cnt = vec![0.0f32; sw * sh];
+    let cells = sw.checked_mul(sh).ok_or_else(|| crate::allocation::error("content-aware fill", "grid size overflowed"))?;
+    let samples = cells.checked_mul(cc).ok_or_else(|| crate::allocation::error("content-aware fill", "sample size overflowed"))?;
+    let mut small = crate::allocation::filled(samples, 0.0f32, "fill pixels")?;
+    let mut hole = crate::allocation::filled(cells, false, "fill holes")?;
+    let mut acc_a = crate::allocation::filled(cells, 0.0f32, "fill alpha")?;
+    let mut cnt = crate::allocation::filled(cells, 0.0f32, "fill counts")?;
     for y in 0..h {
-        let row = comp.read_region(Rect::new(canvas.x0, canvas.y0 + y as i32, canvas.x1, canvas.y0 + y as i32 + 1));
+        let row = crate::allocation::read_region(comp, Rect::new(canvas.x0, canvas.y0 + y as i32, canvas.x1, canvas.y0 + y as i32 + 1), "fill row")?;
         for x in 0..w {
             let i = (y / k) * sw + x / k;
             let px = &row[x * n..(x + 1) * n];
@@ -1050,13 +1061,15 @@ fn content_aware_fill(comp: &Surface, canvas: Rect) -> Surface {
         }
         hole[i] = a / cnt[i].max(1.0) < 0.99;
     }
-    let source: Vec<bool> = hole.iter().map(|h| !h).collect();
+    let mut source = crate::allocation::capacity(cells, "fill source")?;
+    source.extend(hole.iter().map(|h| !h));
     let filled = fill(sw, sh, cc, &small, &hole, &source, &FillOptions::default());
     let mut s = Surface::new(fmt);
     for y in 0..h {
         let area = Rect::new(canvas.x0, canvas.y0 + y as i32, canvas.x1, canvas.y0 + y as i32 + 1);
-        let full = comp.read_region(area);
-        let mut out = vec![0.0f32; w * n];
+        let full = crate::allocation::read_region(comp, area, "fill row")?;
+        let row_len = w.checked_mul(n).ok_or_else(|| crate::allocation::error("fill row", "row size overflowed"))?;
+        let mut out = crate::allocation::filled(row_len, 0.0f32, "fill row")?;
         for x in 0..w {
             let o = x * n;
             let a = full[o + cc];
@@ -1075,10 +1088,10 @@ fn content_aware_fill(comp: &Surface, canvas: Rect) -> Surface {
             }
             out[o + cc] = 1.0;
         }
-        s.write_region(area, &out);
+        s.try_write_region(area, &out).map_err(|e| crate::allocation::error("fill surface", &e.to_string()))?;
     }
     s.prune();
-    s
+    Ok(s)
 }
 
 // ---------- Merge to HDR Pro ----------

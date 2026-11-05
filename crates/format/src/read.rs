@@ -108,7 +108,7 @@ fn read_all_with(reader: &mut impl Read, size_hint: u64, chunk: usize, max: u64)
                 return Err(too_large(max));
             }
             let room = max.saturating_sub(buf.len() as u64).min(usize::MAX as u64) as usize;
-            buf.try_reserve(n.max(chunk).min(room)).map_err(|_| out_of_memory(needed))?;
+            buf.try_reserve_exact(n.max(chunk).min(room)).map_err(|_| out_of_memory(needed))?;
             buf.extend_from_slice(&probe[..n]);
         }
         let room = u64::try_from((buf.capacity() - buf.len()).min(chunk)).unwrap_or(u64::MAX);

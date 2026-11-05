@@ -731,3 +731,12 @@ fn merge_to_hdr_pro_accepts_sources_without_the_photomerge_budget() {
     assert_eq!(srcs.len(), 2);
     assert_eq!(fmt, PixelFormat::RGBA8);
 }
+
+#[test]
+fn seam_and_fill_allocation_failures_are_reported() {
+    crate::allocation::fail_next_for_test();
+    assert!(compute_seam_weights(&[], Rect::new(0, 0, 1, 1), &[]).is_err());
+    let surface = Surface::new(PixelFormat::RGBA8);
+    crate::allocation::fail_next_for_test();
+    assert!(content_aware_fill(&surface, Rect::new(0, 0, 1, 1)).is_err());
+}
