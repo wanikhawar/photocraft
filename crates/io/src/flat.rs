@@ -2512,13 +2512,18 @@ mod fused_tile_tests {
     }
 
     #[test]
-    fn truncated_files_still_fail_or_warn_without_panicking() {
+    fn truncated_image_data_fails_but_missing_iend_tail_keeps_pixels() {
         let png = codecs::encode(&pixels(40, 40, false), Format::Png, &codecs::EncodeOptions::default()).unwrap();
         let jpeg = codecs::encode(&pixels(40, 40, false), Format::Jpeg, &codecs::EncodeOptions::default()).unwrap();
         assert!(import_flat("t", png.get(..20).unwrap_or_default()).is_err(), "header-only PNG");
         assert!(import_flat("t", jpeg.get(..8).unwrap_or_default()).is_err(), "short JPEG");
-        for cut in [png.len() / 2, png.len() - 5] {
-            let _ = import_flat("t", png.get(..cut).unwrap_or_default());
-        }
+        let idat = png.windows(4).position(|chunk| chunk == b"IDAT").unwrap();
+        let idat_len = u32::from_be_bytes(png[idat - 4..idat].try_into().unwrap()) as usize;
+        assert!(idat_len > 1);
+        let idat_cut = idat + 4 + idat_len / 2;
+        assert!(import_flat("t", &png[..idat_cut]).is_err(), "truncated IDAT");
+        let full = import_flat("t", &png).unwrap();
+        let tail_cut = import_flat("t", &png[..png.len() - 5]).unwrap();
+        assert_eq!(doc_pixels(&tail_cut), doc_pixels(&full), "truncated IEND tail");
     }
 }
