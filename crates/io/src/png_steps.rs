@@ -3,10 +3,10 @@
 
 use std::sync::Arc;
 
-use photocraft_codecs::{self as codecs, DecodeOptions, Format, Limits, PngDecodeRows, SharedBytes};
+use photocraft_codecs::{self as codecs, DecodeOptions, Format, PngDecodeRows, SharedBytes};
 
 use crate::flat::FlatBuilder;
-use crate::{ImportResult, IoError, Route};
+use crate::{ImportOptions, ImportResult, IoError, Route};
 
 enum Stage {
     Rows(Box<PngDecodeRows<SharedBytes>>),
@@ -19,6 +19,9 @@ enum Stage {
 pub struct PngImport {
     name: String,
     bytes: Arc<Vec<u8>>,
+    /// The decode options the import's limits give, as [`crate::import_with_options_and_interrupt`]
+    /// decodes a plain image.
+    options: DecodeOptions,
     stage: Stage,
 }
 
@@ -27,11 +30,18 @@ impl PngImport {
     /// which reads the header and refuses what the import refuses; `None` for any other file,
     /// which only [`crate::import_with_options_and_interrupt`] reads. The decoder shares `bytes`.
     pub fn new(name: &str, bytes: &Arc<Vec<u8>>) -> Result<Option<Self>, IoError> {
+        Self::new_with_options(name, bytes, &ImportOptions::default())
+    }
+
+    /// [`PngImport::new`] with the caller's import settings, whose decoded-pixel allowance lowers
+    /// the decoder's limits as it does for [`crate::import_with_options_and_interrupt`].
+    pub fn new_with_options(name: &str, bytes: &Arc<Vec<u8>>, opts: &ImportOptions) -> Result<Option<Self>, IoError> {
         if crate::route(name, bytes) != Route::Flat || codecs::detect(bytes) != Some(Format::Png) {
             return Ok(None);
         }
-        let rows = PngDecodeRows::new(SharedBytes(Arc::clone(bytes)), &Limits::default())?;
-        Ok(Some(Self { name: name.to_string(), bytes: Arc::clone(bytes), stage: Stage::Rows(Box::new(rows)) }))
+        let options = DecodeOptions { limits: crate::flat::decode_limits(opts), ..Default::default() };
+        let rows = PngDecodeRows::new(SharedBytes(Arc::clone(bytes)), &options.limits)?;
+        Ok(Some(Self { name: name.to_string(), bytes: Arc::clone(bytes), options, stage: Stage::Rows(Box::new(rows)) }))
     }
 
     /// How much of the import is done, `0.0..=1.0`.
@@ -51,7 +61,7 @@ impl PngImport {
                 self.stage = match rows.step(more)? {
                     Some(img) => {
                         // The resolution, upright orientation and final limit checks `decode` does.
-                        let img = codecs::finish_png_decode(img, &DecodeOptions::default())?;
+                        let img = codecs::finish_png_decode(img, &self.options)?;
                         Stage::Build(Box::new(FlatBuilder::new(&self.name, img)))
                     }
                     None => Stage::Rows(rows),

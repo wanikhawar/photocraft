@@ -67,7 +67,7 @@ impl PlaceSteps {
     fn io_error(&self, e: photocraft_io::IoError) -> EngineError {
         match e {
             photocraft_io::IoError::Cancelled => EngineError::Cancelled,
-            e => EngineError::Other(format!("{}: {e}", self.input.name)),
+            e => crate::error::io_open_error(&self.input.name, e),
         }
     }
 
@@ -76,7 +76,7 @@ impl PlaceSteps {
         match std::mem::replace(&mut self.stage, Stage::Spent) {
             Stage::Decode => {
                 let input = &self.input;
-                let png = if self.fine { PngImport::new(&input.name, &input.bytes).map_err(|e| self.io_error(e))? } else { None };
+                let png = if self.fine { PngImport::new_with_options(&input.name, &input.bytes, &input.opts).map_err(|e| self.io_error(e))? } else { None };
                 match png {
                     Some(png) => self.stage = Stage::DecodePng(Box::new(png)),
                     None => {
