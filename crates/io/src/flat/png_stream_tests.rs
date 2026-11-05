@@ -327,6 +327,39 @@ fn an_orientation_after_the_image_data_falls_back_to_the_upright_whole_image() {
     assert_streams(&Png::new(300, 20, 2, 8).after(exif(1)).bytes(), "orientation 1");
 }
 
+/// An orientation known before the image data (an `eXIf` ahead of `IDAT`) is refused up front:
+/// no header or row is handed over, so the rows are never read twice, and the file opens
+/// upright exactly as the whole-image path opens it.
+#[test]
+fn an_orientation_before_the_image_data_falls_back_without_reading_rows() {
+    for o in [3u8, 6, 8] {
+        let bytes = Png::new(300, 20, 2, 8).before(exif(o)).bytes();
+        let touched = AtomicU32::new(0);
+        let r = codecs::decode_png_rows::<codecs::CodecError>(
+            &bytes,
+            &codecs::DecodeOptions::default(),
+            TILE_SIZE as u32,
+            &mut |_| {
+                touched.fetch_add(1, Ordering::Relaxed);
+                Ok(true)
+            },
+            &mut |_, _| {
+                touched.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        );
+        assert!(matches!(r, Ok(None)), "orientation {o}");
+        assert_eq!(touched.load(Ordering::Relaxed), 0, "orientation {o}: rows were read before the fallback");
+        assert!(streamed(&bytes).unwrap().is_none(), "orientation {o}");
+        let got = forced(&bytes).unwrap();
+        assert_same(&got, &whole(&bytes).unwrap(), "oriented before the image data");
+        let want = if o == 3 { (300, 20) } else { (20, 300) };
+        assert_eq!((got.document.size.width, got.document.size.height), want, "orientation {o}");
+    }
+    // Orientation 1 ahead of the image data still streams.
+    assert_streams(&Png::new(300, 20, 2, 8).before(exif(1)).bytes(), "orientation 1 before the image data");
+}
+
 #[test]
 fn damaged_files_fail_or_open_exactly_as_with_the_whole_image() {
     let png = Png::new(300, 600, 6, 8);
@@ -447,15 +480,16 @@ fn only_images_of_the_minimum_decoded_size_stream() {
     assert!(import_png_streamed("t", &wide, &Interrupt::NONE, 80_001).unwrap().is_none());
 }
 
-/// A failed reservation is one tile or row band, so the error names the image by its pixel
-/// size, never by the bytes of that reservation (which read as a tiny "0 MB image").
+/// A failed reservation is one tile or row band, not the image, so the error never quotes the
+/// bytes of that reservation as if they were the image's size (they read as a tiny "0 MB image").
 #[test]
-fn allocation_errors_name_the_image_not_the_reservation() {
-    let oom = alloc_error(AllocationError::NotEnoughMemory { bytes: 4096 }, 8000, 6000).to_string();
-    assert!(oom.contains("not enough memory to open the 8000×6000 image"), "{oom}");
-    assert!(!oom.contains("MB"), "{oom}");
-    let overflow = alloc_error(AllocationError::SizeOverflow, 70000, 70000).to_string();
-    assert!(overflow.contains("70000×70000 image is too large"), "{overflow}");
+fn allocation_errors_do_not_quote_the_reservation_as_the_image_size() {
+    let oom = alloc_error(AllocationError::NotEnoughMemory { bytes: 4096 });
+    assert!(matches!(oom, IoError::OutOfMemory(_)), "{oom}");
+    let text = oom.to_string();
+    assert!(!text.contains("4096") && !text.contains("MB") && !text.contains("KB"), "{text}");
+    let overflow = alloc_error(AllocationError::SizeOverflow).to_string();
+    assert!(overflow.contains("too large"), "{overflow}");
 }
 
 /// The stream asks the machine before it allocates the first tile: an image that can't fit is
@@ -463,15 +497,15 @@ fn allocation_errors_name_the_image_not_the_reservation() {
 #[test]
 fn a_streamed_png_the_machine_can_not_hold_is_refused_before_any_tile() {
     let bytes = Png::new(400, 300, 6, 8).bytes();
-    match import_png_streamed_with("t", &bytes, &Interrupt::NONE, 0, || Some(0)) {
+    match import_png_streamed_with("t", &bytes, &Interrupt::NONE, 0, &codecs::Limits::default(), || Some(0)) {
         Err(e) => assert!(e.to_string().contains("not enough memory to open this 400 × 300 px image"), "{e}"),
         Ok(_) => panic!("opened with no free memory"),
     }
     // Unknown free memory is no refusal: the image opens as before.
-    assert!(import_png_streamed_with("t", &bytes, &Interrupt::NONE, 0, || None).unwrap().is_some());
+    assert!(import_png_streamed_with("t", &bytes, &Interrupt::NONE, 0, &codecs::Limits::default(), || None).unwrap().is_some());
     // A cancelled stream is cancelled, not refused for the memory it would have needed.
     let yes = || true;
-    match import_png_streamed_with("t", &bytes, &Interrupt::cancel_only(&yes), 0, || Some(0)) {
+    match import_png_streamed_with("t", &bytes, &Interrupt::cancel_only(&yes), 0, &codecs::Limits::default(), || Some(0)) {
         Err(IoError::Cancelled) => {}
         other => panic!("{:?}", other.map(|_| ())),
     }
