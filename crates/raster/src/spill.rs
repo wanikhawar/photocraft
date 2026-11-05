@@ -507,13 +507,7 @@ fn no_room(dir: &Path, cap: Option<u64>) -> String {
 /// prefix. `None` if unknown, which disables only the free-space check, not spilling.
 #[cfg(not(target_arch = "wasm32"))]
 fn free_space(dir: &Path) -> Option<(u64, u64)> {
-    let mut dir = std::fs::canonicalize(dir).ok()?;
-    // Only on Windows: `\\?\C:\x` is a legal file name on Unix.
-    if cfg!(windows)
-        && let Some(plain) = dir.to_str().and_then(without_verbatim_prefix)
-    {
-        dir = std::path::PathBuf::from(plain);
-    }
+    let dir = std::fs::canonicalize(dir).ok()?;
     let disks = sysinfo::Disks::new_with_refreshed_list_specifics(sysinfo::DiskRefreshKind::nothing().with_storage()).ok()?;
     disks.iter().filter(|d| dir.starts_with(d.mount_point())).max_by_key(|d| d.mount_point().as_os_str().len()).map(|d| (d.available_space(), d.total_space()))
 }
@@ -522,6 +516,7 @@ fn free_space(dir: &Path) -> Option<(u64, u64)> {
 /// or `None` to keep the path as is. `canonicalize` returns verbatim paths, whose prefix never
 /// compares equal to the plain prefix of a disk's mount point.
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
 fn without_verbatim_prefix(path: &str) -> Option<String> {
     let rest = path.strip_prefix(r"\\?\")?;
     if let Some(unc) = rest.strip_prefix(r"UNC\") {
