@@ -1161,6 +1161,16 @@ fn selective_color_dialog_folds_the_single_colour_form_into_the_rows() {
 }
 
 #[test]
+fn selective_color_dialog_folds_a_relative_flag_into_the_method() {
+    let (mut h, id) = selective_dialog();
+    set_field(&mut h, id, "method", json!("absolute"));
+    set_field(&mut h, id, "relative", json!(true));
+    h.run_steps(3);
+    assert_eq!(field(&h, id, "relative"), Value::Null, "relative folded");
+    assert_eq!(field(&h, id, "method"), json!("relative"));
+}
+
+#[test]
 fn selective_color_open_last_restores_every_row_and_the_method() {
     let mut app = selective_app();
     let id = open(&mut app, SELECTIVE).unwrap();

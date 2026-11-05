@@ -44,6 +44,15 @@ pub(super) fn selective_color(ui: &mut egui::Ui, v: &mut Value, cx: &EditorCx) -
         *v = folded;
         e.changed = true;
     }
+    // The engine reads `relative` after `method`. Keep only `method`, so the buttons match the
+    // applied value.
+    if let Some(relative) = v.get("relative").and_then(Value::as_bool)
+        && let Some(o) = v.as_object_mut()
+    {
+        o.insert("method".into(), json!(if relative { "relative" } else { "absolute" }));
+        o.remove("relative");
+        e.changed = true;
+    }
     let range = selected_range(ui, v, cx);
     let mut picked = range;
     ui.horizontal(|ui| {
