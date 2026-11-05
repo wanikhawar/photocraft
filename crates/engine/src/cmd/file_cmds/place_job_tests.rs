@@ -448,7 +448,7 @@ fn a_banded_flatten_equals_flattened_checked() {
         let doc = photocraft_io::import("src.png", bytes).unwrap().document;
         for fmt in formats {
             let expected = flattened_checked(&doc, fmt, "file.place").unwrap();
-            let mut flatten = Flatten::new(doc.clone(), true, fmt).unwrap();
+            let mut flatten = Flatten::new(doc.clone(), true, fmt, "file.placeEmbedded").unwrap();
             let mut bands = 0;
             let got = loop {
                 bands += 1;
@@ -459,7 +459,7 @@ fn a_banded_flatten_equals_flattened_checked() {
             assert!(bands > 1, "{}x{}: {bands} bands", doc.size.width, doc.size.height);
             assert!(got == expected, "{}x{} {:?} {:?}: banded != whole", doc.size.width, doc.size.height, doc.mode, fmt);
             // Not banded is the plain flatten.
-            let whole = Flatten::new(doc.clone(), false, fmt).unwrap().advance().unwrap().unwrap();
+            let whole = Flatten::new(doc.clone(), false, fmt, "file.placeEmbedded").unwrap().advance().unwrap().unwrap();
             assert!(whole == expected);
         }
     }
@@ -476,7 +476,7 @@ fn a_banded_flatten_of_a_palette_image_equals_flattened_checked() {
     assert!(doc.color_table.is_some());
     let fmt = doc.pixel_format();
     let expected = flattened_checked(&doc, fmt, "file.place").unwrap();
-    let mut flatten = Flatten::new(doc, true, fmt).unwrap();
+    let mut flatten = Flatten::new(doc, true, fmt, "file.placeEmbedded").unwrap();
     let got = loop {
         if let Some(px) = flatten.advance().unwrap() {
             break px;
@@ -491,5 +491,9 @@ fn a_banded_flatten_keeps_the_size_limit() {
     use super::place_steps::Flatten;
     let doc = Document::new("huge", photocraft_geom::Size::new(40_000, 40_000), photocraft_color::ColorMode::Rgb, photocraft_color::SampleType::U8);
     let fmt = doc.pixel_format();
-    assert!(Flatten::new(doc, true, fmt).is_err());
+    for cmd in ["file.placeEmbedded", "file.placeLinked"] {
+        for banded in [true, false] {
+            assert!(matches!(Flatten::new(doc.clone(), banded, fmt, cmd), Err(EngineError::BadParams { cmd: actual, .. }) if actual == cmd));
+        }
+    }
 }

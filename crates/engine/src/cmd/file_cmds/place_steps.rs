@@ -75,7 +75,7 @@ impl PlaceSteps {
         match std::mem::replace(&mut self.stage, Stage::Spent) {
             Stage::Decode => {
                 let input = &self.input;
-                let png = if self.fine { PngImport::new(&input.name, &input.bytes).map_err(|e| self.io_error(e))? } else { None };
+                let png = if self.fine { PngImport::with_options(&input.name, &input.bytes, &input.opts).map_err(|e| self.io_error(e))? } else { None };
                 match png {
                     Some(png) => self.stage = Stage::DecodePng(Box::new(png)),
                     None => {
@@ -149,7 +149,7 @@ impl PlaceSteps {
             return Ok(());
         }
         ctx.progress(0.6, "Flattening");
-        self.stage = Stage::Flatten(Box::new(Flatten::new(src, banded && self.fine, self.input.fmt)?));
+        self.stage = Stage::Flatten(Box::new(Flatten::new(src, banded && self.fine, self.input.fmt, self.input.command())?));
         Ok(())
     }
 
@@ -289,6 +289,7 @@ impl Translation {
 /// The decoded document being flattened to the surface it is resized from.
 pub(super) struct Flatten {
     doc: Document,
+    cmd: &'static str,
     fmt: photocraft_color::PixelFormat,
     /// Flatten band by band; otherwise in one go.
     banded: bool,
@@ -301,14 +302,14 @@ pub(super) struct Flatten {
 }
 
 impl Flatten {
-    pub(super) fn new(doc: Document, banded: bool, fmt: photocraft_color::PixelFormat) -> Result<Self> {
-        check_flatten_size(&doc, "file.place")?;
+    pub(super) fn new(doc: Document, banded: bool, fmt: photocraft_color::PixelFormat, cmd: &'static str) -> Result<Self> {
+        check_flatten_size(&doc, cmd)?;
         let bounds = doc.bounds();
         // Bands hold whole tiles, so each tile is written by one band and can move as it is. A
         // document that does not start on the tile grid (none does) flattens in one go.
         let banded = banded && bounds.x0.rem_euclid(TILE_SIZE) == 0 && bounds.y0.rem_euclid(TILE_SIZE) == 0;
         let cols = i32::try_from(BAND_PIXELS / i64::from(TILE_SIZE) / i64::from(TILE_SIZE)).unwrap_or(1).max(1) * TILE_SIZE;
-        Ok(Self { doc, fmt, banded, bounds, at: (bounds.x0, bounds.y0), cols, out: None })
+        Ok(Self { doc, cmd, fmt, banded, bounds, at: (bounds.x0, bounds.y0), cols, out: None })
     }
 
     /// How much of the flatten is done, `0.0..=1.0`.
@@ -321,7 +322,7 @@ impl Flatten {
     /// the last one is in.
     pub(super) fn advance(&mut self) -> Result<Option<Surface>> {
         if !self.banded {
-            return flattened_checked(&self.doc, self.fmt, "file.place").map(Some);
+            return flattened_checked(&self.doc, self.fmt, self.cmd).map(Some);
         }
         let (x, y) = self.at;
         // A band is part of one tile row, at most `cols` wide.

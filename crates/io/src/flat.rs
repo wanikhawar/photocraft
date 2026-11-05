@@ -53,7 +53,7 @@ fn before_composite_decode() {}
 
 /// Decodes a flat image into a single-layer document; a TIFF with Photoshop layer data opens
 /// layered (see [`crate::tiff_layers`]).
-fn decode_limits(opts: &crate::ImportOptions) -> codecs::Limits {
+pub(crate) fn decode_limits(opts: &crate::ImportOptions) -> codecs::Limits {
     let mut limits = codecs::Limits::default();
     if opts.flat_max_pixel_bytes > 0 {
         limits.max_alloc = limits.max_alloc.min(opts.flat_max_pixel_bytes);
@@ -128,6 +128,82 @@ fn import_flat_impl_with_options(
     };
     apply_flat_format(&mut r, bytes, format, img.as_ref())?;
     Ok(r)
+}
+
+/// A streaming PNG's tiles, built one bounded group at a time.
+pub(crate) struct PngTiles {
+    header: codecs::PngHeader,
+    surface: Surface,
+    convert: RowConverter,
+    prune: Option<PruneCursor>,
+}
+
+impl PngTiles {
+    pub(crate) fn new(header: codecs::PngHeader) -> Result<Self, IoError> {
+        let (_, layout, _, sample) = flat_target(header.layout, header.sample);
+        let bpp = surface_format(layout, sample).bytes_per_pixel() as u64;
+        let src = (header.layout.channels() * header.sample.bytes()) as u64;
+        let group = u64::from(header.width).saturating_mul(u64::from(header.height.min(TILE_SIZE as u32)));
+        let needed = tile_bytes(header.width, header.height, bpp).saturating_add(group.saturating_mul(src)).saturating_add(group.saturating_mul(bpp));
+        crate::memory::check_fits(header.width, header.height, needed, crate::memory::available())?;
+        Ok(Self {
+            header,
+            surface: Surface::new(surface_format(layout, sample)),
+            convert: RowConverter::new((header.layout, header.sample), (layout, sample)),
+            prune: None,
+        })
+    }
+
+    pub(crate) fn write(&mut self, y0: u32, data: &[u8]) -> Result<(), IoError> {
+        let (w, h) = (self.header.width, self.header.height);
+        let row = (w as usize).checked_mul(self.convert.src_px).filter(|&b| b > 0).ok_or_else(|| IoError::Unsupported("image too large".into()))?;
+        if data.is_empty() || !data.len().is_multiple_of(row) {
+            return Err(IoError::Unsupported("the decoded rows do not match the image size".into()));
+        }
+        let n = u32::try_from(data.len() / row).map_err(|_| IoError::Unsupported("image too large".into()))?;
+        let end = y0.checked_add(n).filter(|&v| v <= h).ok_or_else(|| IoError::Unsupported("image too large".into()))?;
+        let to_i32 = |v: u32| i32::try_from(v).map_err(|_| IoError::Unsupported("image too large".into()));
+        let rect = Rect::new(0, to_i32(y0)?, to_i32(w)?, to_i32(end)?);
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        self.surface
+            .try_write_rows_with_interrupt(rect, &Interrupt::NONE, |y, x0, dst| {
+                if !self.convert.fill(data, w as usize, y - rect.y0, x0, dst) {
+                    failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+            .map_err(|e| match e {
+                RowWriteError::Cancelled(_) => IoError::Cancelled,
+                RowWriteError::Allocation(ae) => alloc_error(ae, w, h),
+            })?;
+        if failed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(IoError::Unsupported("the decoded image does not match its size".into()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prune_step(&mut self) -> bool {
+        if !self.header.layout.has_alpha() {
+            return true;
+        }
+        let cursor = self.prune.get_or_insert_with(|| self.surface.prune_cursor());
+        self.surface.prune_batch(cursor, PRUNE_BATCH)
+    }
+
+    pub(crate) fn finish(self, name: &str, bytes: &[u8], extras: codecs::PngExtras) -> Result<ImportResult, IoError> {
+        let (mode, _, depth, _) = flat_target(self.header.layout, self.header.sample);
+        let warnings = extras.warnings.iter().map(ToString::to_string).collect();
+        let mut result = flat_document(
+            name,
+            (self.header.width, self.header.height, self.header.layout, mode, depth),
+            self.surface,
+            extras.icc,
+            &extras.meta,
+            warnings,
+            None,
+        )?;
+        apply_flat_format(&mut result, bytes, Some(Format::Png), None)?;
+        Ok(result)
+    }
 }
 
 /// An image becoming a document's surface a bounded band of rows and a bounded batch of empty

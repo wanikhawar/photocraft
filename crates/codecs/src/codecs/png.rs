@@ -225,6 +225,67 @@ impl<B: AsRef<[u8]>> PngDecodeRows<B> {
         })
     }
 
+    /// Opens final-order rows without reserving the full image. Ineligible images use the
+    /// buffered decoder; orientation in a trailing EXIF chunk must still be checked at the end.
+    pub fn streaming(bytes: B, limits: &Limits) -> Result<Option<Self>, CodecError> {
+        let dec = Self::open(bytes, limits, false)?;
+        let upright = dec.reader.info().exif_metadata.as_deref().is_none_or(|e| crate::orientation::exif_orientation(e) == 1);
+        if dec.interlaced || dec.reader.info().animation_control.is_some() || !upright { Ok(None) } else { Ok(Some(dec)) }
+    }
+
+    /// Output shape of a streaming decoder.
+    pub fn header(&self) -> PngHeader {
+        PngHeader { width: self.width, height: u32::try_from(self.height).unwrap_or(u32::MAX), layout: self.layout, sample: self.sample }
+    }
+
+    /// Decode one bounded group and deliver it before returning. Metadata is also scanned in
+    /// bounded batches. A late orientation is reported in the returned extras.
+    pub fn stream_step<E: From<CodecError>>(&mut self, more: &mut dyn FnMut() -> bool, sink: &mut PngRowSink<'_, E>) -> Result<Option<PngExtras>, E> {
+        if self.done {
+            return Err(err("the image was already decoded").into());
+        }
+        if !self.tail {
+            let y0 = self.rows;
+            let count = (4 * 1024 * 1024 / self.line.max(1)).clamp(1, 256).min(self.height - self.rows);
+            self.buf.clear();
+            while self.rows - y0 < count {
+                let end = self.buf.len().checked_add(self.line).ok_or_else(|| err("image too large"))?;
+                self.buf.try_reserve(self.line).map_err(|_| err("cannot allocate PNG row group"))?;
+                self.buf.resize(end, 0);
+                let row = self.buf.get_mut(end - self.line..end).ok_or_else(|| err("invalid PNG row group"))?;
+                self.reader.read_row(row).map_err(map_png_err)?.ok_or_else(|| err("the image data ended early"))?;
+                if self.sample == SampleType::U16 {
+                    to_native_endian(row);
+                }
+                self.rows += 1;
+                if self.rows < self.height && !more() {
+                    break;
+                }
+            }
+            sink(u32::try_from(y0).map_err(|_| err("image too large"))?, &self.buf)?;
+            self.buf.clear();
+            if self.rows < self.height {
+                return Ok(None);
+            }
+            if self.reader.read_row(&mut []).map_err(map_png_err)?.is_some() {
+                return Err(err("the image has more rows than its header declares").into());
+            }
+            self.begin_tail()?;
+        }
+        while !self.text.done {
+            self.text_batch()?;
+            if !self.text.done && !more() {
+                return Ok(None);
+            }
+        }
+        self.done = true;
+        let mut extras = self.extras();
+        if extras.meta.dpi.is_none() {
+            extras.meta.dpi = crate::resolution::from_metadata(extras.meta.exif.as_deref(), extras.meta.xmp.as_deref());
+        }
+        Ok(Some(extras))
+    }
+
     /// The image's width and height in pixels.
     pub fn size(&self) -> (u32, u32) {
         (self.width, u32::try_from(self.height).unwrap_or(u32::MAX))
@@ -2028,6 +2089,28 @@ mod rows_tests {
         assert_eq!(rows.pixel_finalizations, 1, "a metadata yield must not finalize the pixels again");
         assert_eq!(got.meta.text, vec![("Comment".into(), text)]);
     }
+    #[test]
+    fn streaming_reuses_only_a_bounded_row_buffer() {
+        let img = image(80, 900, ChannelLayout::Rgba, SampleType::U16);
+        let bytes = crate::encode(&img, Format::Png, &EncodeOptions::default()).unwrap();
+        let mut rows = PngDecodeRows::streaming(bytes.as_slice(), &Limits::default()).unwrap().unwrap();
+        let mut received = 0;
+        loop {
+            let done = rows
+                .stream_step(&mut || true, &mut |_, data| -> Result<(), CodecError> {
+                    received += data.len();
+                    Ok(())
+                })
+                .unwrap();
+            assert!(rows.buf.is_empty());
+            assert!(rows.buf.capacity() < img.data().len());
+            if done.is_some() {
+                break;
+            }
+        }
+        assert_eq!(received, img.data().len());
+    }
+
     /// A compressed iTXt chunk whose text inflates to `len` bytes of invalid UTF-8.
     fn bad_itxt(len: usize) -> Vec<u8> {
         use std::io::Write;

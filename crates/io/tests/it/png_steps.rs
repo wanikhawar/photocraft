@@ -87,9 +87,8 @@ fn stepped_png_import_keeps_a_palette_as_indexed_colour() {
 fn stepped_png_import_takes_a_step_per_row_and_bounded_steps_to_build_the_document() {
     let bytes = encode(&noise(8, 20, ChannelLayout::Rgba, SampleType::U8), Format::Png, &EncodeOptions::default()).unwrap();
     let (_, calls) = stepped("a.png", &bytes, 1);
-    // 19 calls decode a row, one finishes the file, one orients it, one copies its rows into
-    // the surface, one prunes it, and one builds the document.
-    assert_eq!(calls, 24);
+    // Each row is converted as it arrives, followed by the bounded prune.
+    assert!(calls >= 21, "{calls} calls");
     let arc = Arc::new(bytes);
     let mut import = PngImport::new("a.png", &arc).unwrap().unwrap();
     assert_eq!(import.progress(), 0.0);
@@ -170,9 +169,8 @@ fn stepped_png_import_copies_a_multi_tile_image_in_bounded_steps() {
     assert_same(&got.document, &expected.document, "zero budget");
     assert_eq!(got.warnings, expected.warnings);
     assert_eq!(got.document.metadata.text, vec![("Comment".into(), text)], "the compressed text survives the steps");
-    // One call per row, then its copy bands, its prune batch and the document step, each a call
-    // of its own with an empty budget.
-    assert!(calls >= 260 + 4, "{} calls: an empty budget must not make one step do it all", calls);
+    // One call per row, plus metadata and prune work.
+    assert!(calls >= 261, "{} calls: an empty budget must not make one step do it all", calls);
 }
 
 #[test]
@@ -227,4 +225,24 @@ fn orientations_are_banded_and_match_the_regular_import() {
             }
         }
     }
+}
+
+#[test]
+fn late_orientation_restarts_in_the_buffered_path() {
+    let base = encode(&noise(91, 37, ChannelLayout::Rgba, SampleType::U8), Format::Png, &EncodeOptions::default()).unwrap();
+    for orientation in [3u16, 6, 8] {
+        let mut exif = b"II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
+        exif.extend_from_slice(&orientation.to_le_bytes());
+        exif.extend_from_slice(&[0; 6]);
+        let bytes = with_chunks_before_iend(&base, &[png_chunk(b"eXIf", &exif)]);
+        assert_stepped_equals_import("late.png", &bytes, "late orientation");
+    }
+}
+
+#[test]
+fn stepped_png_respects_import_pixel_limit() {
+    let bytes = Arc::new(encode(&noise(64, 64, ChannelLayout::Rgba, SampleType::U8), Format::Png, &EncodeOptions::default()).unwrap());
+    let opts = ImportOptions { flat_max_pixel_bytes: 128, ..Default::default() };
+    assert!(PngImport::with_options("a.png", &bytes, &opts).is_err());
+    assert!(import_with_options_and_interrupt("a.png", &bytes, &opts, &Interrupt::NONE).is_err());
 }
