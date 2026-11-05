@@ -64,6 +64,7 @@ enum Check {
     Equals { path: String, value: Value },
 }
 
+/// Reject nonregular files and files whose metadata exceeds the caller’s byte limit.
 fn read_limited_to(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     let meta = fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if !meta.is_file() || meta.len() > max {
@@ -72,14 +73,17 @@ fn read_limited_to(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     fs::read(path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Read one recipe artifact within the runner’s file-size limit.
 fn read_limited(path: &Path) -> Result<Vec<u8>, String> {
     read_limited_to(path, MAX_FILE)
 }
 
+/// Accept a case identifier that can safely name one output subdirectory.
 fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 100 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// Reject unsupported recipes, unsafe paths, duplicate IDs, and incomplete checks.
 fn validate(recipes: &Recipes) -> Result<(), String> {
     if recipes.version != 1 || recipes.corpus_revision.is_empty() || recipes.cases.is_empty() || recipes.cases.len() > MAX_RECIPES {
         return Err("expected version 1, a corpus revision and 1..=1000 cases".into());
@@ -123,6 +127,7 @@ fn validate(recipes: &Recipes) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve a corpus input and reject paths escaping the canonical corpus root.
 fn input_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
     let p = root.join(relative).canonicalize().map_err(|e| format!("{relative}: {e}"))?;
     if !p.starts_with(root) {
@@ -131,6 +136,7 @@ fn input_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
     Ok(p)
 }
 
+/// Find exactly one layer matching the recipe’s kind and optional name.
 fn target<'a>(doc: &'a Value, wanted: &Target) -> Result<&'a Value, String> {
     let mut stack = vec![(doc.get("layers").and_then(Value::as_array).ok_or("missing layers")?, 0usize)];
     let mut found = Vec::new();
@@ -155,6 +161,7 @@ fn target<'a>(doc: &'a Value, wanted: &Target) -> Result<&'a Value, String> {
     found.into_iter().next().ok_or_else(|| "missing target".into())
 }
 
+/// Evaluate every declared check, retaining each before/after value and outcome.
 fn verify(checks: &[Check], before: &Value, after: &Value) -> Vec<Value> {
     let mut results = Vec::new();
     for check in checks {
@@ -175,7 +182,7 @@ fn verify(checks: &[Check], before: &Value, after: &Value) -> Vec<Value> {
     results
 }
 
-/// Capture into files to avoid pipe deadlocks. Terminate a stuck CLI instead of blocking a batch.
+/// Capture CLI output into files to avoid pipe deadlocks, terminating a stuck child.
 fn invoke(cli: &Path, args: &[String], dir: &Path, tag: &str) -> Result<(String, String), String> {
     let stdout = dir.join(format!("{tag}.stdout"));
     let stderr = dir.join(format!("{tag}.stderr"));
@@ -207,12 +214,14 @@ fn invoke(cli: &Path, args: &[String], dir: &Path, tag: &str) -> Result<(String,
     Ok((out, err))
 }
 
+/// Request detailed CLI inspection and parse the returned document JSON.
 fn inspect(cli: &Path, file: &Path, dir: &Path, tag: &str) -> Result<Value, String> {
     let path = file.to_str().ok_or("non-UTF-8 path")?;
     let (out, _) = invoke(cli, &["info".into(), path.into(), "--compact".into(), "--detail".into()], dir, tag)?;
     serde_json::from_str(&out).map_err(|e| format!("invalid CLI inspection: {e}"))
 }
 
+/// Export and check one case, retaining candidate provenance after export succeeds.
 fn execute(case: &Recipe, corpus: &Path, cli: &Path, output: &Path) -> Result<Value, String> {
     let input = input_path(corpus, &case.base)?;
     let input_bytes = read_limited(&input)?;
@@ -259,6 +268,7 @@ fn execute(case: &Recipe, corpus: &Path, cli: &Path, output: &Path) -> Result<Va
         "photoshop": {"opens": "not_run", "meaning": "not_run", "rendering": "not_run"}}))
 }
 
+/// Create a report artifact without overwriting an existing file.
 fn write_json(path: &Path, value: &Value) -> Result<(), String> {
     use std::io::Write;
     let mut f = OpenOptions::new().write(true).create_new(true).open(path).map_err(|e| e.to_string())?;
@@ -266,7 +276,7 @@ fn write_json(path: &Path, value: &Value) -> Result<(), String> {
     writeln!(f).map_err(|e| e.to_string())
 }
 
-/// Trimmed stdout of `git args` in `root`; `None` outside a checkout or without git.
+/// Return trimmed Git output, or `None` when repository metadata is unavailable.
 fn git(root: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git").current_dir(root).args(args).output().ok()?;
     if !out.status.success() {
@@ -366,8 +376,8 @@ mod tests {
     #[test]
     fn export_batch_checks_reopened_result_and_propagates_command_failure() {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!("psd-write-oracle-{}-{:?}", std::process::id(), std::thread::current().id()));
-        fs::create_dir(&root).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
         let corpus = root.join("corpus");
         let output = root.join("output");
         fs::create_dir(&corpus).unwrap();
@@ -439,6 +449,5 @@ exit 1
             assert_eq!(manifest["candidates"][i]["path"], candidate);
             assert_eq!(manifest["candidates"][i]["sha256"], crate::sha256::hex(b"base"));
         }
-        fs::remove_dir_all(root).unwrap();
     }
 }
