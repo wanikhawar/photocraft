@@ -438,7 +438,13 @@ fn mix_adjusted(l: &Layer, base: &mut CmykBuffer, adjusted: &CmykBuffer, cx: &Ct
         }
         let cb = [p[0], p[1], p[2], p[3]];
         let cs = [a[0], a[1], a[2], a[3]];
-        let bl = if special { blend_ink_fill(l.blend, cb, cs, fill) } else { blend_ink(l.blend, cb, cs) };
+        let bl = if special && fill <= 0.0 {
+            cb
+        } else if special {
+            blend_ink_fill(l.blend, cb, cs, fill)
+        } else {
+            blend_ink(l.blend, cb, cs)
+        };
         for (v, b) in p.iter_mut().zip(bl) {
             *v = if k >= 1.0 { b } else { *v + (b - *v) * k };
         }
