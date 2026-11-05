@@ -449,7 +449,13 @@ fn png_rows_fail_like_decode_on_damaged_files() {
     let img = synth(64, 64, ChannelLayout::Rgb, SampleType::U8, 11, 1.0);
     for interlaced in [false, true] {
         let bytes = encode(&img, Format::Png, &EncodeOptions { png_interlaced: interlaced, ..Default::default() }).unwrap();
-        for cut in [8, 20, 40, bytes.len() / 3, bytes.len() / 2, bytes.len() - 20] {
+        // Cuts inside the signature, the IHDR chunk or the next chunk header leave no complete image.
+        for cut in [8, 20, 40] {
+            let truncated = bytes.get(..cut).unwrap();
+            assert!(decode(truncated).is_err(), "cut at {cut} interlaced={interlaced}");
+            assert!(decode_in_steps(truncated, 1).is_err(), "cut at {cut} interlaced={interlaced}");
+        }
+        for cut in [bytes.len() / 3, bytes.len() / 2, bytes.len() - 20] {
             assert_steps_equal_decode(bytes.get(..cut).unwrap(), &format!("cut at {cut} interlaced={interlaced}"));
         }
         // A flipped byte in the middle of the compressed data.

@@ -68,6 +68,13 @@ fn queue_takes_drop(queued: usize, bytes: usize, incoming: usize) -> bool {
     queued < MAX_QUEUED_DROPS && bytes.saturating_add(incoming) <= MAX_QUEUED_DROP_BYTES
 }
 
+/// Whether the shell's place inbox, holding `files` files of `bytes` bytes together, takes one more
+/// of `incoming` bytes: the limits of the drop queue it is drained into, so browser reads that
+/// finish between two frames can't hold more than the queue itself would.
+pub fn place_inbox_takes(files: usize, bytes: usize, incoming: usize) -> bool {
+    queue_takes_drop(files, bytes, incoming)
+}
+
 /// `warnings` from an import, plus one for each font family the active document's type uses that
 /// isn't installed (#4559): Photoshop warns about missing fonts as a file opens, and the CLI and
 /// automation already report them; the type would otherwise silently render in a fallback face.

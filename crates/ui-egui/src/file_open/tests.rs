@@ -864,6 +864,16 @@ fn the_drop_queue_is_bounded() {
     assert!(!crate::file_open::queue_takes_drop(crate::file_open::MAX_QUEUED_DROPS, 0, 0));
 }
 
+/// The shell's place inbox, which the browser's reads fill between two frames, takes no more than
+/// the drop queue it is drained into.
+#[test]
+fn the_place_inbox_has_the_drop_queues_limits() {
+    use crate::file_open::{MAX_QUEUED_DROP_BYTES, MAX_QUEUED_DROPS, place_inbox_takes};
+    assert!(place_inbox_takes(0, MAX_QUEUED_DROP_BYTES - 1, 1));
+    assert!(!place_inbox_takes(0, MAX_QUEUED_DROP_BYTES, 1), "a read that would pass the byte cap is refused");
+    assert!(!place_inbox_takes(MAX_QUEUED_DROPS, 0, 0), "so is one past the file cap");
+}
+
 /// Closing A while its file is being placed: nothing lands anywhere, and A's next file is dropped.
 #[test]
 fn closing_the_document_while_its_file_is_placed_places_nothing_elsewhere() {
