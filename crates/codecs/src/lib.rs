@@ -110,6 +110,19 @@ pub fn finish_png_decode(img: Image, opts: &DecodeOptions) -> Result<Image, Code
     finish_format(Format::Png, &[], img, opts)
 }
 
+/// Prepare a stepped PNG orientation with the same metadata and limits as `finish_png_decode`.
+pub fn png_orientation(mut img: Image, opts: &DecodeOptions) -> Result<orientation::PngOrientation, CodecError> {
+    if img.meta.dpi.is_none() {
+        img.meta.dpi = resolution::from_metadata(img.meta.exif.as_deref(), img.meta.xmp.as_deref());
+    }
+    let o = img.meta.exif.as_deref().map_or(1, exif_orientation);
+    opts.limits.check(img.width(), img.height(), img.layout(), img.sample_type())?;
+    if !opts.keep_orientation && (5..=8).contains(&o) {
+        opts.limits.check(img.height(), img.width(), img.layout(), img.sample_type())?;
+    }
+    orientation::PngOrientation::new(img, if opts.keep_orientation { 1 } else { o })
+}
+
 /// The steps after a decoder of `format` has produced `img` from `bytes`.
 fn finish_format(format: Format, bytes: &[u8], mut img: Image, opts: &DecodeOptions) -> Result<Image, CodecError> {
     // Without a resolution of the format's own (PNG pHYs, TIFF tags, JPEG's metadata), the

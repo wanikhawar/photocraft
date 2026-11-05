@@ -87,9 +87,9 @@ fn stepped_png_import_keeps_a_palette_as_indexed_colour() {
 fn stepped_png_import_takes_a_step_per_row_and_bounded_steps_to_build_the_document() {
     let bytes = encode(&noise(8, 20, ChannelLayout::Rgba, SampleType::U8), Format::Png, &EncodeOptions::default()).unwrap();
     let (_, calls) = stepped("a.png", &bytes, 1);
-    // 19 calls that each decode a row, one that decodes the last and finishes the file, one that
-    // copies its rows into the surface, one that prunes it, and one that builds the document.
-    assert_eq!(calls, 23);
+    // 19 calls decode a row, one finishes the file, one orients it, one copies its rows into
+    // the surface, one prunes it, and one builds the document.
+    assert_eq!(calls, 24);
     let arc = Arc::new(bytes);
     let mut import = PngImport::new("a.png", &arc).unwrap().unwrap();
     assert_eq!(import.progress(), 0.0);
@@ -201,5 +201,30 @@ fn a_damaged_png_fails_in_steps_as_it_does_whole() {
             }
         });
         assert!(whole.is_err() && stepped.is_err(), "cut at {}", cut.len());
+    }
+}
+
+#[test]
+fn orientations_are_banded_and_match_the_regular_import() {
+    for sample in [SampleType::U8, SampleType::U16] {
+        let mut img = noise(143, 135, ChannelLayout::Rgba, sample);
+        img.meta.dpi = Some((144.0, 144.0));
+        let base = encode(&img, Format::Png, &EncodeOptions::default()).unwrap();
+        for orientation in 1u16..=8 {
+            let mut exif = b"II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
+            exif.extend_from_slice(&orientation.to_le_bytes());
+            exif.extend_from_slice(&[0; 6]);
+            // eXIf must precede IDAT for the streaming decoder.
+            let mut bytes = base[..33].to_vec();
+            bytes.extend_from_slice(&png_chunk(b"eXIf", &exif));
+            bytes.extend_from_slice(&base[33..]);
+            assert_stepped_equals_import("oriented.png", &bytes, &format!("{sample:?} orientation {orientation}"));
+            let (got, calls) = stepped_zero_budget("oriented.png", &bytes);
+            let expected = whole("oriented.png", &bytes);
+            assert_same(&got.document, &expected.document, "orientation with empty budget");
+            if orientation > 1 {
+                assert!(calls >= 135 + 3 + 3, "orientation should take multiple bands: {calls}");
+            }
+        }
     }
 }
