@@ -52,7 +52,7 @@ impl PngImport {
                     Some(img) => {
                         // The resolution, upright orientation and final limit checks `decode` does.
                         let img = codecs::finish_png_decode(img, &DecodeOptions::default())?;
-                        Stage::Build(Box::new(FlatBuilder::new(&self.name, img)))
+                        Stage::Build(Box::new(FlatBuilder::new(&self.name, img)?))
                     }
                     None => Stage::Rows(rows),
                 };

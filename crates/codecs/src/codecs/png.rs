@@ -7,7 +7,7 @@ use crate::Format;
 use crate::error::CodecError;
 use crate::fidelity::Plan;
 use crate::image::{ChannelLayout, DecodeWarning, Image, Metadata, SampleType};
-use crate::options::{EncodeOptions, Limits, PngCompression, PngStereo};
+use crate::options::{EncodeOptions, Limits, PngCompression, PngStereo, alloc_zeroed};
 
 const F: Format = Format::Png;
 pub(crate) const XMP_KEYWORD: &str = "XML:com.adobe.xmp";
@@ -138,6 +138,12 @@ impl<B: AsRef<[u8]>> PngDecodeRows<B> {
     /// Reads the header and refuses what [`decode`] refuses before any pixel is decoded: sizes
     /// past `limits`, and a file too small for the image it declares.
     pub fn new(bytes: B, limits: &Limits) -> Result<Self, CodecError> {
+        Self::open(bytes, limits, true)
+    }
+
+    /// [`PngDecodeRows::new`], optionally without reserving the whole image: a caller that hands
+    /// the rows on as they come ([`decode_rows`]) never holds them all.
+    fn open(bytes: B, limits: &Limits, reserve: bool) -> Result<Self, CodecError> {
         let at = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let bytes = SharedInput(std::sync::Arc::new(bytes));
         let input = Tracked { cursor: Cursor::new(bytes.clone()), at: at.clone() };
@@ -190,7 +196,9 @@ impl<B: AsRef<[u8]>> PngDecodeRows<B> {
         // Reserve without touching: each row is zero-filled as it is decoded, so the first slice
         // doesn't zero-fill the whole image (a stall on the web build).
         let mut buf = Vec::new();
-        buf.try_reserve_exact(size).map_err(|_| CodecError::LimitExceeded(format!("cannot allocate {size} bytes for the image")))?;
+        if reserve {
+            buf.try_reserve_exact(size).map_err(|_| CodecError::LimitExceeded(format!("cannot allocate {size} bytes for the image")))?;
+        }
         let interlaced = info.interlaced;
         Ok(Self {
             reader,
@@ -316,7 +324,7 @@ impl<B: AsRef<[u8]>> PngDecodeRows<B> {
                         let (keyword, keyword_len, kind, text) = (p.keyword, p.keyword_len, p.kind, p.out);
                         self.text.accept(keyword, keyword_len, kind, text)?;
                     }
-                    TextBatch::Invalid => {}
+                    TextBatch::Invalid(produced) => self.text.charge(produced)?,
                 },
             }
             return Ok(());
@@ -468,12 +476,10 @@ impl<B: AsRef<[u8]>> PngDecodeRows<B> {
         Ok(true)
     }
 
-    /// The image itself, with what the metadata scan accepted.
-    fn finish(&mut self) -> Result<Image, CodecError> {
-        let height = u32::try_from(self.height).map_err(|_| err("image too large"))?;
-        let mut img = Image::from_raw(self.width, height, self.layout, self.sample, std::mem::take(&mut self.buf))?;
+    /// What the file holds besides its pixels, with what the metadata scan accepted.
+    fn extras(&mut self) -> PngExtras {
         let info = self.reader.info();
-        img.icc = info.icc_profile.as_ref().map(|c| c.to_vec());
+        let icc = info.icc_profile.as_ref().map(|c| c.to_vec());
         let mut meta = Metadata { exif: info.exif_metadata.as_ref().map(|c| c.to_vec()), ..Default::default() };
         if let Some(d) = info.pixel_dims
             && d.unit == png::Unit::Meter
@@ -486,10 +492,22 @@ impl<B: AsRef<[u8]>> PngDecodeRows<B> {
         meta.text.extend(std::mem::take(&mut self.text.compressed));
         meta.text.extend(std::mem::take(&mut self.text.international));
         meta.xmp = self.text.xmp.take();
-        img.meta = meta;
+        let mut warnings = Vec::new();
         if self.images > 1 {
-            img.warnings.push(DecodeWarning::MoreFrames { total: u32::try_from(self.images).ok() });
+            warnings.push(DecodeWarning::MoreFrames { total: u32::try_from(self.images).ok() });
         }
+        let orientation = meta.exif.as_deref().map_or(1, crate::orientation::exif_orientation);
+        PngExtras { icc, meta, warnings, orientation }
+    }
+
+    /// The image itself, with what the metadata scan accepted.
+    fn finish(&mut self) -> Result<Image, CodecError> {
+        let height = u32::try_from(self.height).map_err(|_| err("image too large"))?;
+        let mut img = Image::from_raw(self.width, height, self.layout, self.sample, std::mem::take(&mut self.buf))?;
+        let extras = self.extras();
+        img.icc = extras.icc;
+        img.meta = extras.meta;
+        img.warnings = extras.warnings;
         Ok(img)
     }
 }
@@ -500,6 +518,88 @@ fn to_native_endian(samples: &mut [u8]) {
         let v = u16::from_be_bytes([c[0], c[1]]);
         c.copy_from_slice(&v.to_ne_bytes());
     }
+}
+
+/// What a PNG holds besides its pixels. These can sit after the image data (`eXIf`, text), so
+/// they are complete only once the pixels have been read.
+pub struct PngExtras {
+    pub icc: Option<Vec<u8>>,
+    pub meta: Metadata,
+    pub warnings: Vec<DecodeWarning>,
+    /// The EXIF orientation (1-8) the pixels are stored in; 1 when there is none.
+    pub orientation: u16,
+}
+
+/// The size and pixel format the rows of [`decode_rows`] come in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PngHeader {
+    pub width: u32,
+    pub height: u32,
+    pub layout: ChannelLayout,
+    pub sample: SampleType,
+}
+
+/// Where [`decode_rows`] sends rows: the index of the first, then whole rows.
+pub type PngRowSink<'a, E> = dyn FnMut(u32, &[u8]) -> Result<(), E> + 'a;
+
+/// Decodes a PNG a group of rows at a time, so the caller never needs the whole decoded image:
+/// `begin` gets the header once and says whether to go on (after the same size and plausibility checks [`decode`] makes),
+/// then `rows(y0, data)` gets whole rows `y0..` in final order, `group` of them at a time (the
+/// last group may be shorter; a `group` of 0 counts as 1), native-endian, exactly the samples [`decode`] would return. Returns the extras once the file
+/// has been read to its end, or `None` (having called neither closure) when the rows can't be
+/// had in final order: an interlaced (Adam7) file, and an APNG, whose first frame may be a
+/// sub-rectangle. A damaged file fails with the error [`decode`] gives, after however many rows
+/// were delivered. The limits are checked before the first row; an orientation, which an `eXIf`
+/// after the image data may set, is for the caller to apply.
+pub(crate) fn decode_rows<E: From<CodecError>>(
+    bytes: &[u8],
+    limits: &Limits,
+    group: u32,
+    begin: &mut dyn FnMut(&PngHeader) -> Result<bool, E>,
+    rows: &mut PngRowSink<'_, E>,
+) -> Result<Option<PngExtras>, E> {
+    let group = group.max(1);
+    // The limits and plausibility checks are made here, before any row; the output is not reserved.
+    let mut dec = PngDecodeRows::open(bytes, limits, false)?;
+    let upright = dec.reader.info().exif_metadata.as_deref().is_none_or(|e| crate::orientation::exif_orientation(e) == 1);
+    if dec.interlaced || dec.reader.info().animation_control.is_some() || !upright {
+        return Ok(None);
+    }
+    let height = u32::try_from(dec.height).map_err(|_| err("image too large"))?;
+    if !begin(&PngHeader { width: dec.width, height, layout: dec.layout, sample: dec.sample })? {
+        return Ok(None);
+    }
+    let line = dec.line;
+    let mut buf = alloc_zeroed::<u8>(line.checked_mul(group.min(height) as usize).ok_or_else(|| err("image too large"))?)?;
+    let mut y0 = 0;
+    while y0 < height {
+        let n = group.min(height - y0) as usize;
+        for row in buf.chunks_exact_mut(line.max(1)).take(n) {
+            if dec.reader.read_row(row).map_err(map_png_err)?.is_none() {
+                return Err(err("the image data ends before the last row").into());
+            }
+        }
+        let rows_data = buf.get_mut(..line.saturating_mul(n)).ok_or_else(|| err("invalid PNG row group"))?;
+        if dec.sample == SampleType::U16 {
+            to_native_endian(rows_data);
+        }
+        rows(y0, rows_data)?;
+        y0 += n as u32;
+    }
+    // Past the last row: trailing damage fails the same way it does in `decode`.
+    if dec.reader.read_row(&mut []).map_err(map_png_err)?.is_some() {
+        return Err(err("the image has more rows than its header declares").into());
+    }
+    dec.begin_tail()?;
+    while !dec.text.done {
+        dec.text_batch()?;
+    }
+    let mut extras = dec.extras();
+    // As `decode_as_with` does for every format: a resolution the format lacks comes from EXIF or XMP.
+    if extras.meta.dpi.is_none() {
+        extras.meta.dpi = crate::resolution::from_metadata(extras.meta.exif.as_deref(), extras.meta.xmp.as_deref());
+    }
+    Ok(Some(extras))
 }
 
 /// The colour table of a palette PNG (`PLTE`) and the one entry its `tRNS` makes transparent.
@@ -602,10 +702,19 @@ struct TextScan {
 }
 
 impl TextScan {
+    /// Charges `produced` bytes to the shared budget: what a chunk inflated counts even when its
+    /// text is then dropped (bad UTF-8, a corrupt or truncated stream), or every rejected chunk
+    /// could inflate up to the whole remaining budget again.
+    fn charge(&mut self, produced: usize) -> Result<(), CodecError> {
+        self.remaining = self.remaining.checked_sub(produced).ok_or_else(text_limit)?;
+        Ok(())
+    }
+
     /// Keeps a decoded value, charging the keyword and text to the shared budget; invalid UTF-8
-    /// text is dropped without charging, as before.
+    /// text is dropped, but what it inflated is still charged.
     fn accept(&mut self, keyword: String, keyword_len: usize, kind: TextKind, out: Vec<u8>) -> Result<(), CodecError> {
-        let Ok(text) = String::from_utf8(out) else { return Ok(()) };
+        let produced = out.len();
+        let Ok(text) = String::from_utf8(out) else { return self.charge(produced) };
         self.remaining = self.remaining.checked_sub(keyword_len).and_then(|left| left.checked_sub(text.len())).ok_or_else(text_limit)?;
         match kind {
             // Some writers put XMP in Latin-1 text chunks instead of the usual iTXt.
@@ -736,7 +845,8 @@ enum TextBatch {
     /// Every byte of the value was read; `out` is its UTF-8 text.
     Finished(PendingText),
     /// A broken chunk: drop it, as the previous reader did.
-    Invalid,
+    /// The bytes it inflated, which are charged to the budget even though the text is dropped.
+    Invalid(usize),
 }
 
 /// How much of one text value one batch reads or inflates.
@@ -747,38 +857,48 @@ const TEXT_CHUNK_BATCH: usize = 64;
 /// Reads one batch of a text value. Inflation uses a fixed scratch buffer and checks each batch
 /// against the budget before growing the output, so no input-sized allocation is made first.
 fn inflate_text(mut p: PendingText, bytes: &[u8]) -> Result<TextBatch, CodecError> {
-    let Some(input) = bytes.get(p.input.clone()) else { return Ok(TextBatch::Invalid) };
+    let Some(input) = bytes.get(p.input.clone()) else { return Ok(TextBatch::Invalid(p.out.len())) };
     let mut scratch = [0; TEXT_BATCH];
     if let Some(decoder) = p.decoder.as_mut() {
-        let Some(tail) = input.get(p.at.saturating_sub(p.input.start)..) else { return Ok(TextBatch::Invalid) };
+        let Some(tail) = input.get(p.at.saturating_sub(p.input.start)..) else { return Ok(TextBatch::Invalid(p.out.len())) };
         let start_in = decoder.total_in();
         let start_out = decoder.total_out();
-        let Ok(status) = decoder.decompress(tail, &mut scratch, flate2::FlushDecompress::None) else { return Ok(TextBatch::Invalid) };
+        let status = decoder.decompress(tail, &mut scratch, flate2::FlushDecompress::None);
         let used = usize::try_from(decoder.total_in().saturating_sub(start_in)).unwrap_or(usize::MAX);
         let made = usize::try_from(decoder.total_out().saturating_sub(start_out)).unwrap_or(usize::MAX);
-        let (Some(used), Some(batch)) = (p.at.checked_add(used), scratch.get(..made)) else { return Ok(TextBatch::Invalid) };
+        let Ok(status) = status else {
+            // The backend may write a batch before it reports corruption: charge it too, Latin-1
+            // text at its UTF-8 length as on the success path.
+            let charged = match scratch.get(..made) {
+                Some(batch) if p.latin1 => latin1_len(batch).unwrap_or(usize::MAX),
+                _ => made,
+            };
+            return Ok(TextBatch::Invalid(p.out.len().saturating_add(charged)));
+        };
+        let (Some(used), Some(batch)) = (p.at.checked_add(used), scratch.get(..made)) else { return Ok(TextBatch::Invalid(p.out.len())) };
         p.at = used;
         if !append_checked(&mut p.out, &mut p.utf8, &mut p.over, batch, p.latin1, p.limit)? {
-            return Ok(TextBatch::Invalid);
+            return Ok(TextBatch::Invalid(p.out.len()));
         }
         if status == flate2::Status::StreamEnd {
             return Ok(TextBatch::Finished(p));
         }
         if start_in == decoder.total_in() && start_out == decoder.total_out() {
-            return Ok(TextBatch::Invalid); // Truncated stream: never keep partial text.
+            return Ok(TextBatch::Invalid(p.out.len())); // Truncated stream: never keep partial text.
         }
     } else {
         let remaining = input.len().saturating_sub(p.at.saturating_sub(p.input.start));
         let take = remaining.min(TEXT_BATCH);
         let start = p.at.saturating_sub(p.input.start);
-        let Some(batch) = input.get(start..start.saturating_add(take)) else { return Ok(TextBatch::Invalid) };
+        let Some(batch) = input.get(start..start.saturating_add(take)) else { return Ok(TextBatch::Invalid(0)) };
         p.at = p.at.saturating_add(take);
         if !append_checked(&mut p.out, &mut p.utf8, &mut p.over, batch, p.latin1, p.limit)? {
-            return Ok(TextBatch::Invalid);
+            // Stored text isn't inflated: nothing is charged for it.
+            return Ok(TextBatch::Invalid(0));
         }
         if take == remaining {
             if p.utf8.as_ref().is_some_and(|check| !check.complete()) {
-                return Ok(TextBatch::Invalid);
+                return Ok(TextBatch::Invalid(0));
             }
             if p.over {
                 return Err(text_limit());
@@ -1907,5 +2027,38 @@ mod rows_tests {
         assert!(calls > 1, "the metadata took more than the pixel step");
         assert_eq!(rows.pixel_finalizations, 1, "a metadata yield must not finalize the pixels again");
         assert_eq!(got.meta.text, vec![("Comment".into(), text)]);
+    }
+    /// A compressed iTXt chunk whose text inflates to `len` bytes of invalid UTF-8.
+    fn bad_itxt(len: usize) -> Vec<u8> {
+        use std::io::Write;
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        z.write_all(&vec![0xff; len]).unwrap();
+        let mut data = b"Comment\0\x01\x00\0\0".to_vec();
+        data.extend_from_slice(&z.finish().unwrap());
+        let mut out = (data.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(b"iTXt");
+        out.extend_from_slice(&data);
+        let mut crc = flate2::Crc::new();
+        crc.update(b"iTXt");
+        crc.update(&data);
+        out.extend_from_slice(&crc.sum().to_be_bytes());
+        out
+    }
+
+    /// A small PNG with `chunks` placed before its `IEND`.
+    fn png_with(chunks: &[u8]) -> Vec<u8> {
+        let png = crate::encode(&image(4, 4, ChannelLayout::Rgb, SampleType::U8), Format::Png, &EncodeOptions::default()).unwrap();
+        let (head, iend) = png.split_at(png.len() - 12);
+        [head, chunks, iend].concat()
+    }
+
+    #[test]
+    fn dropped_text_still_counts_against_the_budget() {
+        let limits = Limits { max_alloc: 1 << 20, ..Limits::default() };
+        let decode = |bytes: &[u8]| PngDecodeRows::new(bytes, &limits)?.step(&mut || true)?.ok_or_else(|| err("unfinished"));
+        let one = decode(&png_with(&bad_itxt(100_000))).unwrap();
+        assert!(one.meta.text.is_empty(), "invalid UTF-8 is dropped");
+        // Twenty chunks inflate 2 MB between them: each is dropped, but the work is charged.
+        assert!(matches!(decode(&png_with(&bad_itxt(100_000).repeat(20))), Err(CodecError::LimitExceeded(_))));
     }
 }

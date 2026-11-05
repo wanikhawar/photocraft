@@ -28,7 +28,6 @@ pub(crate) struct PlaceSteps {
     input: PlaceInput,
     /// Cut the work into small pieces (for a session without threads).
     fine: bool,
-    vector: bool,
     stage: Stage,
     /// Where the placed image lands, known once it is decoded.
     plan: Plan,
@@ -50,8 +49,9 @@ enum Stage {
     DecodePng(Box<PngImport>),
     Flatten(Box<Flatten>),
     Resize(Box<ResizeSteps>),
-    /// The fitted pixels, to move into place and wrap in a layer.
-    Finish(Surface),
+    /// The fitted pixels (none for a frame's image, which renders from its source), to move into
+    /// place and wrap in a layer.
+    Finish(Option<Surface>),
     Spent,
 }
 
@@ -59,9 +59,7 @@ impl PlaceSteps {
     /// `fine` cuts the work into pieces of a few milliseconds, as a session without worker
     /// threads needs; without it each stage is one unit of work.
     pub(crate) fn new(input: PlaceInput, fine: bool) -> Self {
-        // The importer's own predicate, so a `.svgz` gets the sharp vector render too.
-        let vector = input.doc.is_some();
-        Self { input, fine, vector, stage: Stage::Decode, plan: Plan::default() }
+        Self { input, fine, stage: Stage::Decode, plan: Plan::default() }
     }
 
     fn io_error(&self, e: photocraft_io::IoError) -> EngineError {
@@ -104,7 +102,7 @@ impl PlaceSteps {
             Stage::Resize(mut resize) => {
                 ctx.progress(0.7 + 0.2 * resize.progress(), "Resizing");
                 self.stage = match resize.step(&mut || Instant::now() < deadline) {
-                    Some(px) => Stage::Finish(px),
+                    Some(px) => Stage::Finish(Some(px)),
                     None => Stage::Resize(resize),
                 };
             }
@@ -129,6 +127,7 @@ impl PlaceSteps {
         let p = &self.input.params;
         let scale = match f64_param(p, "scale") {
             Some(k) => (k / 100.0).max(1e-4),
+            None if self.input.frame.is_some() && self.input.fit => (cw / w).max(ch / h),
             None if self.input.fit && (w > cw || h > ch) => (cw / w).min(ch / h),
             None => 1.0,
         };
@@ -138,6 +137,12 @@ impl PlaceSteps {
         };
         let (dx, dy) = ((center.0 - w * scale / 2.0).round(), (center.1 - h * scale / 2.0).round());
         self.plan = Plan { w, h, scale, dx, dy };
+        // A frame's image renders through its smart object, which refuses a placement past the
+        // memory budget; resampling it to the frame's size first would allocate that surface twice.
+        if self.input.frame.is_some() {
+            self.stage = Stage::Finish(None);
+            return Ok(());
+        }
         ctx.progress(0.6, "Flattening");
         self.stage = Stage::Flatten(Box::new(Flatten::new(src, banded && self.fine, self.input.fmt)?));
         Ok(())
@@ -147,42 +152,57 @@ impl PlaceSteps {
     fn flattened(&mut self, px: Surface, ctx: &JobCtx) {
         let scale = self.plan.scale;
         self.stage = if (scale - 1.0).abs() <= 1e-9 {
-            Stage::Finish(px)
+            Stage::Finish(Some(px))
         } else if self.fine {
             Stage::Resize(Box::new(ResizeSteps::new(px, scale, scale, Resample::Bicubic, None)))
         } else {
             ctx.progress(0.7, "Resizing");
-            Stage::Finish(resize_surface(&px, scale, scale, Resample::Bicubic))
+            Stage::Finish(Some(resize_surface(&px, scale, scale, Resample::Bicubic)))
         };
     }
 
     /// Moves the pixels into place and wraps them in the layer's content.
-    fn finish(&mut self, px: Surface, ctx: &JobCtx) -> Result<Prepared> {
+    fn finish(&mut self, px: Option<Surface>, ctx: &JobCtx) -> Result<Prepared> {
         let Plan { w, h, scale, dx, dy } = self.plan;
         let input = &self.input;
-        let px = translate_surface(&px, dx as i32, dy as i32);
+        let (cw, ch) = input.canvas;
+        let px = px.map(|px| translate_surface(&px, dx as i32, dy as i32));
+        let placement = input
+            .frame
+            .as_ref()
+            .map_or(Affine { m: [scale, 0.0, 0.0, scale, dx, dy] }, |(_, t)| t.mul(&Affine { m: [scale / cw, 0.0, 0.0, scale / ch, dx / cw, dy / ch] }));
+        let corners = [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)].map(|(x, y)| placement.apply(photocraft_geom::Point::new(x, y)));
+        let bounds = [
+            corners.iter().map(|q| q.x).fold(f64::INFINITY, f64::min),
+            corners.iter().map(|q| q.y).fold(f64::INFINITY, f64::min),
+            corners.iter().map(|q| q.x).fold(f64::NEG_INFINITY, f64::max),
+            corners.iter().map(|q| q.y).fold(f64::NEG_INFINITY, f64::max),
+        ];
         let label = if input.linked.is_some() { "Place Linked" } else { PLACE_EMBEDDED };
         let content = if input.smart {
             let source = match &input.linked {
                 Some(path) => SmartSource::Linked { path: path.clone() },
                 None => SmartSource::Embedded { file_name: file_name(&input.name), bytes: Arc::clone(&input.bytes) },
             };
-            let mut so = SmartObject::new(source, Affine { m: [scale, 0.0, 0.0, scale, dx, dy] }, Some(px));
-            // A vector source (SVG) renders at its placement scale instead of as a resampled raster.
-            if self.vector
-                && let Some(doc) = &input.doc
-            {
+            let mut so = SmartObject::new(source, placement, px);
+            // A vector source (SVG) or a frame's image renders at its placement scale instead of
+            // as a resampled raster.
+            if let Some(doc) = &input.doc {
                 ctx.progress(0.9, "Rendering");
                 ctx.check()?;
                 if let Some(sharp) = crate::smart_cmds::render(doc, &so)? {
                     so.cache = Some(sharp);
                 }
             }
+            if so.cache.is_none() {
+                return Err(EngineError::Other(format!("{}: the placed image could not be rendered", input.name)));
+            }
             LayerContent::Smart(so)
         } else {
+            let px = px.ok_or_else(|| EngineError::Other(format!("{}: a frame's image must be a smart object", input.name)))?;
             LayerContent::Raster(px)
         };
-        Ok(Prepared { content, layer_name: stem(&input.name), label, scale, bounds: [dx, dy, dx + w * scale, dy + h * scale], smart: input.smart })
+        Ok(Prepared { content, layer_name: stem(&input.name), label, scale, bounds, smart: input.smart, frame: input.frame.as_ref().map(|(id, _)| *id) })
     }
 }
 
