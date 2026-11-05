@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -1111,7 +1111,7 @@ fn a_job_lands_in_the_recording_it_was_started_in_only() {
 #[test]
 fn every_job_terminal_path_drops_a_live_commit_stroke() {
     use crate::brush_cmds::mixer_live::LiveMixer;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::Ordering;
 
     for outcome in 0..6 {
         let mut s = session(32, 32);
