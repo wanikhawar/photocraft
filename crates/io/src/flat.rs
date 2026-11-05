@@ -6,7 +6,7 @@ use photocraft_codecs::{self as codecs, ChannelLayout, Format, Image, SampleType
 use photocraft_color::{BlendMode, ColorMode, PixelFormat, SampleType};
 use photocraft_doc::{AlphaChannel, Document, Layer, LayerContent};
 use photocraft_geom::{Rect, Size, TILE_SIZE};
-use photocraft_raster::{AllocationError, Interrupt, Surface};
+use photocraft_raster::{AllocationError, Interrupt, RowWriteError, Surface};
 
 use crate::renderer::{BandRenderer, RenderError};
 use crate::{ExportOptions, ExportResult, ImportResult, IoError, TgaBits, XmpEmbed};
@@ -667,7 +667,7 @@ fn image_to_document_with_memory(name: &str, img: &Image, ctl: &Interrupt, avail
     ctl.check().map_err(|_| IoError::Cancelled)?;
     // The decoded pixels are already here: check the tiles built beside them before they exist.
     check_layer_fits(w, h, target_layout, csample, available)?;
-    let s = image_surface(img, target_layout, csample)?;
+    let s = image_surface_with(img, target_layout, csample, ctl)?;
     ctl.check().map_err(|_| IoError::Cancelled)?;
     ctl.progress(0.95);
     flat_document(name, (w, h, img.layout(), mode, depth), s, img.icc.clone(), &img.meta, warnings, Some(img))
@@ -885,6 +885,11 @@ fn single_layer_document(
 /// The pixels of a decoded image as a surface of `fmt`, converting layout and sample type a
 /// band of rows at a time so no second full-size copy of the image is made.
 pub(crate) fn image_surface(img: &Image, target_layout: ChannelLayout, csample: CSample) -> Result<Surface, IoError> {
+    image_surface_with(img, target_layout, csample, &Interrupt::NONE)
+}
+
+/// [`image_surface`], checking `ctl` before each tile and row.
+fn image_surface_with(img: &Image, target_layout: ChannelLayout, csample: CSample, ctl: &Interrupt) -> Result<Surface, IoError> {
     let csample = if csample == CSample::F16 { CSample::F32 } else { csample };
     let (w, h) = img.dimensions();
     let mut s = Surface::new(surface_format(target_layout, csample));
@@ -892,12 +897,15 @@ pub(crate) fn image_surface(img: &Image, target_layout: ChannelLayout, csample: 
     let data = img.data();
     let failed = std::sync::atomic::AtomicBool::new(false);
     let (Ok(cw), Ok(ch)) = (i32::try_from(w), i32::try_from(h)) else { return Err(IoError::Unsupported("image too large".into())) };
-    let written = s.try_write_rows_with(Rect::new(0, 0, cw, ch), |y, x0, dst| {
+    let written = s.try_write_rows_with_interrupt(Rect::new(0, 0, cw, ch), ctl, |y, x0, dst| {
         if !convert.fill(data, w as usize, y, x0, dst) {
             failed.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     });
-    written.map_err(|e| alloc_error(e, w, h))?;
+    written.map_err(|error| match error {
+        RowWriteError::Allocation(error) => alloc_error(error, w, h),
+        RowWriteError::Cancelled(_) => IoError::Cancelled,
+    })?;
     if failed.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(IoError::Unsupported("the decoded image does not match its size".into()));
     }
@@ -912,6 +920,9 @@ fn surface_format(target_layout: ChannelLayout, csample: CSample) -> PixelFormat
         ChannelLayout::Lab | ChannelLayout::LabA => ColorMode::Lab,
         _ => ColorMode::Rgb,
     };
+    // The surface stores 16-bit float as 32-bit float, so an F16 target converts to F32 (copying
+    // two-byte samples, or a two-byte opaque alpha, into it would be wrong).
+    let csample = if csample == CSample::F16 { CSample::F32 } else { csample };
     let depth = match csample {
         CSample::U8 => SampleType::U8,
         CSample::U16 => SampleType::U16,
@@ -994,7 +1005,17 @@ fn alloc_error(e: AllocationError, w: u32, h: u32) -> IoError {
         AllocationError::ScratchRead(e) => IoError::Unsupported(format!("could not read scratch pixels: {e}")),
         AllocationError::LengthMismatch { .. } => IoError::Unsupported("the decoded image does not match its size".into()),
         AllocationError::SizeOverflow => IoError::Unsupported(format!("the {w}×{h} image is too large to open")),
-        AllocationError::NotEnoughMemory { .. } => IoError::Unsupported(format!("not enough memory to open the {w}×{h} image")),
+        AllocationError::NotEnoughMemory { .. } => IoError::OutOfMemory(format!("opening the {w}×{h} image")),
+    }
+}
+
+/// The error an out-of-memory or oversized surface allocation is reported as.
+fn alloc_error(e: AllocationError) -> IoError {
+    match e {
+        AllocationError::LengthMismatch { .. } => IoError::Unsupported("the decoded image does not match its size".into()),
+        AllocationError::SizeOverflow => IoError::Unsupported("image too large".into()),
+        AllocationError::NotEnoughMemory { .. } => IoError::OutOfMemory("opening this image".into()),
+        AllocationError::ScratchRead(error) => IoError::Unsupported(format!("could not read tile from scratch: {error}")),
     }
 }
 
@@ -2694,6 +2715,11 @@ mod fused_tile_tests {
     }
 
     #[test]
+    fn allocation_failure_reports_out_of_memory() {
+        assert!(matches!(alloc_error(AllocationError::NotEnoughMemory { bytes: 1 }, 1, 1), IoError::OutOfMemory(_)));
+    }
+
+    #[test]
     fn an_f16_target_is_stored_as_f32_with_opaque_alpha() {
         for &layout in &[ChannelLayout::Rgb, ChannelLayout::Rgba] {
             for &sample in &[CSample::F16, CSample::F32] {
@@ -2779,6 +2805,17 @@ mod fused_tile_tests {
         assert!(matches!(r, Err(IoError::Cancelled)));
         let r = import_flat_with("t", broken, &Interrupt::NONE);
         assert!(matches!(&r, Err(e) if !matches!(e, IoError::Cancelled)), "{:?}", r.map(|_| ()));
+    }
+
+    #[test]
+    fn document_import_cancels_during_surface_construction() {
+        let img = pixels(64, 64, false);
+        let calls = AtomicU32::new(0);
+        // One document check, one tile check, then row checks. Cancel after two rows.
+        let cancel = || calls.fetch_add(1, Ordering::SeqCst) >= 4;
+        let result = image_to_document_with("t", &img, &Interrupt::cancel_only(&cancel));
+        assert!(matches!(result, Err(IoError::Cancelled)));
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
     }
 
     #[test]

@@ -452,7 +452,8 @@ fn only_images_of_the_minimum_decoded_size_stream() {
 #[test]
 fn allocation_errors_name_the_image_not_the_reservation() {
     let oom = alloc_error(AllocationError::NotEnoughMemory { bytes: 4096 }, 8000, 6000).to_string();
-    assert!(oom.contains("not enough memory to open the 8000×6000 image"), "{oom}");
+    assert!(matches!(alloc_error(AllocationError::NotEnoughMemory { bytes: 4096 }, 8000, 6000), IoError::OutOfMemory(_)));
+    assert!(oom.contains("not enough memory: opening the 8000×6000 image"), "{oom}");
     assert!(!oom.contains("MB"), "{oom}");
     let overflow = alloc_error(AllocationError::SizeOverflow, 70000, 70000).to_string();
     assert!(overflow.contains("70000×70000 image is too large"), "{overflow}");
