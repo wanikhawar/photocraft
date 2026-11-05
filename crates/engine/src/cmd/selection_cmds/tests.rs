@@ -680,8 +680,8 @@ fn grow_and_similar_report_a_failed_mask_allocation_and_keep_the_selection() {
         let mut s = Session::new();
         s.execute("file.new", json!({"width": 40, "height": 30})).unwrap();
         s.execute("select.rect", json!({"x": 6, "y": 6, "width": 4, "height": 4})).unwrap();
-        // The first fallible allocation samples the layer; the second is the canvas-sized result.
-        crate::allocation::fail_after_for_test(1);
+        // The sample and current mask are allocated before the result mask.
+        crate::allocation::fail_after_for_test(2);
         let err = s.execute(cmd, json!({"tolerance": 5})).unwrap_err().to_string();
         assert!(err.contains("not enough memory for growing a selection"), "{cmd}: {err}");
         assert_eq!(coverage(&s, 7, 7), 1.0, "{cmd}: the selection must be untouched");
@@ -690,13 +690,40 @@ fn grow_and_similar_report_a_failed_mask_allocation_and_keep_the_selection() {
 }
 
 #[test]
+fn fallible_current_mask_matches_existing_reader() {
+    let mut s = session();
+    let doc = &mut s.active_mut().unwrap().doc;
+    assert_eq!(try_current_mask(doc).unwrap(), current_mask(doc).1);
+    for format in [photocraft_color::PixelFormat::GRAY8, photocraft_color::PixelFormat::RGBA8] {
+        let mut surface = Surface::new(format);
+        surface.fill_rect(Rect::new(3, 4, 9, 10), &[0.5, 0.25, 0.75, 1.0]);
+        doc.selection = Some(surface);
+        assert_eq!(try_current_mask(doc).unwrap(), current_mask(doc).1);
+    }
+}
+
+#[test]
+fn grow_and_similar_keep_selection_when_reading_mask_fails() {
+    for cmd in ["select.grow", "select.similar"] {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 40, "height": 30})).unwrap();
+        s.execute("select.rect", json!({"x": 6, "y": 6, "width": 4, "height": 4})).unwrap();
+        let before = current_mask(&s.active().unwrap().doc).1;
+        crate::allocation::fail_after_for_test(1);
+        let err = s.execute(cmd, json!({"tolerance": 5})).unwrap_err().to_string();
+        assert!(err.contains("not enough memory for reading the current selection"), "{cmd}: {err}");
+        assert_eq!(current_mask(&s.active().unwrap().doc).1, before, "{cmd}: selection changed");
+    }
+}
+
+#[test]
 fn grow_reports_a_failed_frontier_push_mid_traversal_and_keeps_the_selection() {
     let mut s = Session::new();
     s.execute("file.new", json!({"width": 40, "height": 30})).unwrap();
     s.execute("select.rect", json!({"x": 6, "y": 6, "width": 4, "height": 4})).unwrap();
-    // Two buffer allocations (sample, result), then the 12 ring pixels of the 4x4 selection seed the
+    // Three buffer allocations (sample, current mask, result), then the 12 ring pixels of the 4x4 selection seed the
     // frontier; three more clean pushes happen while flood-filling outwards before the next one fails.
-    crate::allocation::fail_after_for_test(2 + 12 + 3);
+    crate::allocation::fail_after_for_test(3 + 12 + 3);
     let err = s.execute("select.grow", json!({"tolerance": 5})).unwrap_err().to_string();
     assert!(err.contains("not enough memory for growing a selection"), "{err}");
     assert_eq!(coverage(&s, 7, 7), 1.0, "the selection must be untouched");

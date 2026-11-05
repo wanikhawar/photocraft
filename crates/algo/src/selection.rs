@@ -42,28 +42,8 @@ pub fn mask_from_surface(s: Option<&Surface>, area: Rect) -> Vec<f32> {
         None => vec![0.0; n],
         // Selections are GRAY8: copy tile bytes through a table, tile rows in parallel.
         Some(s) if s.format() == PixelFormat::GRAY8 && !area.is_empty() => {
-            let w = area.width() as usize;
-            let lut: [f32; 256] = std::array::from_fn(|i| i as f32 / 255.0);
-            let dp = s.default_pixel().first().copied().unwrap_or(0.0);
             let mut out = vec![0.0f32; n];
-            par_rows(&mut out, w, 1, |yy, row| {
-                let y = area.y0 + yy as i32;
-                let mut x = area.x0;
-                while x < area.x1 {
-                    let tc = TileCoord::containing(x, y);
-                    let x1 = (tc.rect().x1).min(area.x1);
-                    let dst = row.get_mut((x - area.x0) as usize..(x1 - area.x0) as usize).unwrap_or_default();
-                    let src = s.tile(tc).and_then(|t| {
-                        let base = (y - tc.ty * TILE_SIZE) as usize * TILE_SIZE as usize + (x - tc.tx * TILE_SIZE) as usize;
-                        t.bytes().get(base..base + dst.len())
-                    });
-                    match src {
-                        Some(src) => dst.iter_mut().zip(src).for_each(|(d, b)| *d = lut[*b as usize]),
-                        None => dst.fill(dp),
-                    }
-                    x = x1;
-                }
-            });
+            read_gray_mask_into(s, area, &mut out);
             out
         }
         Some(s) => {
@@ -73,6 +53,35 @@ pub fn mask_from_surface(s: Option<&Surface>, area: Rect) -> Vec<f32> {
             if ch > 1 { v.chunks_exact(ch).map(|p| p[0]).collect() } else { v }
         }
     }
+}
+
+/// Reads a GRAY8 selection into a preallocated mask. Invalid formats or short buffers are ignored.
+pub fn read_gray_mask_into(s: &Surface, area: Rect, out: &mut [f32]) {
+    if area.is_empty() || s.format() != PixelFormat::GRAY8 {
+        return;
+    }
+    let w = area.width() as usize;
+    let Some(out) = w.checked_mul(area.height() as usize).and_then(|n| out.get_mut(..n)) else { return };
+    let lut: [f32; 256] = std::array::from_fn(|i| i as f32 / 255.0);
+    let dp = s.default_pixel().first().copied().unwrap_or(0.0);
+    par_rows(out, w, 1, |yy, row| {
+        let y = area.y0 + yy as i32;
+        let mut x = area.x0;
+        while x < area.x1 {
+            let tc = TileCoord::containing(x, y);
+            let x1 = (tc.rect().x1).min(area.x1);
+            let dst = row.get_mut((x - area.x0) as usize..(x1 - area.x0) as usize).unwrap_or_default();
+            let src = s.tile(tc).and_then(|t| {
+                let base = (y - tc.ty * TILE_SIZE) as usize * TILE_SIZE as usize + (x - tc.tx * TILE_SIZE) as usize;
+                t.bytes().get(base..base + dst.len())
+            });
+            match src {
+                Some(src) => dst.iter_mut().zip(src).for_each(|(d, b)| *d = lut[*b as usize]),
+                None => dst.fill(dp),
+            }
+            x = x1;
+        }
+    });
 }
 
 /// 8-bit selection value of a coverage (clamped and rounded, as GRAY8 surfaces store it; NaN → 0).
@@ -1057,11 +1066,6 @@ impl ColorMatcher {
             }
         }
         drop(seen);
-        opaque_or_semi.sort_unstable_by(|a, b| {
-            a[0].total_cmp(&b[0]).then_with(|| a[1].total_cmp(&b[1])).then_with(|| a[2].total_cmp(&b[2])).then_with(|| a[3].total_cmp(&b[3]))
-        });
-        opaque_or_semi.dedup_by(|a, b| a == b);
-
         Ok(Self { has_transparent, tree: ColorBvh::build(opaque_or_semi)?, tol: tol.max(0.0) })
     }
 

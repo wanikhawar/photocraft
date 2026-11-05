@@ -79,6 +79,35 @@ fn current_mask(doc: &Document) -> (Rect, Vec<f32>) {
     (area, sel::mask_from_surface(doc.selection.as_ref(), area))
 }
 
+fn try_current_mask(doc: &Document) -> Result<Vec<f32>> {
+    let area = doc.bounds();
+    let purpose = "reading the current selection";
+    match doc.selection.as_ref() {
+        None => {
+            let len = usize::try_from(area.size().area()).map_err(|_| crate::allocation::error(purpose, "requested size overflowed"))?;
+            crate::allocation::filled(len, 0.0, purpose)
+        }
+        Some(surface) if surface.format() == photocraft_color::PixelFormat::GRAY8 => {
+            let len = usize::try_from(area.size().area()).map_err(|_| crate::allocation::error(purpose, "requested size overflowed"))?;
+            let mut mask = crate::allocation::filled(len, 0.0, purpose)?;
+            sel::read_gray_mask_into(surface, area, &mut mask);
+            Ok(mask)
+        }
+        Some(surface) => {
+            let mut samples = crate::allocation::read_region(surface, area, purpose)?;
+            let channels = surface.channels();
+            if channels > 1 {
+                let len = samples.len() / channels;
+                for i in 0..len {
+                    samples[i] = samples[i * channels];
+                }
+                samples.truncate(len);
+            }
+            Ok(samples)
+        }
+    }
+}
+
 /// Grayscale the canvas is actually showing, as opaque RGBA, when that is not the colour
 /// composite: a gray layer-mask view, or — with every colour channel hidden — the first
 /// visible alpha, Quick Mask, or the active layer's mask. The Magic Wand selects from this
@@ -551,7 +580,7 @@ fn try_push(stack: &mut Vec<usize>, i: usize) -> Result<()> {
 fn grow_similar(s: &mut Session, p: &Value, contiguous: bool) -> Result<Value> {
     let tol = f(p, "tolerance", 32.0) / 255.0;
     let (area, px) = sample_pixels(s, b(p, "sampleAllLayers", false))?;
-    let (_, m) = current_mask(&s.active().ok_or(EngineError::NoDocument)?.doc);
+    let m = try_current_mask(&s.active().ok_or(EngineError::NoDocument)?.doc)?;
     let matcher =
         sel::ColorMatcher::new(px.iter().zip(&m).filter_map(|(q, v)| (*v >= 0.5).then_some(*q)), tol).map_err(|message| EngineError::Other(message.into()))?;
     if matcher.is_empty() {
