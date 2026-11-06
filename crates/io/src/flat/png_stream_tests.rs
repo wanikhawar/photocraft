@@ -492,3 +492,35 @@ fn the_whole_image_path_refuses_tiles_the_machine_can_not_hold() {
     assert!(check_layer_fits(4000, 3000, ChannelLayout::Rgba, CSample::U8, None).is_ok());
     assert!(check_layer_fits(4000, 3000, ChannelLayout::Rgba, CSample::U8, Some(1 << 40)).is_ok());
 }
+
+#[test]
+fn resumable_rows_are_bounded_and_only_final_order_files_qualify() {
+    let bytes = Png::new(80, 900, 6, 16).bytes();
+    let expected = codecs::decode(&bytes).unwrap();
+    let mut decoder = codecs::PngDecodeRows::streaming(bytes.as_slice(), &codecs::Limits::default()).unwrap().unwrap();
+    let mut data = Vec::new();
+    let mut groups = 0;
+    loop {
+        let done = decoder
+            .stream_step(&mut || true, &mut |y, rows| -> Result<(), codecs::CodecError> {
+                assert_eq!(y as usize * 80 * 8, data.len());
+                assert!(rows.len() <= 80 * 8 * 256);
+                data.extend_from_slice(rows);
+                groups += 1;
+                Ok(())
+            })
+            .unwrap();
+        if done.is_some() {
+            break;
+        }
+    }
+    assert!(groups >= 4);
+    assert_eq!(data, expected.data());
+    let animated = Png::new(40, 40, 2, 8).before(chunk(b"acTL", &[0, 0, 0, 1, 0, 0, 0, 0])).bytes();
+    let oriented = Png::new(40, 40, 2, 8).before(exif(6)).bytes();
+    let image = Image::from_raw(40, 40, ChannelLayout::Rgb, CSample::U8, vec![7; 40 * 40 * 3]).unwrap();
+    let interlaced = codecs::encode(&image, Format::Png, &codecs::EncodeOptions { png_interlaced: true, ..Default::default() }).unwrap();
+    for bytes in [&animated, &oriented, &interlaced] {
+        assert!(codecs::PngDecodeRows::streaming(bytes.as_slice(), &codecs::Limits::default()).unwrap().is_none());
+    }
+}

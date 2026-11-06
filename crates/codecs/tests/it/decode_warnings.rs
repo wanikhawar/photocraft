@@ -182,6 +182,24 @@ fn apng_warns_and_keeps_the_first_frame() {
     }
 }
 
+#[test]
+fn stepped_apng_matches_first_frame_and_warnings() {
+    for sixteen in [false, true] {
+        for separate in [false, true] {
+            let bytes = apng(2, sixteen, separate);
+            let limits = Limits::default();
+            assert!(PngDecodeRows::streaming(bytes.as_slice(), &limits).unwrap().is_none());
+            let mut rows = PngDecodeRows::new(bytes.as_slice(), &limits).unwrap();
+            let stepped = loop {
+                if let Some(image) = rows.step(&mut || false).unwrap() {
+                    break finish_png_decode(image, &DecodeOptions::default()).unwrap();
+                }
+            };
+            assert_eq!(stepped, decode(&bytes).unwrap());
+        }
+    }
+}
+
 fn chunk(id: &[u8; 4], data: &[u8]) -> Vec<u8> {
     let mut c = id.to_vec();
     c.extend_from_slice(&(data.len() as u32).to_le_bytes());
