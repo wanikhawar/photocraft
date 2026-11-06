@@ -624,6 +624,15 @@ How the web shell (`apps/photocraft-web/src/web.rs`) differs from desktop:
 - Headless Chrome on macOS (`--headless=new --enable-unsafe-webgpu`) gets a real WebGPU adapter.
 
 
+### Cooperative Place on the web
+
+The web session enables cooperative jobs by default. Place decodes and prepares its layer in
+slices polled once per frame; the status bar shows progress and permits cancellation. PNG rows,
+flattening bands and resize bands can yield, while other decoders and some setup and apply steps
+still run as single units. Other commands run inline on the web. On desktop, Place retains its
+worker and path reads run on that worker. Browser drop inboxes and queued file contents each have
+count and byte limits; a canvas drop retains its destination document across tab switches.
+
 ## Indexed Color timings
 
 `cargo run --release -p photocraft-engine --example indexed_color_perf -- image.png` measures

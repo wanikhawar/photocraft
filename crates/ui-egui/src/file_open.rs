@@ -81,6 +81,11 @@ fn queue_takes_drop(queued: usize, bytes: usize, incoming: usize) -> bool {
     queued < MAX_QUEUED_DROPS && bytes.saturating_add(incoming) <= MAX_QUEUED_DROP_BYTES
 }
 
+/// Bound browser reads waiting for the UI to drain an inbox.
+pub fn place_inbox_takes(files: usize, bytes: usize, incoming: usize) -> bool {
+    queue_takes_drop(files, bytes, incoming)
+}
+
 /// `warnings` from an import, plus one for each font family the active document's type uses that
 /// isn't installed (#4559): Photoshop warns about missing fonts as a file opens, and the CLI and
 /// automation already report them; the type would otherwise silently render in a fallback face.
@@ -395,6 +400,7 @@ impl PhotocraftApp {
         // Leave the closed-document notice up for this frame: starting the next queued placement
         // would clear the status bar. The next frame retries the queue, so ask for one at once:
         // another document's files would otherwise wait for the next input event.
+        crate::jobs_ui::begin_pending_place(self, ctx);
         if self.discard_drops_of_closed_documents() {
             if !self.drop_places.is_empty() {
                 ctx.request_repaint();
@@ -503,7 +509,7 @@ impl PhotocraftApp {
     }
 
     fn place_bytes_with(&mut self, name: &str, bytes: Vec<u8>, linked: Option<String>, params: &serde_json::Value) -> Result<serde_json::Value, String> {
-        let r = if self.background_jobs {
+        let r = if crate::jobs_ui::place_in_background(self) {
             crate::jobs_ui::start_place_bytes(self, name, bytes, linked, params)
         } else {
             photocraft_engine::file_cmds::place_bytes(&mut self.session, name, bytes, linked, params).map_err(|e| e.to_string())

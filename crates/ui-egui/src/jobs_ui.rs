@@ -179,6 +179,8 @@ pub struct JobsUi {
     /// The file being placed in the background, if any. One at a time: files dropped meanwhile
     /// wait in the app's drop queue.
     pub place: Option<PlaceJob>,
+    /// Completed places awaiting their document to return to view.
+    pending_place_transforms: Vec<(DocId, photocraft_doc::LayerId)>,
     /// Cached read-only canvas image of the current folder Batch input.
     batch_preview_texture: Option<(JobId, u64, egui::TextureHandle)>,
 }
@@ -187,7 +189,8 @@ pub struct JobsUi {
 /// (the result is then `{"job": id, "pending": true}` and the edit lands when [`tick`] applies
 /// it), else synchronously like [`photocraft_engine::Session::execute`].
 pub fn run(app: &mut PhotocraftApp, id: &str, params: Value) -> Result<Value, String> {
-    if !app.background_jobs {
+    let place = matches!(id, "file.placeEmbedded" | "file.placeLinked") && place_in_background(app);
+    if !app.background_jobs && !place {
         return app.session.execute(id, params).map_err(|e| e.to_string());
     }
     match app.session.start(id, params).map_err(|e| e.to_string())? {
@@ -200,6 +203,11 @@ pub fn run(app: &mut PhotocraftApp, id: &str, params: Value) -> Result<Value, St
             Ok(json!({"job": job.0, "pending": true}))
         }
     }
+}
+
+/// Place uses cooperative jobs on the web and worker jobs on desktop.
+pub(crate) fn place_in_background(app: &PhotocraftApp) -> bool {
+    app.background_jobs || app.session.cooperative_jobs()
 }
 
 /// Place a file's bytes in the background (File › Place for a file with no path to read, a dropped
@@ -238,14 +246,11 @@ fn finish_place(app: &mut PhotocraftApp, ctx: &egui::Context, place: PlaceJob, o
     app.sync_views();
     match outcome {
         JobOutcome::Done(result) => {
-            // The tab can change while the file is placed: the box opens only on the document it
-            // was placed in, and never over another one. An image placed into a frame has none.
-            if app.ui.transform.is_none()
-                && result.get("frame").and_then(Value::as_u64).is_none()
-                && app.session.active().is_some_and(|st| st.doc.id == place.doc)
-                && let Err(e) = crate::transform_tool::begin_placed(app, ctx)
+            if result.get("frame").and_then(Value::as_u64).is_none()
+                && let Some(layer) = result.get("layer").and_then(Value::as_u64)
             {
-                app.ui.status = e;
+                app.jobs.pending_place_transforms.push((place.doc, photocraft_doc::LayerId(layer)));
+                begin_pending_place(app, ctx);
             }
         }
         JobOutcome::Failed(err) => app.place_failed(&place.name, &err),
@@ -256,6 +261,23 @@ fn finish_place(app: &mut PhotocraftApp, ctx: &egui::Context, place: PlaceJob, o
         JobOutcome::Cancelled => {}
     }
     app.place_next_dropped(ctx);
+}
+
+/// Start a completed place's transform only when its document is visible again.
+pub(crate) fn begin_pending_place(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    app.jobs.pending_place_transforms.retain(|(doc, layer)| app.session.documents().iter().any(|st| st.doc.id == *doc && st.doc.layer(*layer).is_some()));
+    if app.ui.transform.is_some() {
+        return;
+    }
+    let Some(active) = app.session.active().map(|st| st.doc.id) else { return };
+    let Some(index) = app.jobs.pending_place_transforms.iter().position(|(doc, _)| *doc == active) else { return };
+    let (_, layer) = app.jobs.pending_place_transforms.remove(index);
+    if let Some(st) = app.session.active_mut() {
+        st.active_layer = Some(layer);
+    }
+    if let Err(e) = crate::transform_tool::begin_placed(app, ctx) {
+        app.ui.status = e;
+    }
 }
 
 /// Open a file in the background: a tab appears at once and shows the progress; the document
