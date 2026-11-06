@@ -1,0 +1,391 @@
+//! Place in resumable steps (#10031): decode, flatten, resize and translate, each in pieces small
+//! enough to run between two frames where there are no worker threads (the web build).
+//!
+//! Every piece computes what the one-shot code computes, so the placed layer is the same whether
+//! a worker thread, a [`PlaceSteps`] driven to the end, or a frame-by-frame [`Session::poll_jobs`]
+//! did the work. `fine` (a cooperative session) cuts the work into pieces; without it each stage
+//! is one unit and native code keeps its parallel resize and flatten.
+
+use photocraft_algo::resample::ResizeSteps;
+use photocraft_geom::{Rect, TILE_SIZE, TileCoord};
+use photocraft_io::PngImport;
+use photocraft_raster::Surface;
+use web_time::Instant;
+
+use super::open::{PLACE_EMBEDDED, PlaceFile, PlaceInput, Prepared};
+use super::paths::{file_name, stem};
+use super::{
+    Affine, Arc, Document, EngineError, LayerContent, Resample, Result, SmartObject, SmartSource, Value, check_flattenable, f64_param, translate_surface,
+};
+use crate::jobs::{JobCtx, StepWork};
+
+/// Pixels a flatten band covers at most: four tiles of a tile row (about 5 ms on one core).
+const BAND_PIXELS: i64 = 4 * (TILE_SIZE as i64) * (TILE_SIZE as i64);
+
+/// A place as a [`StepWork`]; its result is what [`super::open::apply_place`] inserts.
+pub(crate) struct PlaceSteps {
+    input: PlaceInput,
+    /// Cut the work into small pieces (for a session without threads).
+    fine: bool,
+    stage: Stage,
+    bytes: Option<Arc<Vec<u8>>>,
+    /// Where the placed image lands, known once it is decoded.
+    plan: Plan,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Plan {
+    w: f64,
+    h: f64,
+    scale: f64,
+    dx: f64,
+    dy: f64,
+}
+
+enum Stage {
+    /// Nothing done yet.
+    Decode,
+    /// A plain PNG, a few rows at a time.
+    DecodePng(Box<PngImport>),
+    Flatten(Box<Flatten>),
+    Resize(Box<ResizeSteps>),
+    /// The fitted pixels (none for a frame's image, which renders from its source), to move into
+    /// place and wrap in a layer.
+    Finish(Option<Box<Translation>>),
+    Spent,
+}
+
+impl PlaceSteps {
+    /// `fine` cuts the work into pieces of a few milliseconds, as a session without worker
+    /// threads needs; without it each stage is one unit of work.
+    pub(crate) fn new(input: PlaceInput, fine: bool) -> Self {
+        Self { input, fine, stage: Stage::Decode, bytes: None, plan: Plan::default() }
+    }
+
+    fn io_error(&self, e: photocraft_io::IoError) -> EngineError {
+        match e {
+            photocraft_io::IoError::Cancelled => EngineError::Cancelled,
+            // Typed, as the one-shot place reports it: a refused memory budget keeps its fields.
+            e => crate::error::io_open_error(&self.input.name, e),
+        }
+    }
+
+    /// One unit of work; `Some` when the place is prepared.
+    fn advance(&mut self, ctx: &JobCtx, deadline: Instant) -> Result<Option<Prepared>> {
+        match std::mem::replace(&mut self.stage, Stage::Spent) {
+            Stage::Decode => {
+                let bytes = match &self.input.file {
+                    PlaceFile::Bytes(bytes) => Arc::clone(bytes),
+                    PlaceFile::Path(path) => {
+                        ctx.progress(0.0, "Reading");
+                        let bytes = super::paths::read_file(path)?;
+                        ctx.check()?;
+                        Arc::new(bytes)
+                    }
+                };
+                crate::memory_gate::ensure(
+                    &format!("place \u{201c}{}\u{201d}", file_name(&self.input.name)),
+                    crate::memory_gate::place_need(&bytes, self.input.fmt.bytes_per_pixel()),
+                )?;
+                self.input.doc = self.input.doc.take().filter(|_| self.input.frame.is_some() || photocraft_io::is_svg_input(&self.input.name, &bytes));
+                self.bytes = Some(bytes);
+                let input = &self.input;
+                let bytes = self.bytes.as_ref().ok_or_else(|| EngineError::Other("internal error: missing place bytes".into()))?;
+                let png = if self.fine { PngImport::with_options(&input.name, bytes, &input.opts).map_err(|e| self.io_error(e))? } else { None };
+                match png {
+                    Some(png) => self.stage = Stage::DecodePng(Box::new(png)),
+                    None => {
+                        let imported = ctx
+                            .stage(0.0, 0.6, "Decoding", |ctl| photocraft_io::import_with_options_and_interrupt(&input.name, bytes, &input.opts, ctl))
+                            .map_err(|e| self.io_error(e))?;
+                        self.decoded(imported, false, ctx)?;
+                    }
+                }
+            }
+            Stage::DecodePng(mut png) => {
+                ctx.progress(0.55 * png.progress(), "Decoding");
+                match png.step(&mut || Instant::now() < deadline).map_err(|e| self.io_error(e))? {
+                    Some(imported) => self.decoded(imported, true, ctx)?,
+                    None => self.stage = Stage::DecodePng(png),
+                }
+            }
+            Stage::Flatten(mut flatten) => {
+                ctx.progress(0.6 + 0.1 * flatten.progress(), "Flattening");
+                match flatten.advance(ctx)? {
+                    Some(px) => self.flattened(px, ctx)?,
+                    None => self.stage = Stage::Flatten(flatten),
+                }
+            }
+            Stage::Resize(mut resize) => {
+                ctx.progress(0.7 + 0.2 * resize.progress(), "Resizing");
+                self.stage = match resize.step(&mut || Instant::now() < deadline) {
+                    Some(px) => Stage::Finish(Some(Box::new(Translation::new(px, self.plan.dx as i32, self.plan.dy as i32, self.fine)))),
+                    None => Stage::Resize(resize),
+                };
+            }
+            Stage::Finish(None) => return self.finish(None, ctx).map(Some),
+            Stage::Finish(Some(mut translation)) => match translation.advance() {
+                Some(px) => return self.finish(Some(px), ctx).map(Some),
+                None => self.stage = Stage::Finish(Some(translation)),
+            },
+            Stage::Spent => return Err(EngineError::Other("internal error: the place was already prepared".into())),
+        }
+        Ok(None)
+    }
+
+    /// The file is decoded: where it lands, then on to flattening. `banded`: the document is a
+    /// plain image, which flattens band by band.
+    fn decoded(&mut self, imported: photocraft_io::ImportResult, banded: bool, ctx: &JobCtx) -> Result<()> {
+        if imported.preview_only {
+            return Err(EngineError::Other(format!(
+                "{}: only this Affinity file's embedded preview could be read; open it with File › Open to see the warning, or export PSD or PNG from Affinity before using it here",
+                self.input.name
+            )));
+        }
+        let src = imported.document;
+        let (w, h) = (src.size.width as f64, src.size.height as f64);
+        let (cw, ch) = self.input.canvas;
+        let p = &self.input.params;
+        let scale = match f64_param(p, "scale") {
+            Some(k) => (k / 100.0).max(1e-4),
+            None if self.input.frame.is_some() && self.input.fit => (cw / w).max(ch / h),
+            None if self.input.fit && (w > cw || h > ch) => (cw / w).min(ch / h),
+            None => 1.0,
+        };
+        let center = match p.get("center").and_then(Value::as_array) {
+            Some(c) if c.len() == 2 => (c[0].as_f64().unwrap_or(cw / 2.0), c[1].as_f64().unwrap_or(ch / 2.0)),
+            _ => (cw / 2.0, ch / 2.0),
+        };
+        let (dx, dy) = ((center.0 - w * scale / 2.0).round(), (center.1 - h * scale / 2.0).round());
+        self.plan = Plan { w, h, scale, dx, dy };
+        // A frame's image renders through its smart object, which refuses a placement past the
+        // memory budget; resampling it to the frame's size first would allocate that surface twice.
+        if self.input.frame.is_some() {
+            self.stage = Stage::Finish(None);
+            return Ok(());
+        }
+        ctx.progress(0.6, "Flattening");
+        self.stage = Stage::Flatten(Box::new(Flatten::new(src, banded && self.fine, self.input.fmt, self.input.command())?));
+        Ok(())
+    }
+
+    /// The image is flattened: on to resizing it to fit, if it needs that.
+    fn flattened(&mut self, px: Surface, ctx: &JobCtx) -> Result<()> {
+        let scale = self.plan.scale;
+        self.stage = if (scale - 1.0).abs() <= 1e-9 {
+            Stage::Finish(Some(Box::new(Translation::new(px, self.plan.dx as i32, self.plan.dy as i32, self.fine))))
+        } else if self.fine {
+            Stage::Resize(Box::new(ResizeSteps::new(px, scale, scale, Resample::Bicubic, None)))
+        } else {
+            ctx.progress(0.7, "Resizing");
+            let px = ctx
+                .stage(0.7, 0.9, "Resizing", |ctl| photocraft_algo::resample::resize_surface_with_interrupt(&px, scale, scale, Resample::Bicubic, ctl))
+                .map_err(|_| EngineError::Cancelled)?;
+            Stage::Finish(Some(Box::new(Translation::new(px, self.plan.dx as i32, self.plan.dy as i32, self.fine))))
+        };
+        Ok(())
+    }
+
+    /// Moves the pixels into place and wraps them in the layer's content.
+    fn finish(&mut self, px: Option<Surface>, ctx: &JobCtx) -> Result<Prepared> {
+        let Plan { w, h, scale, dx, dy } = self.plan;
+        let input = &self.input;
+        let (cw, ch) = input.canvas;
+        let placement = input.frame.as_ref().map_or(Affine { m: [scale, 0.0, 0.0, scale, dx, dy] }, |(_, f)| {
+            f.transform.mul(&Affine { m: [scale / cw, 0.0, 0.0, scale / ch, dx / cw, dy / ch] })
+        });
+        let corners = [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)].map(|(x, y)| placement.apply(photocraft_geom::Point::new(x, y)));
+        let bounds = [
+            corners.iter().map(|q| q.x).fold(f64::INFINITY, f64::min),
+            corners.iter().map(|q| q.y).fold(f64::INFINITY, f64::min),
+            corners.iter().map(|q| q.x).fold(f64::NEG_INFINITY, f64::max),
+            corners.iter().map(|q| q.y).fold(f64::NEG_INFINITY, f64::max),
+        ];
+        let label = if input.linked.is_some() { "Place Linked" } else { PLACE_EMBEDDED };
+        let smart = input.smart || input.frame.is_some();
+        let content = if smart {
+            let source = match &input.linked {
+                Some(path) => SmartSource::Linked { path: path.clone() },
+                None => SmartSource::Embedded {
+                    file_name: file_name(&input.name),
+                    bytes: Arc::clone(self.bytes.as_ref().ok_or_else(|| EngineError::Other("internal error: missing place bytes".into()))?),
+                },
+            };
+            let mut so = SmartObject::new(source, placement, px);
+            // A vector source (SVG) or a frame's image renders at its placement scale instead of
+            // as a resampled raster.
+            if let Some(doc) = &input.doc {
+                ctx.progress(0.9, "Rendering");
+                ctx.check()?;
+                if let Some(sharp) = crate::smart_cmds::render(doc, &so)? {
+                    so.cache = Some(sharp);
+                }
+            }
+            if so.cache.is_none() {
+                return Err(EngineError::Other(format!("{}: the placed image could not be rendered", input.name)));
+            }
+            LayerContent::Smart(so)
+        } else {
+            let px = px.ok_or_else(|| EngineError::Other(format!("{}: a frame's image must be a smart object", input.name)))?;
+            LayerContent::Raster(px)
+        };
+        Ok(Prepared { content, layer_name: stem(&input.name), label, scale, bounds, smart, frame: input.frame.as_ref().map(|(id, _)| *id) })
+    }
+}
+
+impl StepWork<Prepared> for PlaceSteps {
+    fn step(&mut self, ctx: &JobCtx, deadline: Instant) -> Result<Option<Prepared>> {
+        loop {
+            ctx.check()?;
+            if let Some(prepared) = self.advance(ctx, deadline)? {
+                return Ok(Some(prepared));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+        }
+    }
+}
+
+/// Translates one target tile per advance in cooperative sessions.
+struct Translation {
+    source: Surface,
+    out: Surface,
+    targets: std::collections::btree_set::IntoIter<TileCoord>,
+    bounds: Rect,
+    dx: i32,
+    dy: i32,
+    one_shot: bool,
+}
+
+impl Translation {
+    fn new(source: Surface, dx: i32, dy: i32, fine: bool) -> Self {
+        let bounds = source.content_bounds();
+        // Saturating coordinate shifts need the one-shot implementation's edge handling.
+        let safe_shift = dx != i32::MIN
+            && dy != i32::MIN
+            && bounds.x0.checked_add(dx).is_some()
+            && bounds.x1.checked_add(dx).is_some()
+            && bounds.y0.checked_add(dy).is_some()
+            && bounds.y1.checked_add(dy).is_some();
+        let one_shot = !fine || !safe_shift;
+        let moved = bounds.translate(dx, dy);
+        let targets = if one_shot {
+            Default::default()
+        } else {
+            source
+                .tiles()
+                .filter(|(c, _)| !c.rect().intersect(&bounds).is_empty())
+                .flat_map(|(c, _)| c.rect().translate(dx, dy).intersect(&moved).tiles())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let out = Surface::with_default(source.format(), &source.default_pixel());
+        Self { source, out, targets: targets.into_iter(), bounds, dx, dy, one_shot }
+    }
+
+    fn advance(&mut self) -> Option<Surface> {
+        if self.one_shot {
+            return Some(translate_surface(&self.source, self.dx, self.dy));
+        }
+        if let Some(target) = self.targets.next() {
+            let dst = target.rect().intersect(&self.bounds.translate(self.dx, self.dy));
+            let src = dst.translate(self.dx.saturating_neg(), self.dy.saturating_neg()).intersect(&self.bounds);
+            if !src.is_empty() {
+                let dst = src.translate(self.dx, self.dy);
+                let mut tile = Surface::with_default(self.source.format(), &self.source.default_pixel());
+                tile.write_interleaved(dst, &self.source.to_interleaved(src));
+                tile.prune();
+                self.out.put_tiles(tile.tiles().map(|(c, t)| (*c, Arc::clone(t))));
+            }
+            return None;
+        }
+        // Each target is built once; dropping default-only tiles does not change pixels.
+        Some(std::mem::replace(&mut self.out, Surface::new(self.source.format())))
+    }
+}
+
+/// The decoded document being flattened to the surface it is resized from.
+pub(super) struct Flatten {
+    doc: Document,
+    fmt: photocraft_color::PixelFormat,
+    /// Flatten band by band; otherwise in one go.
+    banded: bool,
+    bounds: Rect,
+    /// The next band's top left corner.
+    at: (i32, i32),
+    /// Width of a band, a whole number of tiles.
+    cols: i32,
+    out: Option<Surface>,
+}
+
+impl Flatten {
+    pub(super) fn new(doc: Document, banded: bool, fmt: photocraft_color::PixelFormat, cmd: &'static str) -> Result<Self> {
+        check_flattenable(&doc, cmd)?;
+        let bounds = doc.bounds();
+        // Bands hold whole tiles, so each tile is written by one band and can move as it is. A
+        // document that does not start on the tile grid (none does) flattens in one go.
+        let banded = banded && bounds.x0.rem_euclid(TILE_SIZE) == 0 && bounds.y0.rem_euclid(TILE_SIZE) == 0;
+        let cols = i32::try_from(BAND_PIXELS / i64::from(TILE_SIZE) / i64::from(TILE_SIZE)).unwrap_or(1).max(1) * TILE_SIZE;
+        Ok(Self { doc, fmt, banded, bounds, at: (bounds.x0, bounds.y0), cols, out: None })
+    }
+
+    /// How much of the flatten is done, `0.0..=1.0`.
+    fn progress(&self) -> f32 {
+        let rows = i64::from(self.bounds.height()).max(1);
+        (i64::from(self.at.1.saturating_sub(self.bounds.y0)) as f32 / rows as f32).clamp(0.0, 1.0)
+    }
+
+    /// Flattens the next band (the whole document if not banded); `Some` with the surface once
+    /// the last one is in.
+    pub(super) fn advance(&mut self, ctx: &JobCtx) -> Result<Option<Surface>> {
+        if !self.banded {
+            return ctx
+                .stage(0.6, 0.7, "Flattening", |ctl| photocraft_compose::composite_to_surface_with_interrupt(&self.doc, self.bounds, self.fmt, None, ctl))
+                .map(Some)
+                .map_err(|_| EngineError::Cancelled);
+        }
+        let (x, y) = self.at;
+        // A band is part of one tile row, at most `cols` wide.
+        let y1 = (y.div_euclid(TILE_SIZE).saturating_add(1).saturating_mul(TILE_SIZE)).min(self.bounds.y1);
+        let x1 = x.saturating_add(self.cols).min(self.bounds.x1);
+        let band = photocraft_compose::composite_to_surface(&self.doc, Rect::new(x, y, x1, y1), self.fmt, None);
+        // The band's tiles move into the result as they are, with no copy of their pixels.
+        let out = self.out.get_or_insert_with(|| Surface::with_default(self.fmt, &band.default_pixel()));
+        out.put_tiles(band.tiles().map(|(c, t)| (*c, Arc::clone(t))));
+        self.at = if x1 >= self.bounds.x1 { (self.bounds.x0, y1) } else { (x1, y) };
+        Ok(if self.at.1 >= self.bounds.y1 { Some(self.out.take().unwrap_or_else(|| Surface::new(self.fmt))) } else { None })
+    }
+}
+
+#[cfg(test)]
+mod translation_tests {
+    use super::*;
+    use photocraft_color::{ColorMode, PixelFormat, SampleType};
+
+    #[test]
+    fn translation_is_resumable_and_matches_one_shot() {
+        for sample in [SampleType::U8, SampleType::U16, SampleType::F32] {
+            let fmt = PixelFormat::new(ColorMode::Rgb, sample, true);
+            let mut src = Surface::new(fmt);
+            let rect = Rect::new(0, 0, 520, 270);
+            let bpp = fmt.bytes_per_pixel();
+            let data: Vec<u8> = (0..520 * 270 * bpp).map(|i| (i * 37 % 251) as u8).collect();
+            src.write_interleaved(rect, &data);
+            for (dx, dy) in [(256, -256), (17, -29), (-267, 5)] {
+                let expected = translate_surface(&src, dx, dy);
+                let mut step = Translation::new(src.clone(), dx, dy, true);
+                let mut calls = 0;
+                let got = loop {
+                    calls += 1;
+                    if let Some(out) = step.advance() {
+                        break out;
+                    }
+                };
+                if dx % TILE_SIZE != 0 || dy % TILE_SIZE != 0 {
+                    assert!(calls > 2);
+                }
+                assert_eq!(got, expected, "{sample:?} ({dx}, {dy})");
+            }
+        }
+    }
+}
