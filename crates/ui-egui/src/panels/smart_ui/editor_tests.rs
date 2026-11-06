@@ -264,3 +264,18 @@ fn a_lab_curves_smart_filter_keeps_a_lightness_edit() {
     let photocraft_doc::Adjustment::Curves { per_channel: wanted, .. } = read(&json!({"lightness": edited})) else { panic!("Curves params") };
     assert_eq!(per_channel[0], wanted[0], "the edited Lightness renders");
 }
+
+/// Probe only: a Lab Curves filter recorded with the top-level alias alone, opened and confirmed unedited.
+#[test]
+fn probe_lab_curves_points_alias_survives_open_and_ok() {
+    let curve = json!([[0, 0], [128, 64], [255, 255]]);
+    let (app, id) = adjustment_filter("lab", "image.adjustments.curves", json!({"points": curve}));
+    let (h, dialog) = edit_first_filter(app, id);
+    let mut h = h;
+    crate::dialogs::confirm(h.state_mut(), dialog).unwrap();
+    let sm = recorded(h.state(), id);
+    let read = |params: &serde_json::Value| photocraft_engine::adjust_params::from_params("curves", params, None, photocraft_doc::ColorMode::Lab).unwrap();
+    let photocraft_doc::Adjustment::Curves { per_channel, .. } = read(&sm.smart_filters[0].params) else { panic!() };
+    let photocraft_doc::Adjustment::Curves { per_channel: wanted, .. } = read(&json!({"points": curve})) else { panic!() };
+    assert_eq!(per_channel[0], wanted[0], "stored: {}", sm.smart_filters[0].params);
+}
