@@ -8,17 +8,18 @@ use photocraft_raster::spill;
 /// counts as no answer, and its late answer would change the status between two reads, so ask again
 /// until the room and the status describe the same answer.
 fn answered_capacity() -> Option<u64> {
-    let mut room = None;
     for _ in 0..10 {
-        room = spill::scratch_capacity();
+        let room = spill::scratch_capacity();
+        let start = std::time::Instant::now();
         while spill::query_threads_for_tests() != 0 {
+            assert!(start.elapsed() < std::time::Duration::from_secs(30), "a query never finished");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         if room.is_none() == spill::free_space_unmeasured() {
-            break;
+            return room;
         }
     }
-    room
+    panic!("ten queries in a row missed their 2 s wait, so the room and the status can't be compared");
 }
 
 #[test]
