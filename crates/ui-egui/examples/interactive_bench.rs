@@ -6,6 +6,9 @@
 //! cargo run --release -p photocraft-ui-egui --example interactive_bench -- [--size 7360x4912] [--reps 5] [--json out.json] [--only text] [--cpu]
 //! ```
 //!
+//! `--only clipped --visual-evidence --json out.json` (scratch probe, #7487) embeds PNG evidence
+//! of the clipped-target Curves preview in the report; see the probe section below.
+//!
 //! Every edit goes through `Session::execute` (the command path the UI, CLI and MCP share:
 //! history snapshot, command, damage), then the canvas refresh the app would do: the GPU
 //! compositor over the edit's damage rect (or the whole document), waited on so the time is the
@@ -373,9 +376,235 @@ fn clipped_preview_group(b: &mut Bench, w: u32, h: u32) {
     }
 }
 
+// ---- scratch visual-evidence probe (#7487) -----------------------------------------------------
+//
+// Temporary, not for the feature PR: `--visual-evidence` on the exact `--only clipped` path
+// renders the unstyled clipped target three ways at the same resolution (original CPU composite,
+// production layer preview on the real GPU compositor, destructive command at k = 1 on the CPU)
+// and embeds the PNGs in the `--json` report. `perf-nightly.yml` uploads `target/perf/*.json`
+// but no PNGs, so the lead can write these existing bytes to disk for inspection.
+
+/// The GPU parity tolerance in `crates/ui-egui/tests/it/adjust_preview_gpu.rs`: a clipped target's
+/// layer preview against the destructive command, premultiplied, 2.5/255.
+const GPU_PREVIEW_VS_COMMAND_TOL_255: f32 = 2.5;
+/// The same test's GPU-vs-CPU tolerance for the same preview document, 2/255.
+const GPU_PREVIEW_VS_CPU_TOL_255: f32 = 2.0;
+/// Feature commit this scratch probe and its `perf/budgets.toml` entry are based on.
+const FEATURE_BASE: &str = "5d9fa9f0ebcd64a1eb6e7f553f5f0f0a9406e2ce";
+/// The probe's small synthetic fixture: geometric fills, no photo and no personal data.
+const EVIDENCE_W: u32 = 512;
+const EVIDENCE_H: u32 = 384;
+
+fn premultiplied(p: [f32; 4]) -> [f32; 4] {
+    [p[0] * p[3], p[1] * p[3], p[2] * p[3], p[3]]
+}
+
+struct PixelDiff {
+    max_255: f32,
+    at: [usize; 2],
+    changed: usize,
+}
+
+impl PixelDiff {
+    fn to_json(&self, tolerance_255: Option<f32>) -> Value {
+        let mut v = json!({"max_abs_diff_255": self.max_255, "at": self.at, "changed_pixels": self.changed});
+        if let Some(t) = tolerance_255 {
+            v["tolerance_255"] = json!(t);
+            v["passed"] = json!(self.max_255 <= t);
+        }
+        v
+    }
+}
+
+/// Premultiplied comparison of two same-size RGBA buffers, as the GPU parity tests do. `changed`
+/// counts pixels whose worst premultiplied channel differs by more than 1/255.
+fn compare_pixels(a: &[[f32; 4]], b: &[[f32; 4]], w: u32) -> Result<PixelDiff, String> {
+    if a.len() != b.len() {
+        return Err(format!("compare: {} vs {} pixels", a.len(), b.len()));
+    }
+    let width = w.max(1) as usize;
+    let (mut max_255, mut at, mut changed) = (0.0f32, 0usize, 0usize);
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        let (x, y) = (premultiplied(*x), premultiplied(*y));
+        let mut worst = 0.0f32;
+        for (xc, yc) in x.iter().zip(y.iter()) {
+            let d = (*xc - *yc).abs();
+            if !d.is_finite() {
+                return Err(format!("compare: non-finite difference at pixel {i}"));
+            }
+            worst = worst.max(d);
+        }
+        let d255 = worst * 255.0;
+        if d255 > 1.0 {
+            changed += 1;
+        }
+        if d255 > max_255 {
+            (max_255, at) = (d255, i);
+        }
+    }
+    Ok(PixelDiff { max_255, at: [at % width, at / width], changed })
+}
+
+/// PNG-encode a straight-alpha RGBA float composite with the repository's codecs (display clamp
+/// and 8-bit quantization suffice for this synthetic RGB8 fixture), embedding the bytes as
+/// numbers so no base64 dependency is needed.
+fn evidence_png(role: &str, w: u32, h: u32, px: &[[f32; 4]]) -> Result<Value, String> {
+    let expected = w as usize * h as usize;
+    if px.len() != expected {
+        return Err(format!("{role}: {} pixels, expected {expected} for {w}x{h}", px.len()));
+    }
+    let mut rgba = Vec::with_capacity(expected * 4);
+    for p in px {
+        for c in p {
+            if !c.is_finite() {
+                return Err(format!("{role}: non-finite pixel value"));
+            }
+            rgba.push((c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+        }
+    }
+    let image = photocraft_codecs::Image::from_raw(w, h, photocraft_codecs::ChannelLayout::Rgba, photocraft_codecs::SampleType::U8, rgba)
+        .map_err(|e| format!("{role} image: {e}"))?;
+    let png = photocraft_codecs::encode(&image, photocraft_codecs::Format::Png, &photocraft_codecs::EncodeOptions::default())
+        .map_err(|e| format!("{role} PNG: {e}"))?;
+    Ok(json!({"role": role, "mime": "image/png", "width": w, "height": h, "png_bytes": png}))
+}
+
+/// The commit that produced the report, for the lead's records: the checkout's HEAD when git is
+/// available, else the CI run's SHA.
+fn source_head() -> (String, &'static str) {
+    if let Ok(out) = std::process::Command::new("git").args(["rev-parse", "HEAD"]).output()
+        && out.status.success()
+    {
+        let h = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !h.is_empty() {
+            return (h, "git rev-parse HEAD");
+        }
+    }
+    if let Ok(h) = std::env::var("GITHUB_SHA") {
+        let h = h.trim();
+        if !h.is_empty() {
+            return (h.to_string(), "GITHUB_SHA");
+        }
+    }
+    ("unknown".into(), "unknown")
+}
+
+/// The probe fixture: the unstyled clipped target from [`clipped_document`], optionally with the
+/// same elliptical selection the benchmark uses (created through the real selection command).
+fn evidence_document(w: u32, h: u32, selection: bool) -> Result<(Document, LayerId), String> {
+    let (doc, target) = clipped_document(w, h, false);
+    if !selection {
+        return Ok((doc, target));
+    }
+    let mut s = Session::new();
+    s.open_document(doc, None);
+    s.execute("layer.select", json!({"layer": target.0})).map_err(|e| format!("select the clipped target: {e}"))?;
+    s.execute("select.rect", json!({"x": w / 4, "y": h / 4, "width": w / 2, "height": h / 2, "ellipse": true}))
+        .map_err(|e| format!("make the elliptical selection: {e}"))?;
+    let doc = s.active().ok_or("the selection session has no active document")?.doc.as_ref().clone();
+    Ok((doc, target))
+}
+
+fn evidence_case(w: u32, h: u32, selection: bool, gpu: &mut Option<Gpu>) -> Result<Value, String> {
+    let (doc, target) = evidence_document(w, h, selection)?;
+    if let Some(why) = photocraft_ui_egui::adjust_preview::unsupported(&doc, target) {
+        return Err(format!("the layer preview refuses the evidence fixture: {why}"));
+    }
+    let params = json!({"points": [[0, 0], [100, 190], [255, 255]]});
+    let bounds = doc.bounds();
+
+    let original = photocraft_compose::render(&doc, bounds).into_px();
+    let preview = photocraft_ui_egui::adjust_preview::preview_document(&doc, target, "curves", &params).map_err(|e| format!("layer preview document: {e}"))?;
+    if !preview.layer(target).is_some_and(photocraft_doc::Layer::is_group) {
+        return Err("the layer preview did not wrap the clipped target in a group".into());
+    }
+    let preview_cpu = photocraft_compose::render(&preview, bounds).into_px();
+    let committed = photocraft_ui_egui::filter_dialog::preview_document(&doc, Some(target), "image.adjustments.curves", &params, 1)
+        .ok_or("the destructive command preview returned no document")?;
+    let committed_cpu = photocraft_compose::render(&committed, bounds).into_px();
+
+    let g = gpu.as_mut().ok_or("no GPU adapter: the evidence requires the real GPU compositor")?;
+    let preview_gpu = photocraft_gpu::render_to_vec(&mut g.comp, &g.device, &g.queue, &preview, bounds).map_err(|e| format!("GPU preview readback: {e}"))?;
+    let adapter = g.adapter_name.clone();
+    let acc_format = format!("{:?}", g.comp.acc_format());
+
+    let gpu_vs_command = compare_pixels(&preview_gpu, &committed_cpu, w)?;
+    if gpu_vs_command.max_255 > GPU_PREVIEW_VS_COMMAND_TOL_255 {
+        return Err(format!(
+            "GPU preview vs committed command: {:.3}/255 exceeds the {:.1}/255 tolerance",
+            gpu_vs_command.max_255, GPU_PREVIEW_VS_COMMAND_TOL_255
+        ));
+    }
+    let gpu_vs_cpu = compare_pixels(&preview_gpu, &preview_cpu, w)?;
+    if gpu_vs_cpu.max_255 > GPU_PREVIEW_VS_CPU_TOL_255 {
+        return Err(format!("GPU preview vs CPU preview: {:.3}/255 exceeds the {:.1}/255 tolerance", gpu_vs_cpu.max_255, GPU_PREVIEW_VS_CPU_TOL_255));
+    }
+    // The Curves setting must actually change pixels, or the three images would prove nothing.
+    let applied = compare_pixels(&original, &committed_cpu, w)?;
+    if applied.changed == 0 {
+        return Err("the Curves settings changed no pixels, so the evidence would be meaningless".into());
+    }
+    println!(
+        "  (visual evidence, selection {selection}: GPU preview vs committed {:.3}/255, GPU vs CPU {:.3}/255, {} px changed)",
+        gpu_vs_command.max_255, gpu_vs_cpu.max_255, applied.changed
+    );
+
+    let images = vec![
+        evidence_png("original_cpu", w, h, &original)?,
+        evidence_png("gpu_preview", w, h, &preview_gpu)?,
+        evidence_png("committed_cpu", w, h, &committed_cpu)?,
+    ];
+    Ok(json!({
+        "case": if selection { "selection" } else { "no_selection" },
+        "selection": selection,
+        "command": "image.adjustments.curves",
+        "params": params,
+        "preview_path": "photocraft_ui_egui::adjust_preview::preview_document (clipped target wrapped in a preview-only group)",
+        "committed_path": "photocraft_ui_egui::filter_dialog::preview_document(k = 1) on the CPU compositor",
+        "clipped_target_wrapped": true,
+        "adapter": adapter,
+        "gpu_accumulation_format": acc_format,
+        "parity": {
+            "gpu_preview_vs_committed": gpu_vs_command.to_json(Some(GPU_PREVIEW_VS_COMMAND_TOL_255)),
+            "gpu_preview_vs_cpu_preview": gpu_vs_cpu.to_json(Some(GPU_PREVIEW_VS_CPU_TOL_255)),
+            "original_vs_committed": applied.to_json(None),
+        },
+        "images": images,
+    }))
+}
+
+/// The `--visual-evidence` payload for the `--json` report: two cases (no selection, selection),
+/// each with the original, GPU preview and committed-command PNGs plus their parity numbers.
+fn visual_evidence(gpu: &mut Option<Gpu>) -> Result<Value, String> {
+    let (w, h) = (EVIDENCE_W, EVIDENCE_H);
+    let (source_head, source_head_source) = source_head();
+    let mut cases = Vec::new();
+    for selection in [false, true] {
+        cases.push(evidence_case(w, h, selection, &mut *gpu)?);
+    }
+    Ok(json!({
+        "kind": "clipped-curves-preview",
+        "scratch_only": true,
+        "issue": 7487,
+        "feature_base": FEATURE_BASE,
+        "source_head": source_head,
+        "source_head_source": source_head_source,
+        "fixture": {
+            "builder": "clipped_document(w, h, styled = false)",
+            "width": w,
+            "height": h,
+            "mode": "RGB",
+            "depth": "U8",
+            "styled_target": false,
+            "note": "synthetic geometric fills only; no photo and no personal data",
+        },
+        "cases": cases,
+    }))
+}
+
 /// Write the `--json` report of the rows measured so far (shared by the full run and the early
-/// `--only clipped` path).
-fn write_report(b: &Bench, args: &[String], w: u32, h: u32) {
+/// `--only clipped` path). `evidence` is the scratch `--visual-evidence` payload, when requested.
+fn write_report(b: &Bench, args: &[String], w: u32, h: u32, evidence: Option<&Value>) {
     let Some(out) = arg(args, "--json") else { return };
     let rows: Vec<Value> = b
         .rows
@@ -391,12 +620,28 @@ fn write_report(b: &Bench, args: &[String], w: u32, h: u32) {
         })
         .collect();
     let context = json!({"gpu_adapter": b.gpu.as_ref().map(|g| g.adapter_name.as_str())});
-    let report = json!({"width": w, "height": h, "gpu": b.gpu.is_some(), "context": context, "rows": rows});
+    let mut report = json!({"width": w, "height": h, "gpu": b.gpu.is_some(), "context": context, "rows": rows});
+    if let Some(evidence) = evidence {
+        report["visual_evidence"] = evidence.clone();
+    }
     std::fs::write(&out, serde_json::to_string_pretty(&report).unwrap()).expect("write json");
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    let want_evidence = args.iter().any(|a| a == "--visual-evidence");
+    if want_evidence {
+        // The probe only makes sense on the independent clipped fixture, and its bytes must reach
+        // the uploaded `--json` report: refuse otherwise rather than succeed without evidence.
+        if arg(&args, "--only").as_deref() != Some("clipped") {
+            eprintln!("--visual-evidence is only available with --only clipped");
+            std::process::exit(2);
+        }
+        if arg(&args, "--json").is_none() {
+            eprintln!("--visual-evidence needs --json <file> so the PNG evidence reaches the downloaded report");
+            std::process::exit(2);
+        }
+    }
     let (w, h) =
         arg(&args, "--size").and_then(|s| s.split_once('x').map(|(a, b)| (a.parse().unwrap_or(7360), b.parse().unwrap_or(4912)))).unwrap_or((7360, 4912));
     let reps: usize = arg(&args, "--reps").and_then(|v| v.parse().ok()).unwrap_or(5).max(1);
@@ -414,8 +659,21 @@ fn main() {
     // 36 MP photo, encoding JPEG, or opening/exporting PSD. That keeps the run's retained
     // memory lower and avoids unrelated rows that `--only` would otherwise execute once.
     if arg(&args, "--only").as_deref() == Some("clipped") {
+        // The evidence runs before the (default 36 MP) benchmark fixtures so its small GPU render
+        // is independent of whatever the clipped rows leave resident.
+        let evidence = if want_evidence {
+            match visual_evidence(&mut b.gpu) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    eprintln!("visual evidence failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            None
+        };
         clipped_preview_group(&mut b, w, h);
-        write_report(&b, &args, w, h);
+        write_report(&b, &args, w, h, evidence.as_ref());
         return;
     }
 
@@ -615,5 +873,5 @@ fn main() {
         ms(t) + b.refresh(&s, false)
     });
 
-    write_report(&b, &args, w, h);
+    write_report(&b, &args, w, h, None);
 }
