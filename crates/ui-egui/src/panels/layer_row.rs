@@ -238,7 +238,7 @@ pub(super) fn layer_row(
     // otherwise lay out names, icons and thumbnails every frame. An off-screen group row keeps only
     // its disclosure widget (accessibility, scroll-to) and paints nothing (#13117). A row whose
     // menu (its own or the eye column's) is open, or that is being renamed, stays whole.
-    if !ui.is_rect_visible(rect) && !resp.context_menu_opened() && !eye_menu_open(ui, l) && crate::layer_row_ui::renaming(ctx) != Some(l.id.0) {
+    if !ui.is_rect_visible(rect) && !resp.context_menu_opened() && !(eye_menu_open(ui, l) && false) && crate::layer_row_ui::renaming(ctx) != Some(l.id.0) {
         if l.is_group() {
             let (x, _) = triangle_x_and_thumb_size(l, depth, rect, base);
             crate::layer_tree_ui::disclosure_widget(ui, rect, x, l, actions);
