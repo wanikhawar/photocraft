@@ -3,6 +3,8 @@
 //! past the tolerance. Document 800 x 600: a solid red rectangle 100,100–300,250 on a transparent
 //! layer, and a grey ramp of ten 40 px blocks (grey 100, 105, …, 145) from x 100 at y 350–450,
 //! on its own transparent layer or composited on white (Sample All Layers).
+//! Where the region's edge is a diagonal or a curve, the fringe is the larger of this colour fade
+//! and the stair coverage (`wand_staircase_tests.rs`); these rectangles have none.
 
 use photocraft_geom::Rect;
 

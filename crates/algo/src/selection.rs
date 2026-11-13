@@ -177,7 +177,9 @@ fn close(a: [f32; 4], b: [f32; 4], tol: f32) -> bool {
 /// Pixels similar to the seed pixel (per-channel difference ≤ `tolerance`
 /// levels, alpha included; fully transparent pixels match regardless of hidden RGB).
 /// `contiguous` limits to the 4-connected region
-/// around the seed. `px` covers `area`.
+/// around the seed. `px` covers `area`. With `anti_alias`, the region stays fully selected and
+/// each pixel just outside it gets the larger of the colour fringe ([`fringe_coverage`]) and the
+/// stair coverage ([`stair_coverage`]).
 pub fn magic_wand(px: &[[f32; 4]], area: Rect, seed: (i32, i32), tolerance: f32, contiguous: bool, anti_alias: bool) -> Vec<f32> {
     let (w, h) = (area.width() as usize, area.height() as usize);
     let Some(n) = w.checked_mul(h).filter(|&n| n <= px.len()) else { return Vec::new() };
@@ -221,11 +223,16 @@ pub fn magic_wand(px: &[[f32; 4]], area: Rect, seed: (i32, i32), tolerance: f32,
     if anti_alias {
         let tol = (tolerance + 1e-3).floor().max(0.0);
         let src = m.clone();
+        let stair = stair_coverage(w, h, (0, 0, w, h), |x, y| src[y * w + x] > 0.0);
         for (i, v) in m.iter_mut().enumerate() {
-            if src[i] == 0.0 && touches_region(i % w, i / w, w, h, |x, y| src[y * w + x] > 0.0) {
-                let p = px[i];
-                let over = (0..3).map(|c| (p[c] - target[c]).abs() * 255.0).fold(0.0f32, f32::max) - tol;
-                *v = f32::from(fringe_coverage(over, p[3].min(target[3]) * 255.0)) / 255.0;
+            if src[i] == 0.0 {
+                let mut c = stair.get(i).copied().unwrap_or(0);
+                if touches_region(i % w, i / w, w, h, |x, y| src[y * w + x] > 0.0) {
+                    let p = px[i];
+                    let over = (0..3).map(|c| (p[c] - target[c]).abs() * 255.0).fold(0.0f32, f32::max) - tol;
+                    c = c.max(fringe_coverage(over, p[3].min(target[3]) * 255.0));
+                }
+                *v = f32::from(c) / 255.0;
             }
         }
     }
@@ -241,10 +248,95 @@ const FRINGE_LEVELS: f32 = 216.0;
 /// different colour channel is `over` levels past the tolerance, and `alpha` (0–255) the lower
 /// of its and the clicked pixel's opacity. Photoshop keeps the region itself fully selected and
 /// softens only the pixels just outside it, fading with the distance past the tolerance; a
-/// neighbour without colour (transparent, next to a shape on its own layer) gets none.
+/// neighbour without colour (transparent, next to a shape on its own layer) gets none. The
+/// fringe a pixel finally gets is the larger of this colour fade and [`stair_coverage`].
 fn fringe_coverage(over: f32, alpha: f32) -> u8 {
     let k = (1.0 - over.max(0.0) / FRINGE_LEVELS).clamp(0.0, 1.0) * (alpha / 255.0).clamp(0.0, 1.0);
     (k * 255.0).round() as u8
+}
+
+/// Exact area under a ramp that starts at 0 with height 1 and falls linearly to 0 at `d > 0`,
+/// over the span `[lo, hi]`.
+fn ramp_area(lo: f32, hi: f32, d: f32) -> f32 {
+    let (u0, u1) = (lo.max(0.0), hi.min(d));
+    if u1 > u0 { (u1 - u0) - (u1 * u1 - u0 * u0) / (2.0 * d) } else { 0.0 }
+}
+
+/// Stair-step softening for the anti-aliased wand, from the binary region alone (so the 8-bit
+/// and f32 wands share it). `inside(x, y)` says whether a pixel of the `w` x `h` area is in the
+/// region; anything outside the area counts as outside. Returns coverage (0-255) for the
+/// `window` `(x0, y0, x1, y1)`, row-major, which must hold every pixel 4-adjacent to the region.
+///
+/// For each of the four sides, a run is a maximal span of outside pixels in a line whose
+/// neighbour on that side is in the region. A run that ends a one-row step up at one end and a
+/// one-row step down at the other (a diagonal) gets a linear ramp falling from the up end across
+/// the run; a run with a one-row step up at both ends (a notch) gets a ramp from each end over
+/// half the run. A pixel's coverage is the exact area under the ramp across its column, the
+/// largest over the four sides. Straight edges, corners and steps of more than one row get none.
+fn stair_coverage(w: usize, h: usize, window: (usize, usize, usize, usize), inside: impl Fn(usize, usize) -> bool) -> Vec<u8> {
+    let (x0, y0, x1, y1) = window;
+    let (bw, bh) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
+    let mut out = vec![0u8; bw.saturating_mul(bh)];
+    if bw == 0 || bh == 0 || x1 > w || y1 > h {
+        return Vec::new();
+    }
+    for (swap, neg) in [(false, false), (false, true), (true, false), (true, true)] {
+        // `t` runs along a line, `s` picks the line; the region lies on the `s + 1` side.
+        let (t0, t1, s0, s1) = if swap { (y0 as i32, y1 as i32, x0 as i32, x1 as i32) } else { (x0 as i32, x1 as i32, y0 as i32, y1 as i32) };
+        let (sl, sh) = if neg { (1 - s1, -s0) } else { (s0, s1 - 1) };
+        let pos = |t: i32, s: i32| {
+            let s = if neg { -s } else { s };
+            if swap { (s, t) } else { (t, s) }
+        };
+        let ins = |t: i32, s: i32| {
+            let (x, y) = pos(t, s);
+            x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h && inside(x as usize, y as usize)
+        };
+        for s in sl..=sh {
+            let mut t = t0;
+            while t < t1 {
+                if ins(t, s) || !ins(t, s + 1) {
+                    t += 1;
+                    continue;
+                }
+                let a = t;
+                while t + 1 < t1 && !ins(t + 1, s) && ins(t + 1, s + 1) {
+                    t += 1;
+                }
+                let b = t;
+                t += 1;
+                let up = |e: i32| ins(e, s) && !ins(e, s - 1);
+                let down = |e: i32| !ins(e, s) && !ins(e, s + 1) && ins(e, s + 2);
+                let len = (b - a + 1) as f32;
+                // (left ramp length, right ramp length); 0 means no ramp from that end.
+                let (dl, dr) = match (up(a - 1), down(a - 1), up(b + 1), down(b + 1)) {
+                    (true, _, _, true) => (len, 0.0),
+                    (_, true, true, _) => (0.0, len),
+                    (true, _, true, _) => (len / 2.0, len / 2.0),
+                    _ => continue,
+                };
+                for p in a..=b {
+                    let mut k = 0.0;
+                    if dl > 0.0 {
+                        k += ramp_area((p - a) as f32, (p - a + 1) as f32, dl);
+                    }
+                    if dr > 0.0 {
+                        k += ramp_area((b - p) as f32, (b - p + 1) as f32, dr);
+                    }
+                    let v = (k.min(1.0) * 255.0).round() as u8;
+                    let (x, y) = pos(p, s);
+                    let cell = |v: i32, o: usize| usize::try_from(v).ok().and_then(|v| v.checked_sub(o));
+                    if let (Some(cx), Some(cy)) = (cell(x, x0), cell(y, y0))
+                        && cx < bw
+                        && let Some(o) = out.get_mut(cy * bw + cx)
+                    {
+                        *o = (*o).max(v);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// True when one of the 8 neighbours of `(x, y)` (inside a `w` x `h` area) is in the region.
@@ -491,6 +583,7 @@ fn region_by_rule(
     let (x1, y1) = ((bx1 + 1 + pad).min(w), (by1 + 1 + pad).min(h));
     let bw = x1 - x0;
     let at = |x: usize, y: usize| marks[y * w + x];
+    let stair = if anti_alias { stair_coverage(w, h, (x0, y0, x1, y1), |x, y| at(x, y) != 0) } else { Vec::new() };
     let mut mask = vec![0u8; bw * (y1 - y0)];
     let fill_row = |yy: usize, out: &mut [u8]| {
         let y = y0 + yy;
@@ -499,10 +592,15 @@ fn region_by_rule(
             let v = at(x, y);
             *o = v;
             // Same rule as `magic_wand`: the region stays fully selected; a pixel just outside
-            // it gets a fringe by how far its colour is past the tolerance.
-            if anti_alias && v == 0 && touches_region(x, y, w, h, |nx, ny| at(nx, ny) != 0) {
-                let p = img[y * w + x];
-                *o = fringe_coverage((distance.rgb(p, target) - tol) as f32, f32::from(p[3].min(target[3])));
+            // it gets the larger of a colour fringe (by how far its colour is past the
+            // tolerance) and the stair coverage of the region's shape.
+            if anti_alias && v == 0 {
+                let mut c = stair.get(yy * bw + xx).copied().unwrap_or(0);
+                if touches_region(x, y, w, h, |nx, ny| at(nx, ny) != 0) {
+                    let p = img[y * w + x];
+                    c = c.max(fringe_coverage((distance.rgb(p, target) - tol) as f32, f32::from(p[3].min(target[3]))));
+                }
+                *o = c;
             }
         }
     };
@@ -889,6 +987,8 @@ mod marquee;
 mod morphology;
 #[cfg(test)]
 mod wand_antialias_tests;
+#[cfg(test)]
+mod wand_staircase_tests;
 
 pub use distance::edt;
 pub use inverse::inverse_surface;
