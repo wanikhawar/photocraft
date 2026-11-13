@@ -289,7 +289,7 @@ pub(crate) fn paint_bucket_cursor(app: &mut PhotocraftApp, painter: &egui::Paint
 pub(super) fn alt_eyedropper(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers) -> bool {
     if matches!(ev, ToolEvent::Down { .. }) {
         let physical_right = app.services.right_button_down.as_ref().is_some_and(|f| f());
-        app.alt_sampling = !physical_right && !app.secondary_erase && alt_samples(app.active_tool(), mods);
+        app.alt_sampling = !physical_right && !app.secondary_erase && (alt_samples(app.active_tool(), mods) || shape_alt_samples(app, mods));
     }
     if !app.alt_sampling {
         return false;
@@ -314,10 +314,26 @@ pub(super) fn alt_eyedropper(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui:
         // While ⇧⌥ stay held after that press, moves sample nothing.
         ToolEvent::Move { .. } if mods.shift => {}
         // Without ⌥: the sample sets the foreground colour, whatever the Eyedropper would do.
-        ToolEvent::Down { x, y, .. } | ToolEvent::Move { x, y, .. } => sample_eyedropper(app, x, y, egui::Modifiers::NONE),
+        ToolEvent::Down { x, y, .. } | ToolEvent::Move { x, y, .. } => {
+            // The Custom Shape tool's Fill takes the sampled colour too (#13467): a solid fill,
+            // which follows the foreground.
+            if sampled_eyedropper(app, x, y, egui::Modifiers::NONE) && app.active_tool() == Tool::CustomShape {
+                app.ui.tool_options.shape_fill = true;
+                app.ui.tool_options.shape_fill_gradient = None;
+            }
+        }
         ToolEvent::Up { .. } => app.alt_sampling = false,
     }
     true
+}
+
+/// The Custom Shape tool samples with ⌥ held at the press only in Shape mode and with no shape
+/// layer active (#13467): with one, ⌥ subtracts from it. Pixels and Path mode weren't measured and
+/// keep drawing from the centre.
+fn shape_alt_samples(app: &PhotocraftApp, mods: egui::Modifiers) -> bool {
+    let shape_layer_active =
+        app.session.active().and_then(|st| st.doc.layer(st.active_layer?)).is_some_and(|l| matches!(l.content, photocraft_doc::LayerContent::Shape(_)));
+    mods.alt && !mods.ctrl && app.active_tool() == Tool::CustomShape && app.ui.tool_options.shape_mode == "shape" && !shape_layer_active
 }
 
 /// Is document point (x, y) on a colour sampler, within the Color Sampler tool's reach of one (7
@@ -328,12 +344,21 @@ fn on_sampler(app: &PhotocraftApp, x: f64, y: f64) -> bool {
 }
 
 #[cfg(test)]
+#[path = "../tools/vector_ui/custom_shape_alt_eyedropper_tests.rs"]
+mod custom_shape_alt_eyedropper_tests;
+
+#[cfg(test)]
 #[path = "../brush_shift_alt_sampler_tests.rs"]
 mod brush_shift_alt_sampler_tests;
 
 /// Sample the image or targeted raster mask at (x, y) using the configured Sample Size.
 /// Write a valid sample to the foreground swatch, or to the background swatch with Alt.
 pub(super) fn sample_eyedropper(app: &mut PhotocraftApp, x: f64, y: f64, mods: egui::Modifiers) {
+    sampled_eyedropper(app, x, y, mods);
+}
+
+/// [`sample_eyedropper`], true when it set a swatch.
+fn sampled_eyedropper(app: &mut PhotocraftApp, x: f64, y: f64, mods: egui::Modifiers) -> bool {
     let rgb = if let Some((surface, canvas)) = eyedropper_mask_source(app) {
         sample_layer_mask(surface, canvas, x, y, app.ui.tool_options.eyedropper_size)
     } else {
@@ -341,8 +366,9 @@ pub(super) fn sample_eyedropper(app: &mut PhotocraftApp, x: f64, y: f64, mods: e
     };
     if let Some(rgb) = rgb {
         let key = if mods.alt { "background" } else { "foreground" };
-        let _ = app.run("tools.setColors", json!({ key: [rgb[0],rgb[1],rgb[2],1.0] }));
+        return app.run("tools.setColors", json!({ key: [rgb[0],rgb[1],rgb[2],1.0] })).is_ok();
     }
+    false
 }
 
 /// Only the Eyedropper's Current Layer and Current & Below modes pick the targeted raster mask.
