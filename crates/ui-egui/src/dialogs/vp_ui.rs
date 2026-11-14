@@ -20,7 +20,7 @@ use egui::{Color32, Pos2, Stroke, TextureHandle, pos2};
 use photocraft_algo::transform::Homography;
 use photocraft_algo::vanishing::{Edge, PlaneCheck, Scene, VpPlane, clone_dabs_from, clone_source};
 use photocraft_doc::{DocId, Document, Layer, LayerContent, LayerId};
-use photocraft_engine::vp_cmds::{CloneSpec, MAX_CLONE_DABS, MAX_CLONE_STROKES, VP, copy_changed, over, paste_onto, visible_image};
+use photocraft_engine::vp_cmds::{CloneSpec, MAX_CLONE_DABS, MAX_CLONE_STROKES, VP, copy_changed, over, paste_onto_shaded, paste_shade_field, visible_image};
 use photocraft_geom::Rect;
 use photocraft_raster::Surface;
 use serde_json::{Value, json};
@@ -95,8 +95,8 @@ struct StampPreview {
     /// The session's `rev`, New Layer and paste it was painted with (any changing repaints it).
     rev: u64,
     new_layer: bool,
-    /// The paste (plane, top-left, width) baked in under the strokes, as OK pastes before it clones.
-    paste: Option<(usize, [f64; 2], f64)>,
+    /// The paste (plane, top-left, width, shade) baked in under the strokes, as OK pastes before it clones.
+    paste: Option<(usize, [f64; 2], f64, f64)>,
     /// The paste landed in `out` (it can fail, or miss the plane).
     baked: bool,
     /// On a new layer: the visible image the strokes sample, with the strokes so far.
@@ -130,6 +130,9 @@ pub struct VpSession {
     canvas: Rect,
     /// The planes' corners; torn-off planes' are derived from their parents ([`Self::resolve`]).
     pub planes: Vec<VpPlane>,
+    /// The focal length saved with the planes (the dialog never edits it): kept for the scene the
+    /// session builds and sent on OK, so reopening and committing does not drop it.
+    focal: Option<f64>,
     /// Per plane: how it was torn off, or `None` for a drawn plane (always the first one).
     pub torn: Vec<Option<Torn>>,
     pub tool: VpTool,
@@ -162,6 +165,8 @@ pub struct VpSession {
     base: Arc<Document>,
     doc_revision: u64,
     preview: Option<StampPreview>,
+    /// The shading the paste takes on, with the document revision it was measured at.
+    shade_field: Option<(u64, Arc<photocraft_algo::surface::ShadingField>)>,
     history: EditHistory<VpEdit>,
 }
 
@@ -240,7 +245,7 @@ impl VpSession {
     fn scene(&self) -> Option<Scene> {
         let first = self.planes.first()?.clone();
         let fallback = f64::from(self.canvas.width().max(self.canvas.height()));
-        let mut sc = Scene::new(first, self.center(), None, fallback);
+        let mut sc = Scene::new(first, self.center(), self.focal, fallback);
         sc.planes.extend(self.planes.iter().skip(1).cloned());
         Some(sc)
     }
@@ -262,9 +267,9 @@ impl VpSession {
         self.selected.filter(|i| *i < self.planes.len()).or_else(|| (!self.planes.is_empty()).then_some(0))
     }
 
-    /// What OK pastes: the plane, the top-left and the width.
-    fn paste_key(&self) -> Option<(usize, [f64; 2], f64)> {
-        self.paste_plane().map(|i| (i, self.paste_at, self.paste_width))
+    /// What OK pastes: the plane, the top-left, the width and the shade.
+    fn paste_key(&self) -> Option<(usize, [f64; 2], f64, f64)> {
+        self.paste_plane().map(|i| (i, self.paste_at, self.paste_width, self.paste_shade.clamp(0.0, 1.0)))
     }
 
     /// The stamp preview is current and already shows the paste under the strokes.
@@ -303,6 +308,9 @@ impl VpSession {
             })
             .collect();
         let mut p = json!({"planes": planes});
+        if let Some(f) = self.focal {
+            p["focalLength"] = json!(f);
+        }
         if let Some(i) = self.paste_plane() {
             let mut entry = json!({"plane": i, "at": self.paste_at, "width": self.paste_width});
             if self.paste_shade > 0.0 {
@@ -336,7 +344,7 @@ impl VpSession {
         self.torn.resize(self.planes.len(), None);
         let Some(first) = self.planes.first().cloned() else { return };
         let fallback = f64::from(self.canvas.width().max(self.canvas.height()));
-        let mut sc = Scene::new(first, self.center(), None, fallback);
+        let mut sc = Scene::new(first, self.center(), self.focal, fallback);
         for i in 1..self.planes.len() {
             match self.torn.get(i).copied().flatten().filter(|t| t.from < i) {
                 Some(t) => {
@@ -444,7 +452,7 @@ impl VpSession {
             return;
         }
         let fallback = f64::from(self.canvas.width().max(self.canvas.height()));
-        let mut sc = Scene::new(first, self.center(), None, fallback);
+        let mut sc = Scene::new(first, self.center(), self.focal, fallback);
         sc.planes.extend(self.planes.iter().take(i).skip(1).cloned());
         let e = edge_index(t.edge);
         let mut miss = |angle: f64, depth: f64| -> f64 {
@@ -526,6 +534,18 @@ impl VpSession {
 
     /// Paints what the preview doesn't show yet (all of it after the planes changed). `key`
     /// names a new preview. False when nothing changed.
+    /// The shading field of the document the paste is shaded by, built once per document revision.
+    fn shade_field(&mut self) -> Option<Arc<photocraft_algo::surface::ShadingField>> {
+        if let Some((rev, f)) = &self.shade_field
+            && *rev == self.doc_revision
+        {
+            return Some(f.clone());
+        }
+        let field = paste_shade_field(&self.base).ok()?;
+        self.shade_field = Some((self.doc_revision, field.clone()));
+        Some(field)
+    }
+
     fn paint_preview(&mut self, key: impl FnOnce() -> u64) -> bool {
         if self.strokes.is_empty() {
             let had = self.preview.is_some();
@@ -547,13 +567,17 @@ impl VpSession {
                 return self.preview.take().is_some();
             };
             let mut out = if self.new_layer { Surface::new(layer.format()) } else { layer.clone() };
+            // As OK does: the photo's shading, measured on the document as it is now.
+            let field = if paste.is_some_and(|k| k.3 > 0.0) { self.shade_field() } else { None };
             // OK pastes first and the strokes then paint over (and sample) the pasted pixels.
-            if let (Some((i, at, width)), Some(c)) = (paste, self.clip.as_ref())
+            if let (Some((i, at, width, shade)), Some(c)) = (paste, self.clip.as_ref())
                 && self.planes.get(i).is_some_and(|p| p.check(self.center()) != PlaneCheck::Invalid)
-                && let Ok(r) = paste_onto(&sc, &mut out, i, &c.surface, c.rect, at, width)
             {
-                area = r.intersect(&canvas);
-                baked = !r.is_empty();
+                let field = field.as_ref().map(|f| (&**f, shade as f32));
+                if let Ok(r) = paste_onto_shaded(&sc, &mut out, i, &c.surface, c.rect, at, width, field) {
+                    area = r.intersect(&canvas);
+                    baked = !r.is_empty();
+                }
             }
             let work = self.new_layer.then(|| {
                 let mut w = visible_image(&self.base);
@@ -838,6 +862,7 @@ pub fn begin(app: &mut PhotocraftApp, ctx: &egui::Context) -> Result<(), String>
         layer,
         canvas,
         planes: saved.clone(),
+        focal: st.doc.perspective.focal.filter(|f| fresh && f.is_finite() && *f > 0.0),
         torn: saved_torn.clone(),
         tool: if saved.is_empty() { VpTool::CreatePlane } else { VpTool::EditPlane },
         pending: Vec::new(),
@@ -858,6 +883,7 @@ pub fn begin(app: &mut PhotocraftApp, ctx: &egui::Context) -> Result<(), String>
         base,
         doc_revision,
         preview: None,
+        shade_field: None,
         history: EditHistory::new(&VpEdit {
             planes: saved,
             torn: saved_torn,

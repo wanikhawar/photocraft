@@ -1579,10 +1579,17 @@ impl RoundTip {
     }
 }
 
-/// The surface outline a dab's computed tip is drawn inside (`None`: a dual or sampled tip, or no
-/// valid footprint; those keep their ellipse).
+/// The surface outline a dab's computed tip is drawn inside (`None`: a dual or sampled tip, an
+/// elliptical tip (roundness below 1: the outline is a bent circle, so it would drop the tip's
+/// roundness and rotation), or no valid footprint; those keep their ellipse).
 pub(super) fn surface_outline(d: &Dab, dual: bool, sampled: bool) -> Option<&crate::surface::Footprint> {
-    if dual || sampled { None } else { d.footprint.as_ref().filter(|f| f.is_valid()) }
+    if dual || sampled || d.roundness < 1.0 { None } else { d.footprint.as_ref().filter(|f| f.is_valid()) }
+}
+
+/// Does a surface footprint apply to `brush`'s tip: a computed, circular one (as
+/// [`surface_outline`] decides per dab)? The brush cursor asks the same to draw the outline.
+pub fn footprint_tip(brush: &crate::BrushSettings) -> bool {
+    matches!(brush.tip, crate::brush::TipShape::Round) && brush.roundness >= 1.0
 }
 
 /// The tip's roundness: 1 inside a surface outline (which holds the squash), else the dab's.

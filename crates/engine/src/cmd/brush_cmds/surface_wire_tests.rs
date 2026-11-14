@@ -696,3 +696,56 @@ fn a_depth_stroke_next_to_an_occlusion_edge_does_not_spill_onto_the_far_surface(
     let c = brush_cursor_shape(&mut s, 92.0, 50.0, 20.0).unwrap();
     assert!(c.outline.unwrap()[0] < 12.0);
 }
+
+#[test]
+fn the_eraser_on_a_mask_has_no_surface_effects_in_commit_and_live() {
+    let mut s = striped(400, 300);
+    let id = s.active().unwrap().active_layer.unwrap();
+    s.edit("mask", |doc, _| {
+        doc.layer_mut(id).unwrap().mask = Some(photocraft_doc::LayerMask::reveal_all());
+        Ok(())
+    })
+    .unwrap();
+    // No saved planes: the eraser, turned into background painting on a mask, must not ask for them.
+    let p =
+        json!({"points": [[200, 270], [200, 140]], "erase": true, "target": "mask", "brush": {"size": 30, "hardness": 1, "surface": {"perspective": true}}});
+    s.execute("paint.stroke", p.clone()).unwrap();
+    assert!(LiveStroke::begin_with(&s, "paint.pencil", &p).is_ok());
+    assert!(LiveStroke::begin_with(&s, "paint.stroke", &p).is_ok());
+    // With planes the erasure is not deformed: the same width at both ends.
+    s.execute("perspective.setPlanes", json!({"planes": [FLOOR]})).unwrap();
+    s.execute("paint.stroke", json!({"points": [[200, 270], [200, 140]], "color": "#000000", "target": "mask", "brush": {"size": 30, "hardness": 1}})).unwrap();
+    s.execute("paint.stroke", p).unwrap();
+    let m = |x, y| s.active().unwrap().doc.layer(id).unwrap().mask.as_ref().unwrap().surface.pixel(x, y)[0];
+    assert!(m(200, 270) > 0.99 && m(200, 150) > 0.99, "erased back to white");
+    assert!(m(200 - 11, 150) > 0.99 && m(200 + 11, 150) > 0.99, "a plain 30 px erasure, not shrunk by the plane");
+}
+
+#[test]
+fn follow_depth_and_perspective_keep_the_planes_foreshortening_in_the_footprint() {
+    // Flat depth with size by depth: the depth footprint alone is a circle, so any squash in the
+    // combined outline is the receding plane's (rays 0 and 16 run along x, 8 and 24 along y).
+    let mut s = depth_doc(400, 300, "Depth", |_, _| 0.6);
+    s.execute("perspective.setPlanes", json!({"planes": [FLOOR]})).unwrap();
+    s.execute("tools.setBrush", depth_brush(json!({"sizeByDepth": true, "perspective": true}))).unwrap();
+    let both = brush_cursor_shape(&mut s, 200.0, 200.0, 20.0).unwrap();
+    let rays = both.outline.expect("a footprint with depth on");
+    let (along_x, along_y) = (rays[0].min(rays[16]), rays[8].max(rays[24]));
+    assert!(along_y < along_x * 0.8, "the plane's foreshortening is in the outline: x {along_x}, y {along_y}");
+    assert!(rays.iter().all(|r| *r <= both.radius + 1e-4 && *r > 0.0));
+    // Depth alone stays a circle there.
+    s.execute("tools.setBrush", json!({"surface": {"perspective": false}})).unwrap();
+    let depth_only = brush_cursor_shape(&mut s, 200.0, 200.0, 20.0).unwrap();
+    assert!(depth_only.outline.unwrap().iter().all(|r| (r - depth_only.radius).abs() < 1e-4));
+}
+
+#[test]
+fn an_all_layers_field_is_rebuilt_when_the_global_light_changes() {
+    let mut s = folds_doc(200, 100);
+    folds_stroke(&mut s, 30);
+    folds_stroke(&mut s, 50);
+    assert_eq!(s.surface_cache.field_builds(), 1);
+    s.execute("layer.layerStyle.globalLight", json!({"angle": 45, "altitude": 60})).unwrap();
+    folds_stroke(&mut s, 70);
+    assert_eq!(s.surface_cache.field_builds(), 2, "the composite depends on the global light");
+}

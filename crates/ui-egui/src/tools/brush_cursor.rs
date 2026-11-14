@@ -159,7 +159,7 @@ pub(crate) fn surface_cursor(
         painter.line_segment([p, at], egui::Stroke::new(1.0, t.accent));
     }
     // A dab bent over the depth: its own 32-point outline.
-    if let Some(ring) = shape.outline.and_then(|rays| outline_ring(xf, &rays)) {
+    if let Some(ring) = bent_ring(xf, brush, &shape, normal) {
         let extent = ring.iter().fold(0.0f32, |m, v| m.max(v.length()));
         if extent < MIN_RADIUS {
             return crate::tool_cursor::crosshair(painter, at, 4.0, 0.0);
@@ -167,6 +167,33 @@ pub(crate) fn surface_cursor(
         return crate::tool_cursor::outline(painter, at, vec![ring], centre);
     }
     cursor(painter, at, brush, (shape.radius * xf.zoom).max(1.0), axes, normal, centre)
+}
+
+/// The outline of a dab bent over the depth, in screen vectors from its centre: for the tips the
+/// renderer bends (a computed circular one; a sampled or elliptical tip keeps its own outline),
+/// at the contour the Normal Tip preference draws (the 50 % coverage one; Full Size Tip keeps the
+/// whole outline). `None`: draw the dab's ellipse or tip outline instead.
+pub(crate) fn bent_ring(
+    xf: &crate::canvas::ViewXform,
+    brush: &BrushSettings,
+    shape: &photocraft_engine::brush_cmds::CursorShape,
+    normal: bool,
+) -> Option<Vec<Vec2>> {
+    if !photocraft_paint::render::footprint_tip(brush) {
+        return None;
+    }
+    let ring = outline_ring(xf, &shape.outline?)?;
+    Some(scale_ring(ring, brush, shape.radius * xf.zoom, normal))
+}
+
+/// `ring` (a surface outline of a dab of screen radius `radius`) at the contour `normal` asks for:
+/// the 50 % coverage one, as [`cursor`] draws a plain circle, else the full outline.
+pub(crate) fn scale_ring(ring: Vec<Vec2>, brush: &BrushSettings, radius: f32, normal: bool) -> Vec<Vec2> {
+    if !normal || !radius.is_finite() || radius <= 0.0 {
+        return ring;
+    }
+    let k = photocraft_paint::half_coverage_radius(radius, brush.hardness).max(1.0) / radius;
+    ring.into_iter().map(|v| v * k.min(1.0)).collect()
 }
 
 /// The screen vectors (from the dab centre) of the closed polygon through the rays of a surface
@@ -402,6 +429,40 @@ mod tests {
         // Angle pi/2 is up the image (y up): the y axis is the one shortened.
         let b = surface_axes(&xf, 10.0, std::f32::consts::FRAC_PI_2, 0.5);
         assert!(close(b[0], Vec2::new(20.0, 0.0)) && close(b[1], Vec2::new(0.0, 10.0)), "{b:?}");
+    }
+
+    fn bent_shape() -> photocraft_engine::brush_cmds::CursorShape {
+        photocraft_engine::brush_cmds::CursorShape { radius: 10.0, proj_angle: 0.0, proj_scale: 1.0, offset: [0.0; 2], outline: Some([10.0; 32]) }
+    }
+
+    #[test]
+    fn the_depth_outline_is_for_computed_circular_tips_only() {
+        let xf = view(0.0, false, 1.0);
+        let shape = bent_shape();
+        let round = BrushSettings { size: 20.0, hardness: 0.5, ..Default::default() };
+        assert!(bent_ring(&xf, &round, &shape, false).is_some());
+        // The renderer keeps a sampled bitmap tip and an elliptical tip: so does the cursor.
+        let sampled = BrushSettings { tip: TipShape::Sampled(photocraft_paint::tile::GrayTile::from_fn(2, 2, |_, _| 1.0)), ..round.clone() };
+        assert!(bent_ring(&xf, &sampled, &shape, false).is_none());
+        let flat = BrushSettings { roundness: 0.3, ..round };
+        assert!(bent_ring(&xf, &flat, &shape, false).is_none());
+    }
+
+    #[test]
+    fn the_depth_outline_follows_the_normal_tip_rule() {
+        let xf = view(0.0, false, 1.0);
+        let shape = bent_shape();
+        let soft = BrushSettings { size: 20.0, hardness: 0.0, ..Default::default() };
+        let extent = |r: &[Vec2]| r.iter().fold(0.0f32, |m, v| m.max(v.length()));
+        let full = bent_ring(&xf, &soft, &shape, false).unwrap();
+        let normal = bent_ring(&xf, &soft, &shape, true).unwrap();
+        // Full Size Tip: the whole outline (10 px at zoom 2). Normal Tip: the 50 % contour, as the plain circle.
+        assert!((extent(&full) - 20.0).abs() < 1e-3, "{}", extent(&full));
+        let half = photocraft_paint::half_coverage_radius(20.0, 0.0);
+        assert!((extent(&normal) - half).abs() < 1e-3 && extent(&normal) < extent(&full) * 0.9, "{} vs {half}", extent(&normal));
+        // A hard tip has its half-coverage contour at the edge: nothing changes.
+        let hard = BrushSettings { hardness: 1.0, ..soft };
+        assert!((extent(&bent_ring(&xf, &hard, &shape, true).unwrap()) - 20.0).abs() < 0.5);
     }
 
     #[test]

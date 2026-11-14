@@ -133,6 +133,29 @@ fn combine(a: &Local, b: &Local) -> Option<Local> {
     local.is_valid().then_some(local)
 }
 
+/// `f` seen through the plane's foreshortening (its squash and direction; its scale is already in
+/// the footprint's radius): the outline of the circle-like footprint under the plane's matrix
+/// `I − (1 − squash) u uᵀ`, resampled at the footprint's own directions. Each output direction is
+/// mapped back through the inverse matrix, where the footprint is read.
+fn squash_footprint(f: &Footprint, plane: &Local) -> Option<Footprint> {
+    if !plane.squash.is_finite() || !plane.squash_angle.is_finite() {
+        return None;
+    }
+    let squash = plane.squash.clamp(0.05, 1.0);
+    let (sn, cs) = plane.squash_angle.sin_cos();
+    let k = 1.0 / squash - 1.0;
+    let mut rays = f.rays;
+    for (i, ray) in rays.iter_mut().enumerate() {
+        let (dsn, dcs) = (i as f32 * std::f32::consts::TAU / photocraft_paint::surface::FOOTPRINT_RAYS as f32).sin_cos();
+        let along = dcs * cs + dsn * sn;
+        let (ux, uy) = (dcs + k * along * cs, dsn + k * along * sn);
+        // |u| >= 1, so the ray only shortens.
+        *ray = f.radius_at(uy.atan2(ux)) / ux.hypot(uy);
+    }
+    let out = Footprint { rays };
+    out.is_valid().then_some(out)
+}
+
 /// Follow Perspective and Follow Depth together. With a plane map, a dab off every plane is left
 /// alone (depth or not): the stroke is anchored on the plane. On a plane both apply, as in
 /// [`combine`]. Without a plane map the depth scale itself is the size, relative to the median
@@ -155,13 +178,19 @@ impl SurfaceMap for CombinedMap {
         }
     }
 
-    /// With depth, its footprint at the dab's own radius (which already holds the plane's scale);
-    /// with planes only, none: their ellipse is exact. The plane's foreshortening is not in it.
+    /// With depth, its footprint at the dab's own radius (which already holds the plane's scale),
+    /// foreshortened by the plane's squash when planes are followed too; with planes only, none:
+    /// their ellipse is exact. A footprint replaces the dab's projection in the renderer, so it
+    /// must hold the plane's foreshortening itself.
     fn footprint(&self, p: Point, radius: f32, _local: &Local) -> Option<Footprint> {
         let depth = self.depth.as_ref()?;
         // Where the depth map has no projection (flat and unscaled) the dab stays as it is.
         depth.local(p)?;
-        depth.footprint(p, radius)
+        let bent = depth.footprint(p, radius)?;
+        match &self.persp {
+            Some(m) => squash_footprint(&bent, &m.local(p)?),
+            None => Some(bent),
+        }
     }
 
     /// The product of the plane's and the depth's references (as [`combine`] multiplies the scales).
@@ -214,8 +243,8 @@ struct FieldEntry {
 /// entirely (it is hidden from the sample), so painting on it, like changing the selection or the
 /// history, keeps the field; any edit of another layer, or of the canvas, invalidates it. A target
 /// inside a group is compared with its group, so there a stroke does invalidate (a rebuild per
-/// stroke, as before). Document-wide settings other than size and colour mode (patterns, the
-/// colour profile) are not compared.
+/// stroke, as before). All Layers also compares the document's global light (layer
+/// styles read it); other document-wide settings (patterns, the colour profile) are not compared.
 fn same_sources(a: &photocraft_doc::Document, b: &photocraft_doc::Document, sample: SampleMode, layer: Option<LayerId>) -> bool {
     if a.size != b.size || a.mode != b.mode || a.depth != b.depth {
         return false;
@@ -223,7 +252,10 @@ fn same_sources(a: &photocraft_doc::Document, b: &photocraft_doc::Document, samp
     match sample {
         SampleMode::CurrentLayer => layer.is_some_and(|id| matches!((a.layer(id), b.layer(id)), (Some(x), Some(y)) if x == y)),
         SampleMode::AllLayers => {
-            a.layers.len() == b.layers.len() && a.layers.iter().zip(&b.layers).all(|(x, y)| x.id == y.id && (Some(x.id) == layer || x == y))
+            // Layer styles with Use Global Light read the document's light, so it is part of the composite.
+            a.global_light == b.global_light
+                && a.layers.len() == b.layers.len()
+                && a.layers.iter().zip(&b.layers).all(|(x, y)| x.id == y.id && (Some(x.id) == layer || x == y))
         }
     }
 }

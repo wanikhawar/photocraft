@@ -283,6 +283,8 @@ fn stroke_with(s: &mut Session, cmd: &str, p: &Value, label: &str, brush: BrushS
     let bg = crate::color_cmds::swatch_in_doc(s, raw_bg);
     let fg = brush.color;
     let symmetry = s.active().and_then(|st| st.symmetry.clone());
+    // The eraser has no surface effects, also where `stroke_target` turns it into painting.
+    let erasing = brush.erase;
     let (id, brush, zoom) = stroke_target(s, p, brush)?;
     let cmyk = doc_cmyk_space(s);
     // The live stroke the canvas already rendered for exactly these params: take its pixels
@@ -290,7 +292,7 @@ fn stroke_with(s: &mut Session, cmd: &str, p: &Value, label: &str, brush: BrushS
     let live = s.live_commit.take().filter(|l| l.matches(s, cmd, p, &pts));
     let from_live = live.is_some();
     // Surface Color and Follow Perspective, from the document as it is before the stroke.
-    let wiring = if from_live { surface_wire::Wiring::default() } else { surface_wire::Wiring::build(s, cmd, p, &brush, id)? };
+    let wiring = if from_live || erasing { surface_wire::Wiring::default() } else { surface_wire::Wiring::build(s, cmd, p, &brush, id)? };
     let dmg = photocraft_color::convert::with_cmyk_space(cmyk.as_ref(), || {
         s.edit(label, |doc, _| {
             if let Some(l) = live {
@@ -665,10 +667,11 @@ impl LiveStroke {
         };
         let brush = if pencil { pencil_brush(s, p)? } else { with_blend_mode(resolve_brush(s, p, cmd)?, p) };
         let (seed, fg) = (brush.seed, brush.color);
+        let erasing = brush.erase;
         let (layer, mut brush, zoom) = stroke_target(s, p, brush)?;
         // As the commit does: from the document before the stroke, and before a locked layer's
         // eraser turns into painting.
-        let wiring = surface_wire::Wiring::build(s, cmd, p, &brush, layer)?;
+        let wiring = if erasing { surface_wire::Wiring::default() } else { surface_wire::Wiring::build(s, cmd, p, &brush, layer)? };
         let st = s.active().ok_or(EngineError::NoDocument)?;
         let base = (st.doc.id, st.revision);
         let mut doc = (*st.doc).clone();

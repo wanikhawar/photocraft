@@ -188,6 +188,13 @@ pub fn visible_image(doc: &Document) -> Surface {
     crate::file_cmds::flattened(doc, doc.pixel_format())
 }
 
+/// The shading field a paste's `shade` scales its colour by: the visible image of `doc` measured at
+/// the default `shadeDetail`, as the command builds it (the Vanishing Point preview shows the same).
+pub fn paste_shade_field(doc: &Document) -> Result<std::sync::Arc<photocraft_algo::surface::ShadingField>> {
+    let detail = photocraft_paint::SurfaceOptions::default().detail;
+    Ok(std::sync::Arc::new(crate::brush_cmds::surface_wire::field_from_surface(&visible_image(doc), doc.bounds(), VP, detail)?))
+}
+
 fn has_layer(s: &Session) -> std::result::Result<(), String> {
     let d = s.active().ok_or("no document open")?;
     match d.active_layer.and_then(|id| d.doc.layer(id)).map(|l| &l.content) {

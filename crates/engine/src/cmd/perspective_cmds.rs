@@ -72,8 +72,11 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         Some(Value::Null) => None,
         Some(v) => Some(v.as_f64().filter(|f| f.is_finite() && *f > 0.0).ok_or_else(|| bad("`focal` must be a number above 0, or null"))?),
     };
-    let new = PerspectivePlanes { planes, focal, size: Some([d.size.width, d.size.height]) };
-    if new == d.perspective || (new.planes.is_empty() && d.perspective.is_empty()) {
+    // Without planes there is no canvas size to record: the candidate keeps the saved one, so only
+    // the planes and the focal length decide whether anything changes.
+    let size = if planes.is_empty() { d.perspective.size } else { Some([d.size.width, d.size.height]) };
+    let new = PerspectivePlanes { planes, focal, size };
+    if new == d.perspective {
         return Ok(json!({"changed": false}));
     }
     s.edit("Set Perspective Planes", |doc, _| {
@@ -215,6 +218,26 @@ mod tests {
         assert_eq!(s.active().unwrap().history.past_len(), steps + 1);
         s.undo();
         assert!(s.active().unwrap().doc.perspective.is_empty());
+    }
+
+    #[test]
+    fn a_focal_length_with_no_planes_is_set_and_cleared() {
+        let mut s = session();
+        let steps = s.active().unwrap().history.past_len();
+        assert_eq!(s.execute(SET, json!({"planes": [], "focal": 500})).unwrap()["changed"], true);
+        assert_eq!(s.active().unwrap().doc.perspective.focal, Some(500.0));
+        assert_eq!(s.execute(PLANES, json!({})).unwrap()["focal"], json!(500.0));
+        // The same again, and no planes with the focal kept, change nothing.
+        assert_eq!(s.execute(SET, json!({"planes": [], "focal": 500})).unwrap()["changed"], false);
+        assert_eq!(s.execute(SET, json!({"planes": []})).unwrap()["changed"], false);
+        assert_eq!(s.active().unwrap().history.past_len(), steps + 1);
+        // null clears the retained focal length.
+        assert_eq!(s.execute(SET, json!({"planes": [], "focal": null})).unwrap()["changed"], true);
+        assert_eq!(s.active().unwrap().doc.perspective.focal, None);
+        assert_eq!(s.execute(SET, json!({"planes": [], "focal": null})).unwrap()["changed"], false);
+        assert_eq!(s.active().unwrap().history.past_len(), steps + 2);
+        s.undo();
+        assert_eq!(s.active().unwrap().doc.perspective.focal, Some(500.0));
     }
 
     #[test]

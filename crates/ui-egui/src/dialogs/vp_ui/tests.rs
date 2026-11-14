@@ -479,3 +479,63 @@ fn paste_shade_is_sent_only_when_set_and_steps_with_undo() {
     app.distort.vanishing.as_mut().unwrap().step(Step::Undo);
     assert_eq!(app.distort.vanishing.as_ref().unwrap().paste_shade, 0.6);
 }
+
+#[test]
+fn the_saved_focal_length_survives_reopening_and_ok() {
+    let (ctx, mut app) = app_with_layer();
+    copy_red_square(&mut app);
+    let floor = [[70.0, 60.0], [170.0, 60.0], [220.0, 150.0], [20.0, 150.0]];
+    app.session
+        .edit("planes", |doc, _| {
+            doc.perspective = photocraft_doc::PerspectivePlanes { planes: vec![floor], focal: Some(500.0), size: Some([240, 160]) };
+            Ok(())
+        })
+        .unwrap();
+    crate::distort_ui::menu(&mut app, &ctx, VP, &json!({})).unwrap().unwrap();
+    let s = app.distort.vanishing.as_ref().unwrap();
+    assert_eq!(s.focal, Some(500.0));
+    assert_eq!(s.params()["focalLength"], json!(500.0), "the commit sends the saved focal length");
+    // The session's scene uses it: another camera gives other plane geometry.
+    let with_saved = s.frame(0).unwrap().1;
+    let sess = app.distort.vanishing.as_mut().unwrap();
+    sess.focal = Some(5000.0);
+    let other = sess.frame(0).unwrap().1;
+    assert_ne!(with_saved, other);
+    sess.focal = Some(500.0);
+    // OK with a paste keeps the focal length with the document.
+    let r = commit(&mut app).unwrap();
+    assert_eq!(r["committed"], true, "{r}");
+    assert_eq!(app.session.active().unwrap().doc.perspective.focal, Some(500.0));
+}
+
+#[test]
+fn the_stamp_preview_shades_the_paste_like_ok_and_repaints_when_the_shade_changes() {
+    let (ctx, mut app) = app_with_layer();
+    copy_red_square(&mut app);
+    // Fine stripes in the photo under the plane: the paste takes them on when shaded.
+    app.session
+        .edit("stripes", |doc, active| {
+            let surf = doc.layer_mut(active.unwrap()).unwrap().surface_mut().unwrap();
+            for x in 60..240 {
+                let v = if x % 2 == 0 { 0.2 } else { 0.8 };
+                surf.fill_rect(Rect::new(x, 0, x + 1, 160), &[v, v, v, 1.0]);
+            }
+            Ok(())
+        })
+        .unwrap();
+    crate::distort_ui::menu(&mut app, &ctx, VP, &json!({})).unwrap().unwrap();
+    control(
+        &mut app,
+        &json!({"planes": [{"corners": [[10, 10], [230, 10], [230, 150], [10, 150]]}], "clone": [{"source": [100, 60], "points": [[40, 120]], "size": 8, "hardness": 80}]}),
+    )
+    .unwrap();
+    let shown = |app: &PhotocraftApp| photocraft_compose::flatten(&app.distort.vanishing.as_ref().unwrap().shown().unwrap().0).into_px();
+    let unshaded = shown(&app);
+    control(&mut app, &json!({"pasteShade": 1.0})).unwrap();
+    sync_preview(&mut app);
+    let shaded = shown(&app);
+    assert_ne!(unshaded, shaded, "changing the shade repaints the preview");
+    // What the preview shows is what OK commits.
+    commit(&mut app).unwrap();
+    assert_eq!(photocraft_compose::flatten(&app.session.active().unwrap().doc).px, shaded);
+}

@@ -242,3 +242,24 @@ fn a_footprint_cuts_the_dab_to_its_outline() {
     assert!(at(21, 30) > 0.99, "west, 9 px out, is inside");
     assert!(at(33, 30) > 0.99, "east, 3 px out, is inside");
 }
+
+#[test]
+fn a_footprint_leaves_an_elliptical_tip_alone() {
+    // Flat depth gives a circular footprint; it must not turn a flat (roundness 0.2) tip round.
+    for angle in [0.0, 40.0] {
+        let ctx = BrushContext::new(&BrushSettings { hardness: 1.0, ..BrushSettings::default() });
+        let mut plain = Dab::round(Point::new(30.25, 30.75), 12.0, 1.0);
+        plain.roundness = 0.2;
+        plain.angle = f32::to_radians(angle);
+        let mut foot = plain;
+        foot.footprint = Some(crate::surface::Footprint { rays: [12.0; 32] });
+        let ((ra, a), (rb, b)) = (coverage_of(&ctx, &plain), coverage_of(&ctx, &foot));
+        assert_eq!(ra, rb);
+        assert!(a.iter().zip(&b).all(|(x, y)| (x - y).abs() < 1e-5), "angle {angle}");
+        // And it really is flat: little coverage 8 px above the centre.
+        let at = |x: i32, y: i32| a[((y - ra.y0) * ra.width() as i32 + (x - ra.x0)) as usize];
+        if angle == 0.0 {
+            assert!(at(30, 22) < 0.01 && at(38, 31) > 0.5);
+        }
+    }
+}
