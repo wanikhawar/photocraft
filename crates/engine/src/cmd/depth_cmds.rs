@@ -1,77 +1,52 @@
-//! Monocular depth estimation: the model store (download, import, status) and `image.estimateDepth`.
+//! `image.estimateDepth`: relative depth of the visible image into an alpha channel.
 //!
-//! The weights (about 95 MB) are not shipped. The desktop and the CLI inject a models folder and
-//! a [`FetchFn`] (a background download); the engine owns the state, so the GUI, CLI and MCP see
-//! the same status. Nothing is downloaded until `depth.downloadModel` runs: running it is the
-//! consent. The web build injects nothing, so these commands are disabled there.
+//! The model is not PhotoCraft's: the work is done by the shared Craft AI layer's `estimate-depth`
+//! tool (see [`ai`]), which owns the model files and their setup (Set up AI). This command sends
+//! it the picture, refines the 16-bit gray picture it returns so edges follow the photo, and writes
+//! the channel as one undo step. On the web build the tool does not exist and the command is
+//! disabled.
+// The web build has no tool, so most of the reduction code below is unused there.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use photocraft_depth::{DepthError, DepthMap, MAX_PIXELS, Model, WEIGHTS, WeightFile};
 use photocraft_doc::{AlphaChannel, DocId, Document};
 use photocraft_geom::Rect;
 use photocraft_raster::Surface;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::channel_cmds::{channel_format, plane_surface};
-use crate::commands::{CommandSpec, always};
+use crate::commands::CommandSpec;
 use crate::{EngineError, Result, Session};
 
-/// What a running download reports.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FetchEvent {
-    /// Bytes received so far over the bytes of every weight file.
-    Progress { done: u64, total: u64 },
-    /// The download ended (`Err` with a message, also when it was cancelled).
-    Done(std::result::Result<(), String>),
-}
+#[cfg(not(target_arch = "wasm32"))]
+pub mod ai;
+#[cfg(not(target_arch = "wasm32"))]
+pub use ai::{AiHost, AiState, Estimator, TOOL};
 
-/// Starts downloading every file of [`WEIGHTS`] into the given folder (verifying size and sha256)
-/// on a background thread and returns at once. The flag asks it to stop. Only public model files
-/// are requested; no document or personal data is sent.
-pub type FetchFn = Box<dyn FnMut(PathBuf, Arc<AtomicBool>) -> std::result::Result<Receiver<FetchEvent>, String> + Send>;
-
-/// A depth estimator over interleaved RGB (0..1): the test hook that replaces the model.
-pub type Estimator = Arc<dyn Fn(&[f32], u32, u32) -> std::result::Result<DepthMap, String> + Send + Sync>;
-
-type EstimateFn = dyn Fn(&[f32], u32, u32, &dyn Fn(f32) -> bool) -> Result<DepthMap> + Send + Sync;
-
-/// Pins the closure's signature so its reference arguments are inferred for any lifetime.
-fn boxed<F: Fn(&[f32], u32, u32, &dyn Fn(f32) -> bool) -> Result<DepthMap> + Send + Sync + 'static>(f: F) -> Arc<EstimateFn> {
-    Arc::new(f)
-}
-
-/// Name of the file that remembers which downloads passed their sha256 check.
-const MARKER: &str = "verified.txt";
-/// Longest side handed to the network in `fast` quality (it resizes to 518 anyway).
-const MODEL_INPUT_SIDE: usize = 1024;
-/// Longest side of the working image in `high` quality: four network widths, tiled.
-const HIGH_INPUT_SIDE: usize = photocraft_depth::MODEL_SIZE as usize * 4;
-/// Most tiles `high` quality may use.
-const HIGH_MAX_TILES: u32 = photocraft_depth::MAX_TILES;
+/// Longest side of the picture sent to the tool (the tool resizes it again to its own sizes).
+const SEND_SIDE: usize = 2048;
+/// Most pixels of document the command reads.
+const MAX_DOC_PIXELS: u64 = 1 << 27;
 /// Most floats of full-precision plane the session keeps (the refined plane is at most 4096 x 4096).
 const MAX_PRECISE_FLOATS: usize = 1 << 26;
 /// Longest side of the grid the depth is refined on, before it is stretched to the document.
 const REFINE_SIDE: usize = 4096;
 const MAX_NAME: usize = 255;
-const NOT_INSTALLED: &str = "depth model not installed: run depth.downloadModel";
+/// Said where the tool does not exist.
+pub const UNAVAILABLE_ON_WEB: &str = "Estimate Depth is not available in the browser";
 
 /// How carefully `image.estimateDepth` works.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Quality {
-    /// One network pass over the whole image (depth sample every ~13 px on a 7000 px photo).
+pub(crate) enum Quality {
+    /// One network pass over the whole image.
     Fast,
-    /// A global pass plus overlapping full-resolution tiles on a larger working image.
+    /// A global pass plus overlapping full-resolution tiles (slower, finer folds and edges).
     High,
 }
 
 impl Quality {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Quality::Fast => "fast",
             Quality::High => "high",
@@ -111,248 +86,25 @@ pub fn precise_depth_plane(s: &Session, doc: DocId, channel_name: &str, current_
 
 #[derive(Default)]
 pub struct DepthState {
-    /// The folder the weights live in; `None` where depth is unavailable (the web build).
-    pub models_dir: Option<PathBuf>,
-    pub fetch: Option<FetchFn>,
-    /// Replaces the model when set (tests).
-    pub estimator: Option<Estimator>,
-    progress: Option<(u64, u64)>,
-    error: Option<String>,
-    pending: Option<Receiver<FetchEvent>>,
-    stop: Option<Arc<AtomicBool>>,
-    cancelled: bool,
+    /// The shared AI layer: the tool, its status, and the hook that replaces it in tests.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub ai: ai::AiState,
     /// Shared with the estimate job, which fills it from its worker thread.
     precise: Arc<Mutex<Option<PreciseDepth>>>,
-}
-
-impl DepthState {
-    /// Apply download events that arrived since the last call; true when something changed.
-    pub fn poll(&mut self) -> bool {
-        let Some(rx) = &self.pending else { return false };
-        let mut changed = false;
-        let mut finished: Option<std::result::Result<(), String>> = None;
-        loop {
-            match rx.try_recv() {
-                Ok(FetchEvent::Progress { done, total }) => {
-                    self.progress = Some((done, total));
-                    changed = true;
-                }
-                Ok(FetchEvent::Done(r)) => {
-                    finished = Some(r);
-                    break;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    finished = Some(Err("The download stopped unexpectedly".into()));
-                    break;
-                }
-            }
-        }
-        let Some(result) = finished else { return changed };
-        self.pending = None;
-        self.stop = None;
-        self.progress = None;
-        self.error = match result {
-            Ok(()) => self.models_dir.as_deref().and_then(|d| write_marker(d).err()),
-            Err(_) if self.cancelled => None,
-            Err(e) => Some(e),
-        };
-        self.cancelled = false;
-        true
-    }
-
-    pub fn downloading(&self) -> bool {
-        self.pending.is_some()
-    }
-
-    pub fn installed(&self) -> bool {
-        self.models_dir.as_deref().is_some_and(installed)
-    }
-
-    fn supported(&self) -> bool {
-        self.models_dir.is_some() && !cfg!(target_arch = "wasm32")
-    }
-}
-
-/// The marker lines for every weight: `<sha256> <size> <name>`.
-fn marker_text() -> String {
-    WEIGHTS.iter().map(|w| format!("{} {} {}\n", w.sha256, w.size, w.name)).collect()
-}
-
-fn write_marker(dir: &Path) -> std::result::Result<(), String> {
-    std::fs::write(dir.join(MARKER), marker_text()).map_err(|e| format!("could not record the verified model files: {e}"))
-}
-
-/// Both files are present with their exact sizes and were verified (by a download or an import).
-/// The hash is not recomputed here: this runs on every status poll.
-fn installed(dir: &Path) -> bool {
-    let marker = std::fs::read_to_string(dir.join(MARKER)).unwrap_or_default();
-    marker == marker_text() && WEIGHTS.iter().all(|w| std::fs::metadata(dir.join(w.name)).is_ok_and(|m| m.is_file() && m.len() == w.size))
 }
 
 fn bad(msg: impl Into<String>) -> EngineError {
     EngineError::Other(msg.into())
 }
 
-fn empty_params(p: &Value) -> Result<()> {
-    match p {
-        Value::Null => Ok(()),
-        Value::Object(o) if o.is_empty() => Ok(()),
-        _ => Err(bad("this command takes an empty object")),
+fn quality_param(p: &Value) -> Result<Quality> {
+    match p.get("quality") {
+        None => Ok(Quality::High),
+        Some(Value::String(q)) if q == "fast" => Ok(Quality::Fast),
+        Some(Value::String(q)) if q == "high" => Ok(Quality::High),
+        Some(_) => Err(bad("`quality` must be \"fast\" or \"high\"")),
     }
 }
-
-fn status_json(s: &DepthState) -> Value {
-    json!({
-        "supported": s.supported(),
-        "installed": s.installed(),
-        "downloading": s.progress.filter(|_| s.downloading()).or(s.downloading().then_some((0, 0))).map(|(done, total)| json!({"done": done, "total": total})),
-        "error": s.error,
-    })
-}
-
-fn model_status(s: &mut Session, p: &Value) -> Result<Value> {
-    empty_params(p)?;
-    s.depth.poll();
-    Ok(status_json(&s.depth))
-}
-
-fn enabled_download(s: &Session) -> std::result::Result<(), String> {
-    if s.depth.fetch.is_none() || s.depth.models_dir.is_none() {
-        return Err("Depth model downloads are unavailable in this frontend".into());
-    }
-    if s.depth.downloading() {
-        return Err("The depth model is already downloading".into());
-    }
-    if s.depth.installed() {
-        return Err("The depth model is already installed".into());
-    }
-    Ok(())
-}
-
-fn download_model(s: &mut Session, p: &Value) -> Result<Value> {
-    empty_params(p)?;
-    s.depth.poll();
-    enabled_download(s).map_err(bad)?;
-    let dir = s.depth.models_dir.clone().ok_or_else(|| bad("no models folder"))?;
-    std::fs::create_dir_all(&dir).map_err(|e| bad(format!("could not create the models folder: {e}")))?;
-    // A stale marker must not outlive files that are about to be replaced.
-    let _ = std::fs::remove_file(dir.join(MARKER));
-    let stop = Arc::new(AtomicBool::new(false));
-    let start = s.depth.fetch.as_mut().ok_or_else(|| bad("Depth model downloads are unavailable in this frontend"))?;
-    match start(dir, stop.clone()) {
-        Ok(rx) => {
-            s.depth.pending = Some(rx);
-            s.depth.stop = Some(stop);
-            s.depth.error = None;
-            s.depth.cancelled = false;
-            s.depth.progress = Some((0, WEIGHTS.iter().map(|w| w.size).sum()));
-        }
-        Err(message) => {
-            s.depth.error = Some(message.clone());
-            return Err(bad(message));
-        }
-    }
-    Ok(status_json(&s.depth))
-}
-
-fn enabled_cancel(s: &Session) -> std::result::Result<(), String> {
-    if s.depth.downloading() { Ok(()) } else { Err("No depth model download is running".into()) }
-}
-
-fn cancel_download(s: &mut Session, p: &Value) -> Result<Value> {
-    empty_params(p)?;
-    enabled_cancel(s).map_err(bad)?;
-    if let Some(stop) = &s.depth.stop {
-        stop.store(true, Ordering::SeqCst);
-    }
-    s.depth.cancelled = true;
-    Ok(status_json(&s.depth))
-}
-
-fn enabled_import(s: &Session) -> std::result::Result<(), String> {
-    if s.depth.models_dir.is_none() {
-        return Err("The depth model store is unavailable in this frontend".into());
-    }
-    if s.depth.downloading() {
-        return Err("The depth model is downloading".into());
-    }
-    Ok(())
-}
-
-fn path_param(p: &Value, key: &str) -> Result<PathBuf> {
-    let v = p.get(key).and_then(Value::as_str).ok_or_else(|| bad(format!("`{key}` must be a file path")))?;
-    if v.is_empty() || v.len() > 4096 || v.contains('\0') {
-        return Err(bad(format!("`{key}` must be a file path")));
-    }
-    Ok(PathBuf::from(v))
-}
-
-/// Copy `src` to `dest`, which must be exactly `weight.size` bytes with the pinned sha256.
-fn import_file(src: &Path, dest: &Path, weight: &WeightFile) -> Result<()> {
-    let meta = std::fs::metadata(src).map_err(|e| bad(format!("could not read {}: {e}", src.display())))?;
-    if !meta.is_file() {
-        return Err(bad(format!("{} is not a file", src.display())));
-    }
-    if meta.len() != weight.size {
-        return Err(bad(format!("{} is {} bytes; {} must be {} bytes", src.display(), meta.len(), weight.name, weight.size)));
-    }
-    let file = std::fs::File::open(src).map_err(|e| bad(format!("could not read {}: {e}", src.display())))?;
-    // Reading is bounded by the pinned size even if the file grows while it is read.
-    let mut input = file.take(weight.size + 1);
-    let _ = std::fs::remove_file(dest);
-    let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(dest).map_err(|e| bad(format!("could not write {}: {e}", dest.display())))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
-    let mut total = 0u64;
-    loop {
-        let n = input.read(&mut buf).map_err(|e| bad(format!("could not read {}: {e}", src.display())))?;
-        if n == 0 {
-            break;
-        }
-        let chunk = buf.get(..n).ok_or_else(|| bad("read overran its buffer"))?;
-        hasher.update(chunk);
-        out.write_all(chunk).map_err(|e| bad(format!("could not write {}: {e}", dest.display())))?;
-        total += n as u64;
-    }
-    out.flush().map_err(|e| bad(format!("could not write {}: {e}", dest.display())))?;
-    let hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    if total != weight.size || !hex.eq_ignore_ascii_case(weight.sha256) {
-        return Err(bad(format!("{} is not the expected {} (checksum mismatch)", src.display(), weight.name)));
-    }
-    Ok(())
-}
-
-fn load_model_files(s: &mut Session, p: &Value) -> Result<Value> {
-    s.depth.poll();
-    enabled_import(s).map_err(bad)?;
-    if !p.is_object() {
-        return Err(bad("expected {\"dinov2\": path, \"head\": path}"));
-    }
-    let sources = [path_param(p, "dinov2")?, path_param(p, "head")?];
-    let dir = s.depth.models_dir.clone().ok_or_else(|| bad("no models folder"))?;
-    std::fs::create_dir_all(&dir).map_err(|e| bad(format!("could not create the models folder: {e}")))?;
-    let staged: Vec<PathBuf> = WEIGHTS.iter().map(|w| dir.join(format!("{}.import", w.name))).collect();
-    let result = (|| -> Result<()> {
-        for ((src, dest), w) in sources.iter().zip(&staged).zip(&WEIGHTS) {
-            import_file(src, dest, w)?;
-        }
-        let _ = std::fs::remove_file(dir.join(MARKER));
-        for (dest, w) in staged.iter().zip(&WEIGHTS) {
-            std::fs::rename(dest, dir.join(w.name)).map_err(|e| bad(format!("could not install {}: {e}", w.name)))?;
-        }
-        write_marker(&dir).map_err(bad)
-    })();
-    for f in &staged {
-        let _ = std::fs::remove_file(f);
-    }
-    result?;
-    s.depth.error = None;
-    Ok(status_json(&s.depth))
-}
-
-// ---------------------------------------------------------------------------------------------
-// image.estimateDepth
 
 /// Averages source pixels into a smaller grid (box filter), fed one band of rows at a time.
 struct Accum {
@@ -441,39 +193,6 @@ fn resize_plane(src: &[f32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<
     out
 }
 
-/// Load the network from `dir`. The candle model is not `Send`, so it is built on the job's own
-/// thread for each estimate instead of being cached in the session.
-fn load_model(dir: &Path) -> Result<Model> {
-    let read = |w: &WeightFile| -> Result<Vec<u8>> {
-        let path = dir.join(w.name);
-        let file = std::fs::File::open(&path).map_err(|e| bad(format!("could not read {}: {e}", path.display())))?;
-        let mut bytes = Vec::with_capacity(usize::try_from(w.size).unwrap_or(0));
-        file.take(w.size + 1).read_to_end(&mut bytes).map_err(|e| bad(format!("could not read {}: {e}", path.display())))?;
-        if bytes.len() as u64 != w.size {
-            return Err(bad(format!("{} has the wrong size; load it again with depth.loadModelFiles", w.name)));
-        }
-        Ok(bytes)
-    };
-    let (dino, head) = (read(&WEIGHTS[0])?, read(&WEIGHTS[1])?);
-    Model::load(&dino, &head).map_err(depth_error)
-}
-
-fn depth_error(e: DepthError) -> EngineError {
-    match e {
-        DepthError::Cancelled => EngineError::Cancelled,
-        other => EngineError::Other(other.to_string()),
-    }
-}
-
-fn quality_param(p: &Value) -> Result<Quality> {
-    match p.get("quality") {
-        None => Ok(Quality::High),
-        Some(Value::String(q)) if q == "fast" => Ok(Quality::Fast),
-        Some(Value::String(q)) if q == "high" => Ok(Quality::High),
-        Some(_) => Err(bad("`quality` must be \"fast\" or \"high\"")),
-    }
-}
-
 fn channel_name(p: &Value) -> Result<String> {
     let obj = match p {
         Value::Null => None,
@@ -493,27 +212,33 @@ fn channel_name(p: &Value) -> Result<String> {
 
 fn enabled_estimate(s: &Session) -> std::result::Result<(), String> {
     s.active().ok_or("no document open")?;
-    Ok(())
+    #[cfg(target_arch = "wasm32")]
+    return Err(UNAVAILABLE_ON_WEB.to_owned());
+    #[cfg(not(target_arch = "wasm32"))]
+    match s.depth.ai.status_reason() {
+        Some(reason) => Err(reason),
+        None => Ok(()),
+    }
 }
 
-/// Composite the visible image and reduce it: RGB for the network and luma for the guide.
-/// A reduced plane set: (pixels, (width, height)).
+/// A plane set reduced from the composite of the visible image: (pixels, (width, height)). The RGB
+/// goes to the tool, the luma guides the refinement.
 type Reduced = (Vec<f32>, (usize, usize));
 
-fn read_image(doc: &Document, ctx: &crate::jobs::JobCtx, rgb_side: usize) -> Result<(Reduced, Reduced)> {
+fn read_image(doc: &Document, ctx: &crate::jobs::JobCtx) -> Result<(Reduced, Reduced)> {
     let rect = doc.bounds();
     let (w, h) = (rect.width() as usize, rect.height() as usize);
     if w == 0 || h == 0 {
         return Err(bad("the document is empty"));
     }
-    if (w as u64).saturating_mul(h as u64) > MAX_PIXELS / 2 {
+    if (w as u64).saturating_mul(h as u64) > MAX_DOC_PIXELS {
         return Err(bad("the image is too large for depth estimation"));
     }
     let fmt = photocraft_color::PixelFormat::RGBA8;
     let flat = ctx
         .stage(0.0, 0.15, "Reading image", |ctl| photocraft_compose::composite_to_surface_with_interrupt(doc, rect, fmt, Some([1.0; 3]), ctl))
         .map_err(|_| EngineError::Cancelled)?;
-    let mut rgb = Accum::new(w, h, 3, rgb_side);
+    let mut rgb = Accum::new(w, h, 3, SEND_SIDE);
     let mut luma = Accum::new(w, h, 1, REFINE_SIDE);
     let mut row_rgb = vec![0.0f32; w * 3];
     let mut row_luma = vec![0.0f32; w];
@@ -548,26 +273,26 @@ struct Estimated {
     /// The refined plane before it was stretched to the document, and its size.
     refined: Vec<f32>,
     refined_size: (usize, usize),
-    /// Tiles the estimate used (1 = a single pass).
-    tiles: u32,
 }
 
-/// Run the estimator and refine its map to the document size: edges follow the photo.
-fn estimate_plane(doc: &Document, ctx: &crate::jobs::JobCtx, estimator: &EstimateFn, quality: Quality) -> Result<Estimated> {
+/// Send the picture to the tool and refine its map to the document size: edges follow the photo.
+#[cfg(not(target_arch = "wasm32"))]
+fn estimate_plane(doc: &Document, ctx: &crate::jobs::JobCtx, backend: &ai::Backend, quality: Quality) -> Result<Estimated> {
     let rect = doc.bounds();
     let (w, h) = (rect.width() as usize, rect.height() as usize);
-    let side = if quality == Quality::High { HIGH_INPUT_SIDE } else { MODEL_INPUT_SIDE };
-    let ((rgb, (rw, rh)), (luma, (lw, lh))) = read_image(doc, ctx, side)?;
-    let tiles = if quality == Quality::High { photocraft_depth::tile_count(rw as u32, rh as u32, HIGH_MAX_TILES) } else { 1 };
-    ctx.progress(0.15, "Estimating depth");
-    let map = estimator(&rgb, rw as u32, rh as u32, &|p| {
-        ctx.progress(0.15 + 0.65 * p, "");
-        ctx.cancelled()
-    })?;
+    let ((rgb, (rw, rh)), (luma, (lw, lh))) = read_image(doc, ctx)?;
+    let bytes: Vec<u8> = rgb.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8).collect();
     drop(rgb);
+    let (rw32, rh32) = (u32::try_from(rw).map_err(|_| bad("the image is too large"))?, u32::try_from(rh).map_err(|_| bad("the image is too large"))?);
+    let png = ai::encode_rgb8(&bytes, rw32, rh32)?;
+    drop(bytes);
+    ctx.progress(0.15, "Estimating depth");
+    let answer = backend(ctx, png, rw32, rh32, quality)?;
     if ctx.cancelled() {
         return Err(EngineError::Cancelled);
     }
+    let map = ai::decode_gray(&answer, rw32, rh32)?;
+    drop(answer);
     let (mw, mh) = (map.width as usize, map.height as usize);
     if mw == 0 || mh == 0 || map.data.len() != mw.saturating_mul(mh) || map.data.iter().any(|v| !v.is_finite()) {
         return Err(bad("the depth model returned an invalid map"));
@@ -585,41 +310,33 @@ fn estimate_plane(doc: &Document, ctx: &crate::jobs::JobCtx, estimator: &Estimat
     }
     ctx.progress(0.95, "");
     let plane = resize_plane(&refined, lw, lh, w, h);
-    Ok(Estimated { plane, refined, refined_size: (lw, lh), tiles })
+    Ok(Estimated { plane, refined, refined_size: (lw, lh) })
 }
 
+#[cfg(target_arch = "wasm32")]
+fn estimate_depth(s: &mut Session, p: &Value) -> Result<Value> {
+    channel_name(p)?;
+    quality_param(p)?;
+    s.active().ok_or(EngineError::NoDocument)?;
+    Err(bad(UNAVAILABLE_ON_WEB))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn estimate_depth(s: &mut Session, p: &Value) -> Result<Value> {
     let name = channel_name(p)?;
     let quality = quality_param(p)?;
     s.active().ok_or(EngineError::NoDocument)?;
-    s.depth.poll();
-    let estimator = match s.depth.estimator.clone() {
-        Some(e) => boxed(move |rgb, w, h, interrupt| {
-            let one = |r: &[f32], w: u32, h: u32| e(r, w, h).map_err(DepthError::Backend);
-            match quality {
-                Quality::Fast => one(rgb, w, h).map_err(depth_error),
-                Quality::High => photocraft_depth::estimate_tiled_with(&one, rgb, w, h, HIGH_MAX_TILES, interrupt).map_err(depth_error),
-            }
-        }),
-        None => {
-            let dir = s.depth.models_dir.clone().filter(|d| installed(d)).ok_or_else(|| bad(NOT_INSTALLED))?;
-            boxed(move |rgb, w, h, interrupt| {
-                let model = load_model(&dir)?;
-                match quality {
-                    Quality::Fast => model.estimate(rgb, w, h, interrupt),
-                    Quality::High => model.estimate_tiled(rgb, w, h, HIGH_MAX_TILES, interrupt),
-                }
-                .map_err(depth_error)
-            })
-        }
-    };
+    if let Some(reason) = s.depth.ai.status_reason() {
+        return Err(bad(reason));
+    }
+    let backend = s.depth.ai.backend().map_err(bad)?;
     let precise = s.depth.precise.clone();
     let started = web_time::Instant::now();
     crate::jobs::edit_job(
         s,
         "Estimate Depth",
         move |doc, _, ctx| {
-            let est = estimate_plane(doc, ctx, &*estimator, quality)?;
+            let est = estimate_plane(doc, ctx, &backend, quality)?;
             let rect = doc.bounds();
             let surface = plane_surface(&est.plane, rect, channel_format(doc));
             let snapshot = surface.clone();
@@ -638,71 +355,43 @@ fn estimate_depth(s: &mut Session, p: &Value) -> Result<Value> {
             let entry =
                 keep.then(|| PreciseDepth { doc: doc.id, channel: name, surface: snapshot, plane: Arc::new(est.refined), width: pw as u32, height: ph as u32 });
             *precise.lock().unwrap_or_else(PoisonError::into_inner) = entry;
-            Ok((index, rect.width(), rect.height(), est.tiles))
+            Ok((index, rect.width(), rect.height()))
         },
-        move |(index, w, h, tiles)| json!({"channel": index, "width": w, "height": h, "quality": quality.name(), "tiles": tiles, "ms": started.elapsed().as_millis() as u64}),
+        move |(index, w, h)| json!({"channel": index, "width": w, "height": h, "quality": quality.name(), "ms": started.elapsed().as_millis() as u64}),
     )
 }
 
 pub fn specs() -> Vec<CommandSpec> {
-    vec![
-        CommandSpec {
-            id: "depth.modelStatus",
-            label: "Depth Model Status",
-            menu: &[],
-            shortcut: None,
-            params: r#"{} → {supported,installed,downloading:{done,total}|null,error:string|null}"#,
-            enabled: always,
-            run: model_status,
-            journal: false,
-        },
-        CommandSpec {
-            id: "depth.downloadModel",
-            label: "Download Depth Model",
-            menu: &[],
-            shortcut: None,
-            params: r#"{} → status: downloads the depth model (about 95 MB) from its pinned public source; running this is the consent"#,
-            enabled: enabled_download,
-            run: download_model,
-            journal: false,
-        },
-        CommandSpec {
-            id: "depth.cancelDownload",
-            label: "Cancel Depth Model Download",
-            menu: &[],
-            shortcut: None,
-            params: r#"{} → status"#,
-            enabled: enabled_cancel,
-            run: cancel_download,
-            journal: false,
-        },
-        CommandSpec {
-            id: "depth.loadModelFiles",
-            label: "Load Depth Model Files",
-            menu: &[],
-            shortcut: None,
-            params: r#"{"dinov2":path,"head":path} → status: installs the two downloaded model files after checking their size and sha256"#,
-            enabled: enabled_import,
-            run: load_model_files,
-            journal: false,
-        },
-        CommandSpec {
-            id: "image.estimateDepth",
-            label: "Estimate Depth",
-            menu: &[],
-            shortcut: None,
-            params: r#"{"channel":name="Depth","quality":"fast"|"high"="high"} → {channel,width,height,quality,tiles,ms}: estimates relative depth of the visible image into an alpha channel (white = near); replaces a channel of that name. "fast" is one network pass; "high" adds overlapping full-resolution tiles on a larger working image (slower, much finer folds and edges). Needs the depth model (depth.downloadModel)"#,
-            enabled: enabled_estimate,
-            run: estimate_depth,
-            journal: true,
-        },
-    ]
+    vec![CommandSpec {
+        id: "image.estimateDepth",
+        label: "Estimate Depth",
+        menu: &[],
+        shortcut: None,
+        params: r#"{"channel":name="Depth","quality":"fast"|"high"="high"} → {channel,width,height,quality,ms}: estimates relative depth of the visible image into an alpha channel (white = near); replaces a channel of that name. Runs the shared Craft AI tool `estimate-depth` (on this computer; nothing leaves it); "high" adds overlapping full-resolution tiles (slower, much finer folds and edges). Disabled with the reason while the tool is not set up: set it up with Set up AI (the ArtCraft Launcher, or Estimate Depth in the brush settings). Not available in the browser"#,
+        enabled: enabled_estimate,
+        run: estimate_depth,
+        journal: true,
+    }]
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
+    use craft_ai_client::AiClient;
+    use craft_ai_core::AppId;
+    use craft_ai_native::secrets::MemoryStore;
+    use craft_ai_native::shared::SharedStore;
+
+    /// A host over an empty temporary store (nothing set up) so no test reads a person's settings.
+    fn empty_host(dir: &std::path::Path) -> AiHost {
+        let store = SharedStore::new(dir.join("connections.json"));
+        let shared = store.clone();
+        AiHost::new(store, move || {
+            let app = AppId::new("photocraft").map_err(|e| e.to_string())?;
+            Ok(AiClient::new(app, shared.clone(), Arc::new(MemoryStore::new())))
+        })
+    }
 
     fn session(w: u32, h: u32) -> Session {
         let mut s = Session::new();
@@ -710,12 +399,24 @@ mod tests {
         s
     }
 
-    /// A fake estimator: depth grows to the right, on a coarse grid like the model's output.
-    fn fake() -> Estimator {
-        Arc::new(|_rgb, _w, _h| {
-            let (mw, mh) = (14u32, 10u32);
-            Ok(DepthMap { width: mw, height: mh, data: (0..mw * mh).map(|i| (i % mw) as f32 / (mw - 1) as f32).collect() })
+    /// A fake tool: depth grows to the right, on a coarse grid like a model's output, at the size
+    /// of the picture it was given. Records the quality it was asked for.
+    fn fake(seen: Arc<Mutex<Vec<String>>>) -> Estimator {
+        Arc::new(move |png, w, h, quality| {
+            seen.lock().unwrap().push(quality.to_owned());
+            // What was sent is a PNG of the size it says.
+            let dec = png::Decoder::new(std::io::Cursor::new(png)).read_info().map_err(|e| e.to_string())?;
+            assert_eq!((dec.info().width, dec.info().height, dec.info().color_type), (w, h, png::ColorType::Rgb));
+            let data: Vec<u16> = (0..w * h).map(|i| ((i % w) as f32 / (w - 1).max(1) as f32 * 65535.0) as u16).collect();
+            Ok(ai::encode_gray16(&data, w, h))
         })
+    }
+
+    fn fake_session(w: u32, h: u32) -> (Session, Arc<Mutex<Vec<String>>>) {
+        let mut s = session(w, h);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        s.depth.ai.estimator = Some(fake(seen.clone()));
+        (s, seen)
     }
 
     fn channels(s: &Session) -> usize {
@@ -723,12 +424,39 @@ mod tests {
     }
 
     #[test]
+    fn an_unset_tool_disables_the_command_with_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session(16, 16);
+        s.depth.ai.set_host(empty_host(dir.path()));
+        let reason = s.depth.ai.status_reason().expect("nothing is set up");
+        assert!(!reason.trim().is_empty());
+        let e = s.execute("image.estimateDepth", json!({})).unwrap_err().to_string();
+        assert!(e.contains(&reason), "{e} vs {reason}");
+        assert_eq!(channels(&s), 0);
+        // Without a document the command is off for that reason first.
+        let none = Session::new();
+        assert!(enabled_estimate(&none).is_err());
+        // The status is reused for a moment and forgotten on request.
+        assert_eq!(s.depth.ai.status_reason(), Some(reason));
+        s.depth.ai.forget_status();
+        assert!(s.depth.ai.status_reason().is_some());
+    }
+
+    #[test]
+    fn a_host_that_cannot_be_made_is_the_reason() {
+        let mut s = session(8, 8);
+        s.depth.ai.set_host(AiHost::new(SharedStore::new("/nonexistent/x.json"), || Err("no AI folder here".to_owned())));
+        assert_eq!(s.depth.ai.status_reason().as_deref(), Some("no AI folder here"));
+        assert!(s.execute("image.estimateDepth", json!({})).is_err());
+    }
+
+    #[test]
     fn estimates_into_a_channel_replaces_it_and_is_one_undo_step() {
-        let mut s = session(64, 48);
-        s.depth.estimator = Some(fake());
+        let (mut s, seen) = fake_session(64, 48);
         let r = s.execute("image.estimateDepth", json!({})).unwrap();
         assert_eq!((r["channel"].clone(), r["width"].clone(), r["height"].clone()), (json!(0), json!(64), json!(48)));
         assert!(r["ms"].is_u64());
+        assert_eq!(seen.lock().unwrap().as_slice(), ["high"]);
         let doc = &s.active().unwrap().doc;
         assert_eq!(doc.channels[0].name, "Depth");
         let v = doc.channels[0].surface.read_region(doc.bounds());
@@ -750,42 +478,39 @@ mod tests {
     }
 
     #[test]
-    fn quality_is_validated_and_reported() {
-        let mut s = session(16, 16);
-        s.depth.estimator = Some(fake());
+    fn quality_is_validated_and_sent_to_the_tool() {
+        let (mut s, seen) = fake_session(16, 16);
         for p in [json!({"quality": "ultra"}), json!({"quality": 3}), json!({"quality": null}), json!({"quality": ["fast"]}), json!({"quality": "High"})] {
             assert!(s.execute("image.estimateDepth", p.clone()).is_err(), "{p}");
         }
         assert_eq!(channels(&s), 0);
-        let r = s.execute("image.estimateDepth", json!({})).unwrap();
-        assert_eq!(r["quality"], "high");
-        let r = s.execute("image.estimateDepth", json!({"quality": "fast"})).unwrap();
-        assert_eq!((r["quality"].clone(), r["tiles"].clone()), (json!("fast"), json!(1)));
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(s.execute("image.estimateDepth", json!({})).unwrap()["quality"], "high");
+        assert_eq!(s.execute("image.estimateDepth", json!({"quality": "fast"})).unwrap()["quality"], "fast");
+        assert_eq!(seen.lock().unwrap().as_slice(), ["high", "fast"]);
     }
 
     #[test]
-    fn high_tiles_a_large_document_and_fast_does_not() {
-        let mut s = session(1500, 1000);
-        s.depth.estimator = Some(fake());
-        let hi = s.execute("image.estimateDepth", json!({"quality": "high"})).unwrap();
-        assert!(hi["tiles"].as_u64().unwrap() > 1, "{hi}");
-        assert!(hi["tiles"].as_u64().unwrap() <= 16);
+    fn a_large_document_is_reduced_before_it_is_sent() {
+        let (mut s, _) = fake_session(3000, 1000);
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let log = sizes.clone();
+        let inner = s.depth.ai.estimator.clone().unwrap();
+        s.depth.ai.estimator = Some(Arc::new(move |png, w, h, q| {
+            log.lock().unwrap().push((w, h));
+            inner(png, w, h, q)
+        }));
+        let r = s.execute("image.estimateDepth", json!({})).unwrap();
+        assert_eq!((r["width"].clone(), r["height"].clone()), (json!(3000), json!(1000)));
+        assert_eq!(sizes.lock().unwrap().as_slice(), [(2048, 683)]);
         let doc = &s.active().unwrap().doc;
-        assert_eq!(doc.channels.len(), 1);
         let v = doc.channels[0].surface.read_region(doc.bounds());
         assert!(v.iter().all(|x| x.is_finite() && (0.0..=1.0).contains(x)));
-        let fast = s.execute("image.estimateDepth", json!({"quality": "fast"})).unwrap();
-        assert_eq!(fast["tiles"], 1);
-        // A small document is one pass even in high quality.
-        let mut small = session(200, 150);
-        small.depth.estimator = Some(fake());
-        assert_eq!(small.execute("image.estimateDepth", json!({})).unwrap()["tiles"], 1);
     }
 
     #[test]
     fn the_precise_plane_is_kept_until_the_channel_is_edited() {
-        let mut s = session(64, 48);
-        s.depth.estimator = Some(fake());
+        let (mut s, _) = fake_session(64, 48);
         let id = s.active().unwrap().doc.id;
         s.execute("image.estimateDepth", json!({})).unwrap();
         let surface = s.active().unwrap().doc.channels[0].surface.clone();
@@ -809,39 +534,15 @@ mod tests {
 
     #[test]
     fn lens_blur_reads_the_depth_channel() {
-        let mut s = session(64, 48);
-        s.depth.estimator = Some(fake());
+        let (mut s, _) = fake_session(64, 48);
         s.execute("image.estimateDepth", json!({})).unwrap();
         s.execute("channel.target", json!({"channel": "composite"})).unwrap();
         s.execute("filter.blur.lensBlur", json!({"radius": 4, "depthMap": "channel", "depthChannel": "Depth", "focalDistance": 255})).unwrap();
     }
 
     #[test]
-    fn missing_model_and_missing_injection_fail_gracefully() {
-        let mut s = session(16, 16);
-        // Not injected: status works, everything else errors.
-        let st = s.execute("depth.modelStatus", json!({})).unwrap();
-        assert_eq!((st["supported"].clone(), st["installed"].clone(), st["downloading"].clone()), (json!(false), json!(false), Value::Null));
-        for (id, p) in [
-            ("depth.downloadModel", json!({})),
-            ("depth.cancelDownload", json!({})),
-            ("depth.loadModelFiles", json!({"dinov2": "/nope", "head": "/nope"})),
-            ("image.estimateDepth", json!({})),
-        ] {
-            assert!(s.execute(id, p).is_err(), "{id}");
-        }
-        // A folder without the model.
-        let dir = tempfile::tempdir().unwrap();
-        s.depth.models_dir = Some(dir.path().to_path_buf());
-        let e = s.execute("image.estimateDepth", json!({})).unwrap_err().to_string();
-        assert!(e.contains("depth model not installed: run depth.downloadModel"), "{e}");
-        assert_eq!(channels(&s), 0);
-    }
-
-    #[test]
     fn hostile_params_are_errors() {
-        let mut s = session(16, 16);
-        s.depth.estimator = Some(fake());
+        let (mut s, _) = fake_session(16, 16);
         let long = "x".repeat(256);
         for p in [
             json!({"channel": ""}),
@@ -854,132 +555,56 @@ mod tests {
         ] {
             assert!(s.execute("image.estimateDepth", p.clone()).is_err(), "{p}");
         }
-        for id in ["depth.modelStatus"] {
-            for p in [json!({"x": 1}), json!([]), json!("a")] {
-                assert!(s.execute(id, p).is_err(), "{id}");
-            }
-        }
         assert_eq!(channels(&s), 0);
-        // A bad map from the estimator is an error, not a panic or a channel.
-        for map in [
-            DepthMap { width: 4, height: 4, data: vec![0.5; 3] },
-            DepthMap { width: 0, height: 0, data: vec![] },
-            DepthMap { width: 2, height: 2, data: vec![f32::NAN; 4] },
-        ] {
-            s.depth.estimator = Some(Arc::new(move |_, _, _| Ok(map.clone())));
+    }
+
+    #[test]
+    fn a_bad_answer_from_the_tool_is_an_error_not_a_channel() {
+        let (mut s, _) = fake_session(16, 16);
+        let gray8 = |w: u32, h: u32, value: u8| {
+            let mut out = Vec::new();
+            let mut enc = png::Encoder::new(&mut out, w, h);
+            enc.set_color(png::ColorType::Grayscale);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&vec![value; (w * h) as usize]).unwrap();
+            out
+        };
+        let rgb = ai::encode_rgb8(&[0; 16 * 16 * 3], 16, 16).unwrap();
+        let answers: Vec<std::result::Result<Vec<u8>, String>> = vec![
+            Err("boom".into()),
+            Ok(Vec::new()),
+            Ok(b"not a png".to_vec()),
+            // The wrong size, a colour picture.
+            Ok(gray8(8, 8, 3)),
+            Ok(rgb),
+        ];
+        for a in answers {
+            s.depth.ai.estimator = Some(Arc::new(move |_, _, _, _| a.clone()));
             assert!(s.execute("image.estimateDepth", json!({})).is_err());
         }
-        s.depth.estimator = Some(Arc::new(|_, _, _| Err("boom".into())));
-        assert!(s.execute("image.estimateDepth", json!({})).is_err());
+        // An 8-bit gray picture of the right size is fine.
+        s.depth.ai.estimator = Some(Arc::new(move |_, _, _, _| Ok(gray8(16, 16, 200))));
+        assert!(s.execute("image.estimateDepth", json!({})).is_ok());
+    }
+
+    #[test]
+    fn a_running_estimate_can_be_cancelled() {
+        use std::sync::mpsc;
+        let mut s = session(32, 32);
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        s.depth.ai.estimator = Some(Arc::new(move |_, w, h, _| {
+            let _ = entered_tx.send(());
+            let _ = release_rx.lock().unwrap().recv();
+            Ok(ai::encode_gray16(&vec![1000; (w * h) as usize], w, h))
+        }));
+        let started = s.start("image.estimateDepth", json!({})).unwrap();
+        let crate::jobs::Started::Job(job) = started else { panic!("the estimate runs as a background job") };
+        entered_rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+        assert!(s.cancel_job(job));
+        let _ = release_tx.send(());
         assert_eq!(channels(&s), 0);
-    }
-
-    /// A fake download that writes sparse files of the pinned sizes.
-    fn fake_fetch() -> FetchFn {
-        Box::new(|dir: PathBuf, _stop| {
-            for w in &WEIGHTS {
-                std::fs::File::create(dir.join(w.name)).and_then(|f| f.set_len(w.size)).map_err(|e| e.to_string())?;
-            }
-            let (tx, rx) = mpsc::channel();
-            let total = WEIGHTS.iter().map(|w| w.size).sum();
-            tx.send(FetchEvent::Progress { done: total, total }).map_err(|e| e.to_string())?;
-            tx.send(FetchEvent::Done(Ok(()))).map_err(|e| e.to_string())?;
-            Ok(rx)
-        })
-    }
-
-    #[test]
-    fn a_download_installs_the_model() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut s = Session::new();
-        s.depth.models_dir = Some(dir.path().join("models"));
-        s.depth.fetch = Some(fake_fetch());
-        assert_eq!(s.execute("depth.modelStatus", json!({})).unwrap()["installed"], false);
-        s.execute("depth.downloadModel", json!({})).unwrap();
-        let st = s.execute("depth.modelStatus", json!({})).unwrap();
-        assert_eq!(
-            (st["supported"].clone(), st["installed"].clone(), st["downloading"].clone(), st["error"].clone()),
-            (json!(true), json!(true), Value::Null, Value::Null)
-        );
-        // Installed: nothing left to download.
-        assert!(s.execute("depth.downloadModel", json!({})).is_err());
-        // Files of the wrong size are not installed, whatever the marker says.
-        std::fs::File::create(dir.path().join("models").join(WEIGHTS[0].name)).unwrap();
-        assert_eq!(s.execute("depth.modelStatus", json!({})).unwrap()["installed"], false);
-        assert!(s.journal.is_empty());
-    }
-
-    #[test]
-    fn a_download_can_be_cancelled_and_failures_are_reported() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut s = Session::new();
-        s.depth.models_dir = Some(dir.path().to_path_buf());
-        type Slot = Arc<std::sync::Mutex<Option<(mpsc::Sender<FetchEvent>, Arc<AtomicBool>)>>>;
-        let slot: Slot = Arc::default();
-        let held = slot.clone();
-        s.depth.fetch = Some(Box::new(move |_, stop| {
-            let (tx, rx) = mpsc::channel();
-            *held.lock().unwrap() = Some((tx, stop));
-            Ok(rx)
-        }));
-        s.execute("depth.downloadModel", json!({})).unwrap();
-        let (tx, stop) = slot.lock().unwrap().take().unwrap();
-        tx.send(FetchEvent::Progress { done: 10, total: 100 }).unwrap();
-        let st = s.execute("depth.modelStatus", json!({})).unwrap();
-        assert_eq!(st["downloading"], json!({"done": 10, "total": 100}));
-        assert!(s.execute("depth.downloadModel", json!({})).is_err(), "already downloading");
-        assert!(s.execute("depth.loadModelFiles", json!({"dinov2": "a", "head": "b"})).is_err());
-        s.execute("depth.cancelDownload", json!({})).unwrap();
-        assert!(stop.load(Ordering::SeqCst));
-        tx.send(FetchEvent::Done(Err("cancelled".into()))).unwrap();
-        let st = s.execute("depth.modelStatus", json!({})).unwrap();
-        assert_eq!((st["downloading"].clone(), st["error"].clone()), (Value::Null, Value::Null));
-        // A failure is reported; a worker that vanishes is too.
-        s.depth.fetch = Some(Box::new(|_, _| {
-            let (tx, rx) = mpsc::channel();
-            tx.send(FetchEvent::Done(Err("offline".into()))).map_err(|e| e.to_string())?;
-            Ok(rx)
-        }));
-        s.execute("depth.downloadModel", json!({})).unwrap();
-        assert_eq!(s.execute("depth.modelStatus", json!({})).unwrap()["error"], "offline");
-        s.depth.fetch = Some(Box::new(|_, _| Ok(mpsc::channel().1)));
-        s.execute("depth.downloadModel", json!({})).unwrap();
-        assert!(s.execute("depth.modelStatus", json!({})).unwrap()["error"].is_string());
-        s.depth.fetch = Some(Box::new(|_, _| Err("no thread".into())));
-        assert!(s.execute("depth.downloadModel", json!({})).is_err());
-    }
-
-    #[test]
-    fn load_model_files_checks_size_and_checksum() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut s = Session::new();
-        s.depth.models_dir = Some(dir.path().join("models"));
-        let small = dir.path().join("small.bin");
-        std::fs::write(&small, b"not a model").unwrap();
-        // The right size but the wrong content: a sparse file of zeros.
-        let zeros = |w: &WeightFile| {
-            let p = dir.path().join(w.name);
-            std::fs::File::create(&p).unwrap().set_len(w.size).unwrap();
-            p
-        };
-        let (d, h) = (zeros(&WEIGHTS[0]), zeros(&WEIGHTS[1]));
-        let to = |p: &Path| p.to_str().unwrap().to_string();
-        for p in [
-            json!({"dinov2": to(&small), "head": to(&h)}),
-            json!({"dinov2": to(&d), "head": to(&h)}),
-            json!({"dinov2": to(&dir.path().join("missing")), "head": to(&h)}),
-            json!({"dinov2": "", "head": to(&h)}),
-            json!({"dinov2": to(dir.path()), "head": to(&h)}),
-            json!({"head": to(&h)}),
-            json!({"dinov2": 3, "head": 4}),
-            json!([]),
-        ] {
-            assert!(s.execute("depth.loadModelFiles", p.clone()).is_err(), "{p}");
-        }
-        assert_eq!(s.execute("depth.modelStatus", json!({})).unwrap()["installed"], false);
-        // Nothing half-installed is left behind.
-        let left: Vec<_> = std::fs::read_dir(dir.path().join("models")).unwrap().flatten().collect();
-        assert!(left.is_empty(), "{left:?}");
     }
 
     #[test]
@@ -996,5 +621,15 @@ mod tests {
             a.add_row(y, &[0.0, 0.0, 1.0, 1.0]);
         }
         assert_eq!(a.finish(), vec![0.0, 1.0]);
+    }
+
+    #[test]
+    fn gray_pictures_decode_to_unit_values() {
+        let png = ai::encode_gray16(&[0, 65535, 32768, 1], 2, 2);
+        let m = ai::decode_gray(&png, 2, 2).unwrap();
+        assert_eq!((m.width, m.height), (2, 2));
+        assert_eq!((m.data[0], m.data[1]), (0.0, 1.0));
+        assert!((m.data[2] - 0.5).abs() < 1e-3);
+        assert!(ai::decode_gray(&png, 2, 3).is_err());
     }
 }

@@ -262,8 +262,8 @@ what an agent can't finish alone.
 
 ### G4. Brush feel
 - **Beyond parity (2026-11-14, storytold/photocraft#14341):** surface-aware brush landed:
-  Surface Color (strength, detail, sample), Estimate Depth (Depth Anything V2 Small, downloaded
-  on first use after asking; Fast and tiled High Quality) into a Depth channel, Follow Depth
+  Surface Color (strength, detail, sample), Estimate Depth (the shared Craft AI tool `estimate-depth`, set up once
+  through Set up AI or the in-app setup, which asks before downloading; Fast and tiled High Quality) into a Depth channel, Follow Depth
   (slope, size and a surface-traced outline that stops at depth edges), Follow Perspective on
   Vanishing Point planes saved with the document, an adaptive cursor and a paste shade for
   Vanishing Point ([details](brush-parity.md#surface-aware-brush-beyond-parity)). Open: same-size

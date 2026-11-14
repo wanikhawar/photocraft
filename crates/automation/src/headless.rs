@@ -16,7 +16,6 @@ use crate::{AuthorizedWorkspace, AutomationError, files};
 fn untrusted(filesystem: Filesystem) -> Headless {
     let mut session = Session::new();
     session.authorize = Some(authorize_engine_step);
-    session.depth.models_dir = crate::app_dirs::models_dir();
     Headless { session, writers: HashMap::new(), filesystem, renderer: None, pending_diagnostics: Vec::new(), waited: HashMap::new() }
 }
 
@@ -73,10 +72,24 @@ impl Headless {
     /// not a remote automation client, supplies these host paths. Nested
     /// `actions.play` steps are not re-checked: this caller is already trusted.
     pub fn trusted_local() -> Self {
-        let mut session = Session::new();
-        // An already-downloaded depth model works headless; `depth.loadModelFiles` installs one.
-        session.depth.models_dir = crate::app_dirs::models_dir();
-        Self { session, writers: HashMap::new(), filesystem: Filesystem::TrustedLocal, renderer: None, pending_diagnostics: Vec::new(), waited: HashMap::new() }
+        Self {
+            session: Session::new(),
+            writers: HashMap::new(),
+            filesystem: Filesystem::TrustedLocal,
+            renderer: None,
+            pending_diagnostics: Vec::new(),
+            waited: HashMap::new(),
+        }
+    }
+
+    /// Lets this session use the person's shared AI settings (`CRAFT_AI_DIR` moves them), so
+    /// `image.estimateDepth` runs where the tool is set up. Off by default: a session never reads
+    /// them unless its frontend asks (the CLI does; tests do not).
+    #[must_use]
+    pub fn with_ai_tools(self) -> Self {
+        // A failure leaves Estimate Depth off with that reason.
+        let _ = self.session.depth.ai.use_standard_host();
+        self
     }
 
     /// Create an automation session with capability-scoped file access.

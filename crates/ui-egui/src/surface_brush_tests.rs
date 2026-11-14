@@ -114,15 +114,54 @@ fn the_depth_options_reach_tools_set_brush() {
     assert!(s.depth && !s.size_by_depth && (s.relief - 0.8).abs() < 1e-6);
 }
 
-#[test]
-fn estimate_depth_asks_for_consent_when_the_model_is_missing() {
-    let mut app = app(Tool::Brush);
-    crate::dialogs::depth_ui::start(&mut app);
-    // Not installed in a fresh session: the consent dialog opens (or, where unsupported, a status).
-    match app.ui.depth_dialog.as_ref() {
-        Some(d) => assert_eq!(d.phase, crate::dialogs::depth_ui::DepthPhase::Consent),
-        None => assert!(app.ui.status_error, "{}", app.ui.status),
+/// A host over an empty temporary AI store: nothing is set up, and no test reads a person's settings.
+#[cfg(not(target_arch = "wasm32"))]
+fn empty_host(dir: &std::path::Path) -> photocraft_engine::depth_cmds::AiHost {
+    use std::sync::Arc;
+    let store = craft_ai_native::shared::SharedStore::new(dir.join("connections.json"));
+    let shared = store.clone();
+    photocraft_engine::depth_cmds::AiHost::new(store, move || {
+        let app = craft_ai_core::AppId::new("photocraft").map_err(|e| e.to_string())?;
+        Ok(craft_ai_client::AiClient::new(app, shared.clone(), Arc::new(craft_ai_native::secrets::MemoryStore::new())))
+    })
+}
+
+/// Draw frames of the Estimate Depth window until `ui.inspect` reports `phase` (workers answer in between).
+#[cfg(not(target_arch = "wasm32"))]
+fn wait_for_phase(app: &mut PhotocraftApp, phase: &str) {
+    let ctx = egui::Context::default();
+    for _ in 0..400 {
+        ctx.run_ui(egui::RawInput::default(), |ui| crate::dialogs::depth_ui::show(app, ui.ctx())).textures_delta.clear();
+        if crate::dialogs::depth_ui::inspect(app)["phase"] == phase {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
+    panic!("the window never reached `{phase}`: {}", crate::dialogs::depth_ui::inspect(app));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn estimate_depth_with_an_unset_tool_opens_the_missing_model_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app(Tool::Brush);
+    app.session.depth.ai.set_host(empty_host(dir.path()));
+    let reason = app.session.depth.ai.status_reason().expect("nothing is set up");
+    assert_eq!(crate::dialogs::depth_ui::unavailable_reason(&app), Some(reason));
+    crate::dialogs::depth_ui::start(&mut app);
+    assert_eq!(crate::dialogs::depth_ui::inspect(&app)["phase"], "loading");
+    wait_for_phase(&mut app, "missing");
+    // Nothing was estimated, and closing leaves no window.
+    assert!(app.session.active().unwrap().doc.channels.is_empty());
     crate::dialogs::depth_ui::cancel(&mut app);
-    assert!(app.ui.depth_dialog.is_none());
+    assert!(crate::dialogs::depth_ui::inspect(&app).is_null());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn estimate_depth_without_a_document_says_so() {
+    let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+    crate::dialogs::depth_ui::start(&mut app);
+    assert!(app.ui.status_error, "{}", app.ui.status);
+    assert!(crate::dialogs::depth_ui::inspect(&app).is_null());
 }

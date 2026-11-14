@@ -71,7 +71,6 @@ mod services;
 mod single_instance;
 mod startup_report;
 // Tablet support (macOS AppKit monitor, Linux X11/Wayland, Windows barrel button).
-mod depth;
 mod tablet;
 mod ui_state;
 mod updates;
@@ -593,6 +592,9 @@ fn main() -> eframe::Result {
             #[cfg(not(target_os = "linux"))]
             let session = Session::new();
             PhotocraftApp::install_type_reset_hooks(&cc.egui_ctx);
+            // Estimate Depth reads the person's shared AI settings (Set up AI); a failure leaves it
+            // off with that reason.
+            let _ = session.depth.ai.use_standard_host();
             let mut app = PhotocraftApp::new(session, services);
             app.min_frame_ms = uncapped.then_some(1000.0 / 240.0);
             app.integrated_titlebar = cfg!(target_os = "macos");

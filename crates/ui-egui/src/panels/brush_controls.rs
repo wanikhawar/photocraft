@@ -155,8 +155,17 @@ pub(super) fn surface_options(app: &mut PhotocraftApp, ui: &mut egui::Ui, b: &mu
             widgets::checkbox(ui, &mut s.size_by_depth, tl!("Size by Depth"))
                 .on_hover_text(tl!("Brush size is the size at the photo's middle distance; nearer is larger, farther smaller."));
         });
+        // Clickable while the tool is not set up: the click opens the shared setup. The reason it
+        // cannot run now is the tooltip.
         let estimate = ui.add_enabled(!cfg!(target_arch = "wasm32"), egui::Button::new(tl!("Estimate Depth…")));
-        let estimate = if cfg!(target_arch = "wasm32") { estimate.on_disabled_hover_text(tl!("Not available in this build")) } else { estimate };
+        let estimate = if cfg!(target_arch = "wasm32") {
+            estimate.on_disabled_hover_text(tl!("Not available in this build"))
+        } else {
+            match crate::dialogs::depth_ui::unavailable_reason(app) {
+                Some(reason) => estimate.on_hover_text(reason),
+                None => estimate,
+            }
+        };
         if estimate.clicked() {
             estimate_depth = true;
         }

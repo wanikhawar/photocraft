@@ -14,9 +14,16 @@ craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "e2dc681a3",
 # Feature flags shared with the launcher and the other Craft apps (craft-libs#1118, #1119).
 craft-flags = { git = "https://github.com/storytold/craft-libs", rev = "e2dc681a3" }
 # The ArtCraft Launcher's agents switch and app list, shared with the launcher, the MCP gateway and
-# every Craft app (storytold/craft-ai-integrations#195). Pinned to the head of
-# storytold/craft-ai-integrations#197 until it merges.
-craft-ai-agents = { git = "https://github.com/storytold/craft-ai-integrations", rev = "35e0352666a117407d62230a6c6c2366f3e21a3b" }
+# every Craft app (storytold/craft-ai-integrations#195), and the shared AI layer PhotoCraft runs
+# Estimate Depth through (`estimate-depth`, Set up AI). All pinned to the head of
+# storytold/craft-ai-integrations#202 until it merges; repin then. One revision for every crate of
+# that repository, so there is one `craft-ai-core`.
+craft-ai-agents = { git = "https://github.com/storytold/craft-ai-integrations", rev = "733ec2feb1184512ac3861af4ad268f8dea216e2" }
+craft-ai-client = { git = "https://github.com/storytold/craft-ai-integrations", rev = "733ec2feb1184512ac3861af4ad268f8dea216e2", features = ["candle"] }
+craft-ai-core = { git = "https://github.com/storytold/craft-ai-integrations", rev = "733ec2feb1184512ac3861af4ad268f8dea216e2" }
+craft-ai-features = { git = "https://github.com/storytold/craft-ai-integrations", rev = "733ec2feb1184512ac3861af4ad268f8dea216e2" }
+craft-ai-native = { git = "https://github.com/storytold/craft-ai-integrations", rev = "733ec2feb1184512ac3861af4ad268f8dea216e2" }
+craft-ai-egui = { git = "https://github.com/storytold/craft-ai-integrations", rev = "733ec2feb1184512ac3861af4ad268f8dea216e2", default-features = false }
 # internal
 photocraft-geom = { path = "crates/geom" }
 photocraft-color = { path = "crates/color" }
@@ -32,7 +39,6 @@ photocraft-compose = { path = "crates/compose" }
 photocraft-gpu = { path = "crates/gpu" }
 photocraft-paint = { path = "crates/paint" }
 photocraft-algo = { path = "crates/algo" }
-photocraft-depth = { path = "crates/depth" }
 photocraft-io = { path = "crates/io" }
 photocraft-text = { path = "crates/text" }
 photocraft-vector = { path = "crates/vector" }
