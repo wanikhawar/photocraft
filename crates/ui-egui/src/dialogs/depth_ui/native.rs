@@ -75,9 +75,26 @@ enum Stage {
     Failed,
 }
 
+/// What one Estimate Depth asks for: the channel to write and the quality, fixed when it is chosen.
+#[derive(Clone, Debug, PartialEq)]
+struct Ask {
+    channel: String,
+    quality: &'static str,
+}
+
+impl Ask {
+    /// The brush's current Estimate Depth settings.
+    fn now(app: &PhotocraftApp) -> Self {
+        let surface = &app.session.tools.brush.surface;
+        Self { channel: surface.depth_channel.clone(), quality: if surface.depth_high_quality { "high" } else { "fast" } }
+    }
+}
+
 /// The setup window. Bound to the document that started the estimate.
 struct Window {
     doc: DocId,
+    /// The channel and quality asked for when Estimate Depth was chosen, used when setup ends.
+    ask: Ask,
     host: AiHost,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
@@ -187,11 +204,9 @@ pub fn inspect(app: &PhotocraftApp) -> Value {
     }
 }
 
-/// Run `image.estimateDepth` into the brush's depth channel, as a background job when jobs are on.
-fn estimate(app: &mut PhotocraftApp) {
-    let surface = &app.session.tools.brush.surface;
-    let (channel, quality) = (surface.depth_channel.clone(), if surface.depth_high_quality { "high" } else { "fast" });
-    if let Err(e) = app.run("image.estimateDepth", json!({"channel": channel, "quality": quality})) {
+/// Run `image.estimateDepth` as `ask` says, as a background job when jobs are on.
+fn estimate(app: &mut PhotocraftApp, ask: &Ask) {
+    if let Err(e) = app.run("image.estimateDepth", json!({"channel": ask.channel, "quality": ask.quality})) {
         match app.depth_ai.window.as_mut() {
             Some(w) => {
                 w.error = Some(e);
@@ -212,8 +227,9 @@ pub fn start(app: &mut PhotocraftApp) {
         app.ui.status_error = true;
         return;
     };
+    let ask = Ask::now(app);
     if app.session.depth.ai.status_reason().is_none() {
-        estimate(app);
+        estimate(app, &ask);
         return;
     }
     let host = match app.session.depth.ai.host() {
@@ -225,7 +241,7 @@ pub fn start(app: &mut PhotocraftApp) {
         }
     };
     let (tx, rx) = mpsc::channel();
-    app.depth_ai.window = Some(Window { doc, host, tx, rx, stage: Stage::Loading, working: false, started: false, provider: None, error: None });
+    app.depth_ai.window = Some(Window { doc, ask, host, tx, rx, stage: Stage::Loading, working: false, started: false, provider: None, error: None });
 }
 
 /// Close the window and stop its download.
@@ -237,10 +253,10 @@ pub fn cancel(app: &mut PhotocraftApp) {
     }
 }
 
-/// Hand a worker's answer to the window. Returns true when the estimate should run now.
-fn apply(app: &mut PhotocraftApp, msg: Msg) -> bool {
+/// Hand a worker's answer to the window. Returns what to estimate when it should run now.
+fn apply(app: &mut PhotocraftApp, msg: Msg) -> Option<Ask> {
     let current = active_doc(app);
-    let Some(w) = app.depth_ai.window.as_mut() else { return false };
+    let w = app.depth_ai.window.as_mut()?;
     match msg {
         Msg::Failed(e) => {
             w.working = false;
@@ -315,7 +331,7 @@ fn apply(app: &mut PhotocraftApp, msg: Msg) -> bool {
                             connection.as_str(),
                             model.as_str()
                         ));
-                        return false;
+                        return None;
                     }
                     return finish(app, current);
                 }
@@ -323,17 +339,17 @@ fn apply(app: &mut PhotocraftApp, msg: Msg) -> bool {
             }
         }
     }
-    false
+    None
 }
 
 /// Setup is done: estimate when the person is still on the document that asked, else say so and
 /// leave nothing running.
-fn finish(app: &mut PhotocraftApp, current: Option<DocId>) -> bool {
-    let Some(w) = app.depth_ai.window.as_mut() else { return false };
+fn finish(app: &mut PhotocraftApp, current: Option<DocId>) -> Option<Ask> {
+    let w = app.depth_ai.window.as_mut()?;
     if app.session.depth.ai.status_reason().is_some() {
         w.error = Some(app.session.depth.ai.status_reason().unwrap_or_default());
         w.stage = Stage::Failed;
-        return false;
+        return None;
     }
     if current != Some(w.doc) {
         w.error = Some(
@@ -341,10 +357,9 @@ fn finish(app: &mut PhotocraftApp, current: Option<DocId>) -> bool {
                 .into(),
         );
         w.stage = Stage::Failed;
-        return false;
+        return None;
     }
-    app.depth_ai.window = None;
-    true
+    app.depth_ai.window.take().map(|w| w.ask)
 }
 
 /// Ask for a folder, then rebuild the plan with it. `existing` is true for a folder that already
@@ -394,20 +409,20 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
         }
     }
     // Take answers.
-    let mut run_estimate = false;
+    let mut run_estimate = None;
     while let Some(w) = app.depth_ai.window.as_ref() {
         match w.rx.try_recv() {
             Ok(msg) => {
-                if apply(app, msg) {
-                    run_estimate = true;
+                if let Some(ask) = apply(app, msg) {
+                    run_estimate = Some(ask);
                     break;
                 }
             }
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
         }
     }
-    if run_estimate {
-        estimate(app);
+    if let Some(ask) = run_estimate {
+        estimate(app, &ask);
         return;
     }
     let Some(w) = app.depth_ai.window.as_mut() else { return };
@@ -624,7 +639,7 @@ mod tests {
         assert_ne!(active_doc(&app), Some(started_on));
         // The tool is ready by the time the setup ends.
         app.session.depth.ai.estimator = Some(Arc::new(|_, _, _, _| Err("not run".into())));
-        assert!(!apply(&mut app, Msg::Chosen(Ok(()))));
+        assert!(apply(&mut app, Msg::Chosen(Ok(()))).is_none());
         assert_eq!(inspect(&app)["phase"], "failed");
         let error = inspect(&app)["error"].as_str().unwrap_or_default().to_owned();
         assert!(error.contains("no longer the active one"), "{error}");
@@ -635,7 +650,7 @@ mod tests {
             w.doc = current;
             w.stage = Stage::Loading;
         }
-        assert!(apply(&mut app, Msg::Chosen(Ok(()))));
+        assert!(apply(&mut app, Msg::Chosen(Ok(()))).is_some());
         assert!(app.depth_ai.window.is_none());
     }
 
@@ -644,7 +659,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app(dir.path());
         start(&mut app);
-        assert!(!apply(&mut app, Msg::Chosen(Ok(()))));
+        assert!(apply(&mut app, Msg::Chosen(Ok(()))).is_none());
         assert_eq!(inspect(&app)["phase"], "failed");
         assert!(inspect(&app)["error"].is_string());
     }
@@ -657,8 +672,53 @@ mod tests {
         if let Some(w) = app.depth_ai.window.as_mut() {
             w.working = true;
         }
-        assert!(!apply(&mut app, Msg::Failed("boom".into())));
+        assert!(apply(&mut app, Msg::Failed("boom".into())).is_none());
         assert_eq!(inspect(&app), json!({"phase": "failed", "busy": false, "error": "boom"}));
+    }
+
+    /// The model files are in place, by download or by files found on disk: both end in `adopt`.
+    fn adopted() -> Msg {
+        let connection = craft_ai_core::ConnectionId::new("native-estimate-depth-candle").unwrap();
+        let model = craft_ai_core::ModelId::new("depth-anything-v2-small").unwrap();
+        Msg::Adopted(Ok(craft_ai_client::Adopted { connection, model, bound: true, kept: None }))
+    }
+
+    /// Download completion and local-file completion on another document: nothing is estimated,
+    /// and neither document gains a channel.
+    #[test]
+    fn model_files_arriving_while_another_document_is_active_estimate_nothing() {
+        for arrival in ["download", "local files"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut app = app(dir.path());
+            let started_on = active_doc(&app).unwrap();
+            start(&mut app);
+            app.run("file.new", json!({"width": 16, "height": 16})).unwrap();
+            app.session.depth.ai.estimator = Some(Arc::new(|_, _, _, _| Err("not run".into())));
+            assert!(apply(&mut app, adopted()).is_none(), "{arrival}");
+            assert_eq!(inspect(&app)["phase"], "failed", "{arrival}");
+            assert!(app.session.active().unwrap().doc.channels.is_empty(), "{arrival}");
+            // The document that asked was not touched either.
+            app.run("document.activate", json!({"document": 0})).unwrap();
+            assert_eq!(active_doc(&app), Some(started_on), "{arrival}");
+            assert!(app.session.active().unwrap().doc.channels.is_empty(), "{arrival}");
+        }
+    }
+
+    /// The channel and quality are the ones asked for when Estimate Depth was chosen, even if the
+    /// brush settings change while the model files arrive.
+    #[test]
+    fn the_estimate_keeps_the_channel_and_quality_it_was_asked_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        app.session.tools.brush.surface.depth_channel = "Near".into();
+        app.session.tools.brush.surface.depth_high_quality = false;
+        start(&mut app);
+        app.session.tools.brush.surface.depth_channel = "Other".into();
+        app.session.tools.brush.surface.depth_high_quality = true;
+        app.session.depth.ai.estimator = Some(Arc::new(|_, _, _, _| Err("not run".into())));
+        let ask = apply(&mut app, adopted()).expect("the same document estimates");
+        assert_eq!(ask, Ask { channel: "Near".into(), quality: "fast" });
+        assert!(app.depth_ai.window.is_none());
     }
 
     #[test]
