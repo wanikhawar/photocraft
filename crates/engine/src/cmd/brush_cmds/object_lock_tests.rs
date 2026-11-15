@@ -358,3 +358,39 @@ fn cancelling_a_pending_find_ends_the_wait_at_once() {
     let plain = LiveStroke::begin_with(&s, "paint.stroke", &stroke(json!([[60, 50]]), json!({}))).unwrap();
     assert!(plain.cancel_pending().is_none());
 }
+
+/// Painting straight onto the photo (its only layer) looks at the photo: hiding the layer being
+/// painted, as a paint layer above the photo is hidden, would leave an empty canvas to look at.
+#[test]
+fn painting_onto_the_photo_itself_looks_at_the_photo() {
+    let mut s = two_objects();
+    // Drop the empty paint layer: the photo is the only layer, and the active one.
+    s.execute("layer.delete", json!({})).unwrap();
+    assert_eq!(s.active().unwrap().doc.layers.len(), 1);
+    let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+    let record = seen.clone();
+    let (inner, _) = segmenter(vec![A, B]);
+    s.ai.segmenter = Some(Arc::new(move |png, w, h, clicks| {
+        record.lock().unwrap().push(png.to_vec());
+        inner(png, w, h, clicks)
+    }));
+    s.execute("paint.stroke", stroke(json!(ACROSS), stay(json!({})))).unwrap();
+    let pngs = seen.lock().unwrap();
+    let png = pngs.first().expect("the segmenter ran");
+    let mut reader = png::Decoder::new(std::io::Cursor::new(png.clone())).read_info().unwrap();
+    let mut px = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut px).unwrap();
+    let ch = info.color_type.samples();
+    let at = |x: usize, y: usize| px[(y * info.width as usize + x) * ch];
+    // Red where the objects are, white (transparent over white) around them.
+    assert!(at(60, 50) > 150 && px[(50 * info.width as usize + 60) * ch + 1] < 100, "the photo's red object was sent");
+    assert!(at(5, 5) > 240, "the empty area is white");
+    drop(pngs);
+    // The stroke is blue over the red photo: blue on its object, the touching one still red.
+    let photo = layer_surface(&s);
+    let blue = |x, y| {
+        let c = photo.rgba(x, y);
+        c[2] > 0.5 && c[0] < 0.5
+    };
+    assert!(blue(60, 50) && !blue(130, 50), "the stroke stays on its object");
+}

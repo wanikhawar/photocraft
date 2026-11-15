@@ -410,10 +410,33 @@ fn ask_tool(
     Ok(Some(Segmented { mask, found }))
 }
 
-/// The document a sample is read from: with All Layers the one being painted is hidden first (as
-/// for Surface Color), so earlier strokes never change what is found.
+/// The document a sample is read from. With All Layers the one being painted is hidden first (as
+/// for Surface Color), so earlier strokes on a paint layer never change what is found, but only
+/// when another visible layer shows something: painting straight onto the photo (often the only
+/// layer) must look at the photo, not at an empty canvas.
 fn sampled_doc(doc: &Arc<Document>, all_layers: bool, layer: Option<LayerId>) -> Cow<'_, Document> {
-    if all_layers { super::surface_wire::hide_target(doc, layer) } else { Cow::Borrowed(&**doc) }
+    if all_layers && layer.is_some_and(|id| others_show_something(&doc.layers, id, 0)) {
+        super::surface_wire::hide_target(doc, layer)
+    } else {
+        Cow::Borrowed(&**doc)
+    }
+}
+
+/// Deepest group nesting [`others_show_something`] looks into (documents can be deep).
+const MAX_GROUP_DEPTH: usize = 64;
+
+/// Whether a visible layer other than `target` (inside visible groups) can show pixels: a fill, a
+/// layer with content, or a type, shape or smart object layer. Adjustments and empty layers show
+/// nothing of their own.
+fn others_show_something(layers: &[photocraft_doc::Layer], target: LayerId, depth: usize) -> bool {
+    use photocraft_doc::LayerContent;
+    layers.iter().filter(|l| l.visible && l.id != target).any(|l| match &l.content {
+        LayerContent::Group(g) => depth < MAX_GROUP_DEPTH && others_show_something(&g.children, target, depth + 1),
+        LayerContent::Adjustment(_) => false,
+        LayerContent::Fill(_) => true,
+        LayerContent::Raster(s) => !s.content_bounds().is_empty(),
+        LayerContent::Text(_) | LayerContent::Shape(_) | LayerContent::Smart(_) => l.surface().is_none_or(|s| !s.content_bounds().is_empty()),
+    })
 }
 
 fn built_in(sampled: &Document, layer: Option<LayerId>, all_layers: bool, click: (f64, f64)) -> Result<Region> {
