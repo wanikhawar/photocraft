@@ -248,16 +248,7 @@ fn invalid_entry_left(ui: &egui::Ui, resp: &egui::Response) -> bool {
         return false;
     }
     let owed = ui.ctx().data_mut(|d| d.remove_temp::<bool>(no_number)).unwrap_or(false);
-    if !resp.lost_focus() {
-        return false;
-    }
-    // The field stops reading its text once complete arithmetic is held (`50/2`), so the pass
-    // that leaves it can be the first to read the final text (`50/2x`): that result wins over
-    // the flag an earlier pass left.
-    match crate::widgets::typed_text_parses(ui.ctx(), resp.id) {
-        Some(parses) => !parses,
-        None => owed,
-    }
+    owed && resp.lost_focus()
 }
 
 /// The Polygon tool's Sides: whole numbers 3..100. Returns true once the field is left with a
