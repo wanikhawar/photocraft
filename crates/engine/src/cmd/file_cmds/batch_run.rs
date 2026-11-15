@@ -247,7 +247,7 @@ fn process_outputs<'a>(
     let action_prefs = s.prefs().actions.clone();
     let authorize = s.authorize;
     #[cfg(not(target_arch = "wasm32"))]
-    let ai = s.depth.ai.shared();
+    let ai = s.ai.shared();
     let mut files = Vec::new();
     let mut errors = Vec::new();
     let mut written = OutputClaims::default();
@@ -257,7 +257,7 @@ fn process_outputs<'a>(
         // And use its AI layer, so an action that estimates depth works in the copy too.
         #[cfg(not(target_arch = "wasm32"))]
         {
-            scratch.depth.ai = ai.shared();
+            scratch.ai = ai.shared();
         }
         scratch.prefs.edit(|prefs| prefs.actions = action_prefs.clone());
         f(scratch, out).map_err(FileFailure::from)
@@ -307,7 +307,7 @@ pub(super) fn process_document_copies(
             scratch.authorize = s.authorize;
             #[cfg(not(target_arch = "wasm32"))]
             {
-                scratch.depth.ai = s.depth.ai.shared();
+                scratch.ai = s.ai.shared();
             }
             scratch.prefs.edit(|prefs| *prefs = s.prefs().clone());
             scratch.add_document(state.doc.as_ref().clone(), state.path.clone());
@@ -929,7 +929,7 @@ pub(super) fn batch(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let authorize = s.authorize;
     #[cfg(not(target_arch = "wasm32"))]
-    let ai = s.depth.ai.shared();
+    let ai = s.ai.shared();
     let raw_ppi = super::open::raw_open_resolution(s);
     let action_prefs = s.prefs().actions.clone();
     let prefs = s.prefs.clone();
@@ -1063,7 +1063,7 @@ pub(super) fn batch(s: &mut Session, p: &Value) -> Result<Value> {
                 scratch.authorize = authorize;
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    scratch.depth.ai = ai.shared();
+                    scratch.ai = ai.shared();
                 }
                 // A command inside the action (Estimate Depth waits on a model) stops with this Batch.
                 // Only the cancel is shared: the scratch's progress, commit and Esc state stay its own.
@@ -1648,7 +1648,7 @@ mod shared_ai_tests {
     fn parent(calls: &Arc<AtomicUsize>) -> Session {
         let mut s = Session::new();
         let calls = calls.clone();
-        s.depth.ai.estimator = Some(Arc::new(move |_, w, h, _| {
+        s.ai.estimator = Some(Arc::new(move |_, w, h, _| {
             calls.fetch_add(1, Ordering::SeqCst);
             Ok(ai::encode_gray16(&vec![30000; (w * h) as usize], w, h))
         }));
@@ -1665,7 +1665,7 @@ mod shared_ai_tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let release_rx = std::sync::Mutex::new(release_rx);
         let mut s = Session::new();
-        s.depth.ai.estimator = Some(Arc::new(move |_, w, h, _| {
+        s.ai.estimator = Some(Arc::new(move |_, w, h, _| {
             let _ = entered_tx.send(());
             // Held until the test ends; a cancel must not wait for it.
             let _ = release_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(60));

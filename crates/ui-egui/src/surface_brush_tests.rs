@@ -116,11 +116,11 @@ fn the_depth_options_reach_tools_set_brush() {
 
 /// A host over an empty temporary AI store: nothing is set up, and no test reads a person's settings.
 #[cfg(not(target_arch = "wasm32"))]
-fn empty_host(dir: &std::path::Path) -> photocraft_engine::depth_cmds::AiHost {
+fn empty_host(dir: &std::path::Path) -> photocraft_engine::ai_layer::AiHost {
     use std::sync::Arc;
     let store = craft_ai_native::shared::SharedStore::new(dir.join("connections.json"));
     let shared = store.clone();
-    photocraft_engine::depth_cmds::AiHost::new(store, move || {
+    photocraft_engine::ai_layer::AiHost::new(store, move || {
         let app = craft_ai_core::AppId::new("photocraft").map_err(|e| e.to_string())?;
         Ok(craft_ai_client::AiClient::new(app, shared.clone(), Arc::new(craft_ai_native::secrets::MemoryStore::new())))
     })
@@ -145,8 +145,8 @@ fn wait_for_phase(app: &mut PhotocraftApp, phase: &str) {
 fn estimate_depth_with_an_unset_tool_opens_the_missing_model_window() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app(Tool::Brush);
-    app.session.depth.ai.set_host(empty_host(dir.path()));
-    let reason = app.session.depth.ai.status_reason_now().expect("nothing is set up");
+    app.session.ai.set_host(empty_host(dir.path()));
+    let reason = app.session.ai.status_reason_now(photocraft_engine::depth_cmds::TOOL).expect("nothing is set up");
     assert_eq!(crate::dialogs::depth_ui::unavailable_reason(&app), Some(reason));
     crate::dialogs::depth_ui::start(&mut app);
     assert_eq!(crate::dialogs::depth_ui::inspect(&app)["phase"], "loading");

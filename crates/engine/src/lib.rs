@@ -9,6 +9,8 @@
 
 mod actions_record;
 pub mod adjust_params;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod ai_layer;
 mod allocation;
 pub mod build_info;
 mod canvas_geom;
@@ -265,7 +267,11 @@ pub struct Session {
     pub prefs: prefs::PrefsStore,
     /// Release checks use an injected platform transport; no network I/O in the engine.
     pub updates: updates_cmds::Updates,
-    /// Estimate Depth: the shared AI tool's status and the last estimate's full-precision plane.
+    /// The shared Craft AI layer: its host, each tool's status and the test stand-ins
+    /// ([`ai_layer`]). The web build has no tools.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub ai: ai_layer::AiState,
+    /// Estimate Depth: the last estimate's full-precision plane.
     pub depth: depth_cmds::DepthState,
     /// Edit menu state: Fade source, custom shape library (see `edit_menu_cmds`).
     pub edit_state: edit_menu_cmds::EditState,

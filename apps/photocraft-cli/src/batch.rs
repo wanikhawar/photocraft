@@ -197,7 +197,7 @@ pub(crate) fn droplet(a: &DropletArgs, out: &mut dyn Write, err: &mut dyn Write)
         p["output"] = json!(o);
     }
     let mut s = photocraft_engine::Session::new();
-    let _ = s.depth.ai.use_standard_host();
+    let _ = s.ai.use_standard_host();
     let r = s.execute("file.automate.runDroplet", p)?;
     for f in r["files"].as_array().into_iter().flatten() {
         let _ = writeln!(out, "ok    {}", f.as_str().unwrap_or_default());

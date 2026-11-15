@@ -11,7 +11,8 @@ use craft_ai_core::AiError;
 use craft_ai_egui::{NativeSetupAction, PopupAction, missing_model_popup, native_model_setup};
 use craft_ai_features::{Feature, builtin};
 use photocraft_doc::DocId;
-use photocraft_engine::depth_cmds::{AiHost, TOOL};
+use photocraft_engine::ai_layer::AiHost;
+use photocraft_engine::depth_cmds::TOOL;
 use serde_json::{Value, json};
 
 use crate::PhotocraftApp;
@@ -198,7 +199,7 @@ fn active_doc(app: &PhotocraftApp) -> Option<DocId> {
 
 /// Why the Estimate Depth button is off, for its tooltip, or `None` while it can be used.
 pub fn unavailable_reason(app: &PhotocraftApp) -> Option<String> {
-    app.session.depth.ai.status_reason()
+    app.session.ai.status_reason(TOOL)
 }
 
 /// A small summary for `ui.inspect`: `null` while no setup window is open.
@@ -241,11 +242,11 @@ pub fn start(app: &mut PhotocraftApp) {
         cancel(app);
     }
     let ask = Ask::now(app);
-    if app.session.depth.ai.status_reason_now().is_none() {
+    if app.session.ai.status_reason_now(TOOL).is_none() {
         estimate(app, &ask);
         return;
     }
-    let host = match app.session.depth.ai.host() {
+    let host = match app.session.ai.host() {
         Ok(h) => h,
         Err(e) => {
             app.ui.status = e;
@@ -300,7 +301,7 @@ fn apply(app: &mut PhotocraftApp, msg: Msg) -> Option<Ask> {
             match r {
                 // The tool became ready meanwhile (another app set it up).
                 Ok(None) => {
-                    app.session.depth.ai.forget_status();
+                    app.session.ai.forget_status();
                     return finish(app, current);
                 }
                 Ok(Some(p)) => w.stage = Stage::Missing(Box::new(p)),
@@ -344,7 +345,7 @@ fn apply(app: &mut PhotocraftApp, msg: Msg) -> Option<Ask> {
             w.working = false;
             match r {
                 Ok(()) => {
-                    app.session.depth.ai.forget_status();
+                    app.session.ai.forget_status();
                     return finish(app, current);
                 }
                 Err(e) => w.error = Some(e),
@@ -354,7 +355,7 @@ fn apply(app: &mut PhotocraftApp, msg: Msg) -> Option<Ask> {
             w.working = false;
             match r {
                 Ok(adopted) => {
-                    app.session.depth.ai.forget_status();
+                    app.session.ai.forget_status();
                     if let Some((connection, model)) = adopted.kept.filter(|_| !adopted.bound) {
                         w.error = Some(format!(
                             "Another model ({} / {}) is already chosen for Estimate Depth, so the new files were not switched on. Choose it in Set up AI in the ArtCraft Launcher.",
@@ -376,7 +377,7 @@ fn apply(app: &mut PhotocraftApp, msg: Msg) -> Option<Ask> {
 /// leave nothing running.
 fn finish(app: &mut PhotocraftApp, current: Option<DocId>) -> Option<Ask> {
     let w = app.depth_ai.window.as_mut()?;
-    if let Some(reason) = app.session.depth.ai.status_reason_now() {
+    if let Some(reason) = app.session.ai.status_reason_now(TOOL) {
         w.error = Some(reason);
         w.stage = Stage::Failed;
         return None;
@@ -674,7 +675,7 @@ mod tests {
     fn app(dir: &std::path::Path) -> PhotocraftApp {
         let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
         app.run("file.new", json!({"width": 32, "height": 24})).unwrap();
-        app.session.depth.ai.set_host(empty_host(dir));
+        app.session.ai.set_host(empty_host(dir));
         app
     }
 
@@ -689,7 +690,7 @@ mod tests {
         app.run("file.new", json!({"width": 16, "height": 16})).unwrap();
         assert_ne!(active_doc(&app), Some(started_on));
         // The tool is ready by the time the setup ends.
-        app.session.depth.ai.estimator = Some(Arc::new(|_, _, _, _| Err("not run".into())));
+        app.session.ai.estimator = Some(Arc::new(|_, _, _, _| Err("not run".into())));
         assert!(apply(&mut app, Msg::Chosen(Ok(()))).is_none());
         assert_eq!(inspect(&app)["phase"], "failed");
         let error = inspect(&app)["error"].as_str().unwrap_or_default().to_owned();
@@ -843,7 +844,7 @@ mod tests {
             let started_on = active_doc(&app).unwrap();
             start(&mut app);
             app.run("file.new", json!({"width": 16, "height": 16})).unwrap();
-            app.session.depth.ai.estimator = Some(Arc::new(|_, _, _, _| Err("not run".into())));
+            app.session.ai.estimator = Some(Arc::new(|_, _, _, _| Err("not run".into())));
             assert!(apply(&mut app, adopted()).is_none(), "{arrival}");
             assert_eq!(inspect(&app)["phase"], "failed", "{arrival}");
             assert!(app.session.active().unwrap().doc.channels.is_empty(), "{arrival}");
@@ -865,7 +866,7 @@ mod tests {
         start(&mut app);
         app.session.tools.brush.surface.depth_channel = "Other".into();
         app.session.tools.brush.surface.depth_high_quality = true;
-        app.session.depth.ai.estimator = Some(Arc::new(|_, _, _, _| Err("not run".into())));
+        app.session.ai.estimator = Some(Arc::new(|_, _, _, _| Err("not run".into())));
         let ask = apply(&mut app, adopted()).expect("the same document estimates");
         assert_eq!(ask, Ask { channel: "Near".into(), quality: "fast" });
         assert!(app.depth_ai.window.is_none());

@@ -88,7 +88,7 @@ impl Headless {
     #[must_use]
     pub fn with_ai_tools(self) -> Self {
         // A failure leaves Estimate Depth off with that reason.
-        let _ = self.session.depth.ai.use_standard_host();
+        let _ = self.session.ai.use_standard_host();
         self
     }
 

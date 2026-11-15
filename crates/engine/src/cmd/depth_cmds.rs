@@ -22,7 +22,7 @@ use crate::{EngineError, Result, Session};
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ai;
 #[cfg(not(target_arch = "wasm32"))]
-pub use ai::{AiHost, AiState, Estimator, TOOL};
+pub use ai::{Estimator, TOOL};
 
 /// Longest side of the picture sent to the tool (the tool resizes it again to its own sizes).
 const SEND_SIDE: usize = 2048;
@@ -90,9 +90,6 @@ pub fn precise_depth_plane(s: &Session, doc: DocId, channel_name: &str, current_
 
 #[derive(Default)]
 pub struct DepthState {
-    /// The shared AI layer: the tool, its status, and the hook that replaces it in tests.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub ai: ai::AiState,
     /// Shared with the estimate job, which fills it from its worker thread.
     precise: Arc<Mutex<Option<PreciseDepth>>>,
 }
@@ -274,7 +271,7 @@ fn enabled_estimate(s: &Session) -> std::result::Result<(), String> {
     #[cfg(target_arch = "wasm32")]
     return Err(UNAVAILABLE_ON_WEB.to_owned());
     #[cfg(not(target_arch = "wasm32"))]
-    match s.depth.ai.known_status_reason() {
+    match s.ai.known_status_reason(TOOL) {
         Some(reason) => Err(reason),
         None => Ok(()),
     }
@@ -339,7 +336,7 @@ fn estimate_plane(doc: &Document, ctx: &crate::jobs::JobCtx, backend: &ai::Backe
     let bytes: Vec<u8> = rgb.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8).collect();
     drop(rgb);
     let (rw32, rh32) = (u32::try_from(rw).map_err(|_| bad("the image is too large"))?, u32::try_from(rh).map_err(|_| bad("the image is too large"))?);
-    let png = ai::encode_rgb8(&bytes, rw32, rh32)?;
+    let png = crate::ai_layer::encode_rgb8(&bytes, rw32, rh32)?;
     drop(bytes);
     ctx.progress(0.15, "Estimating depth");
     let answer = backend(ctx, png, rw32, rh32, quality)?;
@@ -380,10 +377,10 @@ fn estimate_depth(s: &mut Session, p: &Value) -> Result<Value> {
     let name = channel_name(p)?;
     let quality = quality_param(p)?;
     s.active().ok_or(EngineError::NoDocument)?;
-    if let Some(reason) = s.depth.ai.status_reason_now() {
+    if let Some(reason) = s.ai.status_reason_now(TOOL) {
         return Err(bad(reason));
     }
-    let backend = s.depth.ai.backend().map_err(bad)?;
+    let backend = ai::backend(&s.ai).map_err(bad)?;
     let precise = s.depth.precise.clone();
     let started = web_time::Instant::now();
     crate::jobs::edit_job(
@@ -443,6 +440,7 @@ pub fn specs() -> Vec<CommandSpec> {
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
+    use crate::ai_layer::AiHost;
     use crate::channel_cmds::plane_surface;
     use craft_ai_client::AiClient;
     use craft_ai_core::AppId;
@@ -481,7 +479,7 @@ mod tests {
     fn fake_session(w: u32, h: u32) -> (Session, Arc<Mutex<Vec<String>>>) {
         let mut s = session(w, h);
         let seen = Arc::new(Mutex::new(Vec::new()));
-        s.depth.ai.estimator = Some(fake(seen.clone()));
+        s.ai.estimator = Some(fake(seen.clone()));
         (s, seen)
     }
 
@@ -493,8 +491,8 @@ mod tests {
     fn an_unset_tool_disables_the_command_with_the_reason() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = session(16, 16);
-        s.depth.ai.set_host(empty_host(dir.path()));
-        let reason = s.depth.ai.status_reason_now().expect("nothing is set up");
+        s.ai.set_host(empty_host(dir.path()));
+        let reason = s.ai.status_reason_now(TOOL).expect("nothing is set up");
         assert!(!reason.trim().is_empty());
         let e = s.execute("image.estimateDepth", json!({})).unwrap_err().to_string();
         assert!(e.contains(&reason), "{e} vs {reason}");
@@ -503,9 +501,9 @@ mod tests {
         let none = Session::new();
         assert!(enabled_estimate(&none).is_err());
         // The status is reused for a moment and forgotten on request.
-        assert_eq!(s.depth.ai.status_reason(), Some(reason));
-        s.depth.ai.forget_status();
-        assert!(s.depth.ai.status_reason().is_some());
+        assert_eq!(s.ai.status_reason(TOOL), Some(reason));
+        s.ai.forget_status();
+        assert!(s.ai.status_reason(TOOL).is_some());
     }
 
     /// The per-frame status never waits for the shared store: it answers at once and fills in the
@@ -515,21 +513,21 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let release_rx = Mutex::new(release_rx);
         let s = Session::new();
-        s.depth.ai.set_host(AiHost::new(SharedStore::new("/nonexistent/x.json"), move || {
+        s.ai.set_host(AiHost::new(SharedStore::new("/nonexistent/x.json"), move || {
             // The slow part (key-store setup) blocks until the test lets it go.
             let _ = release_rx.lock().unwrap().recv();
             Err("no AI folder here".to_owned())
         }));
         let began = std::time::Instant::now();
-        let first = s.depth.ai.status_reason().expect("provisional while checking");
+        let first = s.ai.status_reason(TOOL).expect("provisional while checking");
         assert!(began.elapsed() < std::time::Duration::from_secs(5), "blocked for {:?}", began.elapsed());
         assert!(first.contains("Checking"), "{first}");
         // Asking again while the read runs starts nothing else and still answers at once.
-        assert_eq!(s.depth.ai.status_reason(), Some(first));
+        assert_eq!(s.ai.status_reason(TOOL), Some(first));
         release_tx.send(()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            if s.depth.ai.status_reason().as_deref() == Some("no AI folder here") {
+            if s.ai.status_reason(TOOL).as_deref() == Some("no AI folder here") {
                 break;
             }
             assert!(std::time::Instant::now() < deadline, "the background read never answered");
@@ -541,11 +539,11 @@ mod tests {
     #[test]
     fn a_new_host_is_seen_at_once() {
         let s = Session::new();
-        s.depth.ai.set_host(AiHost::new(SharedStore::new("/nonexistent/x.json"), || Err("old".to_owned())));
-        assert_eq!(s.depth.ai.status_reason_now().as_deref(), Some("old"));
-        s.depth.ai.set_host(AiHost::new(SharedStore::new("/nonexistent/x.json"), || Err("new".to_owned())));
-        assert_eq!(s.depth.ai.status_reason_now().as_deref(), Some("new"));
-        assert_eq!(s.depth.ai.status_reason().as_deref(), Some("new"));
+        s.ai.set_host(AiHost::new(SharedStore::new("/nonexistent/x.json"), || Err("old".to_owned())));
+        assert_eq!(s.ai.status_reason_now(TOOL).as_deref(), Some("old"));
+        s.ai.set_host(AiHost::new(SharedStore::new("/nonexistent/x.json"), || Err("new".to_owned())));
+        assert_eq!(s.ai.status_reason_now(TOOL).as_deref(), Some("new"));
+        assert_eq!(s.ai.status_reason(TOOL).as_deref(), Some("new"));
     }
 
     #[test]
@@ -554,10 +552,10 @@ mod tests {
         // report why the tool cannot run.
         let dir = tempfile::tempdir().unwrap();
         let mut s = session(16, 16);
-        s.depth.ai.set_host(empty_host(dir.path()));
+        s.ai.set_host(empty_host(dir.path()));
         let e = s.execute("image.estimateDepth", json!({})).unwrap_err().to_string();
         assert!(!e.contains("Checking"), "{e}");
-        let reason = s.depth.ai.status_reason_now().expect("nothing is set up");
+        let reason = s.ai.status_reason_now(TOOL).expect("nothing is set up");
         assert!(e.contains(&reason), "{e} vs {reason}");
         assert_eq!(channels(&s), 0);
     }
@@ -568,7 +566,7 @@ mod tests {
     fn enabled_reads_on_a_fresh_session_agree() {
         let dir = tempfile::tempdir().unwrap();
         let not_set_up = session(8, 8);
-        not_set_up.depth.ai.set_host(empty_host(dir.path()));
+        not_set_up.ai.set_host(empty_host(dir.path()));
         let no_host = session(8, 8);
         for (case, s) in [("tool not set up", &not_set_up), ("no host", &no_host)] {
             let first = s.disabled_reason("image.estimateDepth");
@@ -582,8 +580,8 @@ mod tests {
     #[test]
     fn a_host_that_cannot_be_made_is_the_reason() {
         let mut s = session(8, 8);
-        s.depth.ai.set_host(AiHost::new(SharedStore::new("/nonexistent/x.json"), || Err("no AI folder here".to_owned())));
-        assert_eq!(s.depth.ai.status_reason_now().as_deref(), Some("no AI folder here"));
+        s.ai.set_host(AiHost::new(SharedStore::new("/nonexistent/x.json"), || Err("no AI folder here".to_owned())));
+        assert_eq!(s.ai.status_reason_now(TOOL).as_deref(), Some("no AI folder here"));
         assert!(s.execute("image.estimateDepth", json!({})).is_err());
     }
 
@@ -632,8 +630,8 @@ mod tests {
         let (mut s, _) = fake_session(3000, 1000);
         let sizes = Arc::new(Mutex::new(Vec::new()));
         let log = sizes.clone();
-        let inner = s.depth.ai.estimator.clone().unwrap();
-        s.depth.ai.estimator = Some(Arc::new(move |png, w, h, q| {
+        let inner = s.ai.estimator.clone().unwrap();
+        s.ai.estimator = Some(Arc::new(move |png, w, h, q| {
             log.lock().unwrap().push((w, h));
             inner(png, w, h, q)
         }));
@@ -725,7 +723,7 @@ mod tests {
             enc.write_header().unwrap().write_image_data(&vec![value; (w * h) as usize]).unwrap();
             out
         };
-        let rgb = ai::encode_rgb8(&[0; 16 * 16 * 3], 16, 16).unwrap();
+        let rgb = crate::ai_layer::encode_rgb8(&[0; 16 * 16 * 3], 16, 16).unwrap();
         let answers: Vec<std::result::Result<Vec<u8>, String>> = vec![
             Err("boom".into()),
             Ok(Vec::new()),
@@ -735,11 +733,11 @@ mod tests {
             Ok(rgb),
         ];
         for a in answers {
-            s.depth.ai.estimator = Some(Arc::new(move |_, _, _, _| a.clone()));
+            s.ai.estimator = Some(Arc::new(move |_, _, _, _| a.clone()));
             assert!(s.execute("image.estimateDepth", json!({})).is_err());
         }
         // An 8-bit gray picture of the right size is fine.
-        s.depth.ai.estimator = Some(Arc::new(move |_, _, _, _| Ok(gray8(16, 16, 200))));
+        s.ai.estimator = Some(Arc::new(move |_, _, _, _| Ok(gray8(16, 16, 200))));
         assert!(s.execute("image.estimateDepth", json!({})).is_ok());
     }
 
@@ -750,7 +748,7 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::channel::<()>();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let release_rx = Mutex::new(release_rx);
-        s.depth.ai.estimator = Some(Arc::new(move |_, w, h, _| {
+        s.ai.estimator = Some(Arc::new(move |_, w, h, _| {
             let _ = entered_tx.send(());
             let _ = release_rx.lock().unwrap().recv();
             Ok(ai::encode_gray16(&vec![1000; (w * h) as usize], w, h))
@@ -774,7 +772,7 @@ mod tests {
         let (before, _, _) = precise_depth_plane(&s, id, "Depth", &surface).expect("plane after the first estimate");
         // A second estimate whose worker finishes, then is cancelled before its result is applied.
         let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
-        s.depth.ai.estimator = Some(Arc::new(move |_, w, h, _| {
+        s.ai.estimator = Some(Arc::new(move |_, w, h, _| {
             let _ = entered_tx.send(());
             Ok(ai::encode_gray16(&vec![30000; (w * h) as usize], w, h))
         }));
