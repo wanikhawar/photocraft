@@ -126,7 +126,7 @@ pub(super) fn surface_options(app: &mut PhotocraftApp, ui: &mut egui::Ui, b: &mu
     let mut clear = false;
     let mut estimate_depth = false;
     let mut set_up_finder = false;
-    // Its Sample dropdown opens a list of its own over it.
+    // Its dropdowns (Sample, Stay on Object) open lists of their own over it.
     widgets::press_menu::show_popover(&resp, |ui| {
         ui.set_min_width(200.0);
         let s = &mut b.surface;
