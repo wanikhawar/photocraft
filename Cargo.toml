@@ -19,7 +19,7 @@ craft-flags = { git = "https://github.com/storytold/craft-libs", rev = "ad8faa1c
 # storytold/craft-ai-integrations#202 until it merges; repin then. One revision for every crate of
 # that repository, so there is one `craft-ai-core`.
 craft-ai-agents = { git = "https://github.com/storytold/craft-ai-integrations", rev = "8effd2d135d4c69e5fa6e7045b8d6265ddbdeba7" }
-craft-ai-client = { git = "https://github.com/storytold/craft-ai-integrations", rev = "8effd2d135d4c69e5fa6e7045b8d6265ddbdeba7", features = ["candle"] }
+craft-ai-client = { git = "https://github.com/storytold/craft-ai-integrations", rev = "8effd2d135d4c69e5fa6e7045b8d6265ddbdeba7", features = ["candle", "rten"] }
 craft-ai-core = { git = "https://github.com/storytold/craft-ai-integrations", rev = "8effd2d135d4c69e5fa6e7045b8d6265ddbdeba7" }
 craft-ai-features = { git = "https://github.com/storytold/craft-ai-integrations", rev = "8effd2d135d4c69e5fa6e7045b8d6265ddbdeba7" }
 craft-ai-native = { git = "https://github.com/storytold/craft-ai-integrations", rev = "8effd2d135d4c69e5fa6e7045b8d6265ddbdeba7" }

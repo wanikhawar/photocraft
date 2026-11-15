@@ -24,6 +24,35 @@ pub enum SampleMode {
 /// Valid range of [`SurfaceOptions::detail`] (the blur radius in pixels).
 pub const DETAIL_RANGE: std::ops::RangeInclusive<f32> = 1.0..=512.0;
 
+/// Valid range of [`SurfaceOptions::object_feather`] (pixels).
+pub const OBJECT_FEATHER_MAX: f32 = 64.0;
+
+/// What Stay on Object keeps the paint on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StayOn {
+    /// Paint wherever the brush goes.
+    #[default]
+    Off,
+    /// Paint only on the object under the first dab of the stroke.
+    Object,
+    /// Only on that object and only where its depth is near the depth under the first dab (two
+    /// objects of one colour at different distances are told apart).
+    ObjectAndDepth,
+}
+
+impl StayOn {
+    /// Does the stroke stay on an object at all?
+    pub fn is_on(self) -> bool {
+        self != Self::Off
+    }
+
+    /// Does the stroke also read the depth channel?
+    pub fn uses_depth(self) -> bool {
+        self == Self::ObjectAndDepth
+    }
+}
+
 /// The brush's Surface options: all off by default.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -51,6 +80,14 @@ pub struct SurfaceOptions {
     /// Estimate Depth runs the tiled, high-resolution estimate (slower, finer folds and edges)
     /// rather than one whole-image pass.
     pub depth_high_quality: bool,
+    /// Stay on Object: the stroke paints only on the object under its first dab.
+    pub stay_on: StayOn,
+    /// Softness of the object's edge, in pixels (0..=64): the paint fades out over about this
+    /// distance instead of stopping on a hard line.
+    pub object_feather: f32,
+    /// 0..1: with `ObjectAndDepth`, how far from the depth under the first dab the paint still
+    /// lands (in the depth channel's own 0..1 values); beyond 1.5 times it there is none.
+    pub depth_tolerance: f32,
 }
 
 impl Default for SurfaceOptions {
@@ -66,6 +103,9 @@ impl Default for SurfaceOptions {
             size_by_depth: true,
             depth_channel: "Depth".to_string(),
             depth_high_quality: true,
+            stay_on: StayOn::Off,
+            object_feather: 1.5,
+            depth_tolerance: 0.08,
         }
     }
 }
@@ -84,6 +124,12 @@ impl SurfaceOptions {
         }
         if self.depth_channel.is_empty() || self.depth_channel.chars().count() > 255 {
             return Err("surface depth channel must be a channel name of 1 to 255 characters".to_string());
+        }
+        if !self.object_feather.is_finite() || !(0.0..=OBJECT_FEATHER_MAX).contains(&self.object_feather) {
+            return Err(format!("surface object feather must be between 0 and {OBJECT_FEATHER_MAX} pixels, got {}", self.object_feather));
+        }
+        if !self.depth_tolerance.is_finite() || !(0.0..=1.0).contains(&self.depth_tolerance) {
+            return Err(format!("surface depth tolerance must be between 0 and 1, got {}", self.depth_tolerance));
         }
         Ok(())
     }
@@ -261,6 +307,27 @@ mod tests {
         }
         assert!(SurfaceOptions { depth_channel: String::new(), ..Default::default() }.validate().is_err());
         assert!(SurfaceOptions { depth_channel: "x".repeat(256), ..Default::default() }.validate().is_err());
+    }
+
+    #[test]
+    fn stay_on_options_validate_and_parse() {
+        let o = SurfaceOptions::default();
+        assert_eq!((o.stay_on, o.object_feather, o.depth_tolerance), (StayOn::Off, 1.5, 0.08));
+        for bad in [f32::NAN, -0.1, 64.5, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(SurfaceOptions { object_feather: bad, ..Default::default() }.validate().is_err(), "feather {bad}");
+        }
+        for bad in [f32::NAN, -0.1, 1.5, f32::INFINITY] {
+            assert!(SurfaceOptions { depth_tolerance: bad, ..Default::default() }.validate().is_err(), "tolerance {bad}");
+        }
+        assert!(SurfaceOptions { object_feather: 64.0, depth_tolerance: 1.0, ..Default::default() }.validate().is_ok());
+        assert!(SurfaceOptions { object_feather: 0.0, depth_tolerance: 0.0, ..Default::default() }.validate().is_ok());
+        for (name, want) in [("off", StayOn::Off), ("object", StayOn::Object), ("objectAndDepth", StayOn::ObjectAndDepth)] {
+            let o: SurfaceOptions = serde_json::from_str(&format!(r#"{{"stayOn":"{name}","objectFeather":3,"depthTolerance":0.2}}"#)).unwrap();
+            assert_eq!((o.stay_on, o.object_feather, o.depth_tolerance), (want, 3.0, 0.2));
+            assert_eq!(serde_json::to_value(want).unwrap(), name);
+        }
+        assert!(serde_json::from_str::<SurfaceOptions>(r#"{"stayOn":"everything"}"#).is_err());
+        assert!(!StayOn::Off.is_on() && StayOn::Object.is_on() && !StayOn::Object.uses_depth() && StayOn::ObjectAndDepth.uses_depth());
     }
 
     #[test]

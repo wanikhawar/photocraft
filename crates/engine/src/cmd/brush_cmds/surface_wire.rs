@@ -21,6 +21,7 @@ use photocraft_paint::surface::{Footprint, Local, SampleMode, ShadeSource, Surfa
 use photocraft_paint::{BrushSettings, StrokeRenderer};
 use serde_json::{Value, json};
 
+use super::object_lock::ObjectLock;
 use crate::commands::{CommandSpec, is_mask_target};
 use crate::{EngineError, Result, Session};
 
@@ -216,6 +217,24 @@ pub(crate) fn make_map(persp: Option<Arc<PlaneMap>>, depth: Option<DepthMap>) ->
     }
 }
 
+/// `doc` with `layer` (the one being painted) hidden, so an All Layers sample never sees earlier
+/// strokes. Hiding, not removing, keeps the other layers' order; a layer clipped to the hidden one
+/// disappears with it, which is what a hidden clipping base does in the composite. `doc` itself
+/// (no copy) when there is nothing to hide: the layer is absent or already hidden. Cheap: the
+/// layers' surfaces are copy-on-write.
+pub(super) fn hide_target(doc: &photocraft_doc::Document, layer: Option<LayerId>) -> std::borrow::Cow<'_, photocraft_doc::Document> {
+    match layer.filter(|id| doc.layer(*id).is_some_and(|l| l.visible)) {
+        Some(id) => {
+            let mut hidden = doc.clone();
+            if let Some(l) = hidden.layer_mut(id) {
+                l.visible = false;
+            }
+            std::borrow::Cow::Owned(hidden)
+        }
+        None => std::borrow::Cow::Borrowed(doc),
+    }
+}
+
 /// What a cached shading field was built for. The document's content is compared apart from this
 /// ([`same_sources`]), not by revision: a stroke on the target layer must keep the cache.
 #[derive(Clone, PartialEq)]
@@ -245,7 +264,7 @@ struct FieldEntry {
 /// inside a group is compared with its group, so there a stroke does invalidate (a rebuild per
 /// stroke, as before). All Layers also compares the document's global light and patterns (layer
 /// styles read both); other document-wide settings (the colour profile) are not compared.
-fn same_sources(a: &photocraft_doc::Document, b: &photocraft_doc::Document, sample: SampleMode, layer: Option<LayerId>) -> bool {
+pub(super) fn same_sources(a: &photocraft_doc::Document, b: &photocraft_doc::Document, sample: SampleMode, layer: Option<LayerId>) -> bool {
     if a.size != b.size || a.mode != b.mode || a.depth != b.depth {
         return false;
     }
@@ -276,6 +295,8 @@ pub struct SurfaceCache {
     builds: std::sync::atomic::AtomicUsize,
     depth: Mutex<Option<DepthEntry>>,
     depth_builds: std::sync::atomic::AtomicUsize,
+    /// The objects Stay on Object has found, shared with the locks that use them.
+    pub(crate) objects: Arc<super::object_lock::ObjectCache>,
 }
 
 /// The depth geometry of a channel, with a snapshot of the channel's surface it was built from
@@ -298,6 +319,11 @@ impl SurfaceCache {
     pub fn depth_builds(&self) -> usize {
         self.depth_builds.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// How many times Stay on Object has run a finder for this session (a cache hit runs none).
+    pub fn object_finds(&self) -> usize {
+        self.objects.runs()
+    }
 }
 
 /// Shading and perspective for one stroke, ready to attach to its renderers.
@@ -305,6 +331,8 @@ impl SurfaceCache {
 pub(crate) struct Wiring {
     shade: Option<(Arc<dyn ShadeSource>, f32)>,
     map: Option<Arc<dyn SurfaceMap>>,
+    /// Stay on Object: the stroke paints only on the object under its first dab.
+    lock: Option<Arc<ObjectLock>>,
 }
 
 impl Wiring {
@@ -312,6 +340,11 @@ impl Wiring {
     #[cfg(test)]
     pub(crate) fn map(&self) -> Option<&Arc<dyn SurfaceMap>> {
         self.map.as_ref()
+    }
+
+    /// The lock that keeps the stroke on its object, if Stay on Object is on.
+    pub(crate) fn lock(&self) -> Option<&Arc<ObjectLock>> {
+        self.lock.as_ref()
     }
 
     /// Does the stroke use any surface effect?
@@ -330,7 +363,7 @@ impl Wiring {
     /// no saved plane for this canvas, or a shading sample that cannot be built.
     pub(crate) fn build(s: &Session, cmd: &str, p: &Value, brush: &BrushSettings, layer: Option<LayerId>) -> Result<Self> {
         let opts = &brush.surface;
-        if brush.erase || !(opts.color || opts.perspective || opts.depth) {
+        if brush.erase || !(opts.color || opts.perspective || opts.depth || opts.stay_on.is_on()) {
             return Ok(Self::default());
         }
         opts.validate().map_err(|e| bad(cmd, e))?;
@@ -345,6 +378,10 @@ impl Wiring {
             None
         };
         w.map = make_map(persp, depth);
+        // The object is found when the stroke first needs it (`ObjectLock::resolve`), not here.
+        if opts.stay_on.is_on() {
+            w.lock = Some(Arc::new(ObjectLock::build(s, cmd, opts, layer)?));
+        }
         // Strength 0 shades nothing, so it must not build (or be refused for) a field either.
         if opts.color && opts.strength > 0.0 && !is_gray_target(s, p)? {
             let field = shading_field(s, cmd, opts.sample, opts.detail, layer)?;
@@ -446,18 +483,8 @@ pub(crate) fn build_field(doc: &photocraft_doc::Document, cmd: &str, sample: Sam
     check_size(canvas, cmd)?;
     match sample {
         SampleMode::AllLayers => {
-            // Cheap: the layers' surfaces are copy-on-write.
-            let mut hidden;
-            let doc = match layer.filter(|id| doc.layer(*id).is_some_and(|l| l.visible)) {
-                Some(id) => {
-                    hidden = doc.clone();
-                    if let Some(l) = hidden.layer_mut(id) {
-                        l.visible = false;
-                    }
-                    &hidden
-                }
-                None => doc,
-            };
+            let hidden = hide_target(doc, layer);
+            let doc = &*hidden;
             let mut b = ShadingBuilder::new(ColorMode::Rgb, true, canvas, detail).map_err(|e| bad(cmd, e))?;
             let rows = i32::try_from(b.band_rows()).unwrap_or(i32::MAX);
             photocraft_compose::render_bands(doc, canvas, rows, |band| {

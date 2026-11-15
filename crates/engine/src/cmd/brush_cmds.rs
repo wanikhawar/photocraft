@@ -293,6 +293,12 @@ fn stroke_with(s: &mut Session, cmd: &str, p: &Value, label: &str, brush: BrushS
     let from_live = live.is_some();
     // Surface Color and Follow Perspective, from the document as it is before the stroke.
     let wiring = if from_live || erasing { surface_wire::Wiring::default() } else { surface_wire::Wiring::build(s, cmd, p, &brush, id)? };
+    // Stay on Object: the object under the stroke's first dab, found before the edit (a live
+    // stroke's pixels already stay on it).
+    let object = match (wiring.lock(), pts.first()) {
+        (Some(lock), Some(first)) => Some(lock.resolve((first.x, first.y))?),
+        _ => None,
+    };
     let dmg = photocraft_color::convert::with_cmyk_space(cmyk.as_ref(), || {
         s.edit(label, |doc, _| {
             if let Some(l) = live {
@@ -300,7 +306,10 @@ fn stroke_with(s: &mut Session, cmd: &str, p: &Value, label: &str, brush: BrushS
                 *surf = l.surface;
                 return Ok(l.bounds);
             }
-            let sel = doc.selection.clone();
+            let sel = match &object {
+                Some(region) => Some(object_lock::clip_selection(doc.selection.as_ref(), region)),
+                None => doc.selection.clone(),
+            };
             let table = crate::mode_cmds::paint_color_table(doc, p);
             let canvas = doc.bounds();
             let (surf, lock) = crate::channel_cmds::target_surface(doc, id, p)?;
@@ -607,6 +616,13 @@ pub struct LiveStroke {
     points: Vec<StrokePoint>,
     /// The document and revision the stroke started on.
     base: (photocraft_doc::DocId, u64),
+    /// Stay on Object: finds the object under the first dab. Resolved on the first `push` that has
+    /// a point, so the thread that paints does the waiting (see [`LiveStroke::is_pending`]).
+    object: Option<std::sync::Arc<object_lock::ObjectLock>>,
+    /// Whether `object` has been resolved and its region applied to `sel`.
+    object_ready: bool,
+    /// The points `begin_with` was given, held back until the object is known.
+    deferred: Vec<StrokePoint>,
 }
 
 /// A finished live stroke offered to its own commit ([`Session::offer_live_stroke`],
@@ -693,6 +709,7 @@ impl LiveStroke {
             .collect();
         let mirror_distinct = vec![false; mirrors.len()];
         let pre = surf.clone();
+        let object = wiring.lock().cloned();
         let mut live = Self {
             doc: std::sync::Arc::new(doc),
             seed,
@@ -712,9 +729,26 @@ impl LiveStroke {
             cmyk: doc_cmyk_space(s),
             points: Vec::new(),
             base,
+            object,
+            object_ready: false,
+            deferred: Vec::new(),
         };
-        live.push(&pts)?;
+        if live.object.is_some() {
+            // Stay on Object finds its object when the stroke first paints (it may run a model):
+            // the thread that paints does that, not the one that starts the stroke.
+            check_coords(&pts, cmd)?;
+            live.deferred = pts;
+        } else {
+            live.push(&pts)?;
+        }
         Ok(live)
+    }
+
+    /// Is Stay on Object still waiting for the first `push` to find its object? Until then the
+    /// stroke has painted nothing (`begin_with` held its points back): whoever paints must call
+    /// [`push`](Self::push), with no points if need be, to let it start.
+    pub fn is_pending(&self) -> bool {
+        self.object.is_some() && !self.object_ready
     }
 
     /// The stroke as its commit would take it over (see [`LiveCommit`]).
@@ -758,6 +792,21 @@ impl LiveStroke {
     /// Invalid coordinates reject the whole batch without changing the preview.
     pub fn push(&mut self, pts: &[StrokePoint]) -> Result<Rect> {
         check_coords(pts, &self.cmd)?;
+        // Stay on Object: the first point decides the object, and from then on the stroke paints
+        // through its region (and the document's selection).
+        let mut joined = None;
+        if let Some(object) = self.object.clone().filter(|_| !self.object_ready) {
+            let Some(first) = self.deferred.first().or(pts.first()) else { return Ok(Rect::EMPTY) };
+            let region = object.resolve((first.x, first.y))?;
+            self.sel = Some(object_lock::clip_selection(self.sel.as_ref(), &region));
+            self.object_ready = true;
+            if !self.deferred.is_empty() {
+                let mut all = std::mem::take(&mut self.deferred);
+                all.extend_from_slice(pts);
+                joined = Some(all);
+            }
+        }
+        let pts = joined.as_deref().unwrap_or(pts);
         self.points.extend_from_slice(pts);
         let cmyk = self.cmyk.clone();
         let dmg = photocraft_color::convert::with_cmyk_space(cmyk.as_ref(), || -> Result<Rect> {
@@ -824,7 +873,9 @@ fn pct(p: &Value, k: &str, d: f32) -> f32 {
 }
 
 pub mod mixer_live;
+pub mod object_lock;
 pub mod surface_wire;
+pub use object_lock::{Finder, ObjectCache, ai_status, finder};
 pub use surface_wire::{CursorShape, brush_cursor_shape};
 fn mixer_brush(s: &mut Session, p: &Value) -> Result<Value> {
     mixer_live::run(s, p)
@@ -1523,6 +1574,9 @@ mod color_replacement_modes_tests;
 #[cfg(test)]
 mod mixer_live_tests;
 
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod object_lock_tests;
 #[cfg(test)]
 mod surface_wire_tests;
 
