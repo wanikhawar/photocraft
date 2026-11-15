@@ -119,12 +119,13 @@ pub(super) fn smoothing_options(ui: &mut egui::Ui, b: &mut photocraft_engine::Br
 /// `tools.setBrush`; Clear Planes runs `perspective.clearPlanes`.
 pub(super) fn surface_options(app: &mut PhotocraftApp, ui: &mut egui::Ui, b: &mut photocraft_engine::BrushSettings) {
     use photocraft_paint::surface::{DETAIL_RANGE, SampleMode};
-    let on = b.surface.color || b.surface.perspective || b.surface.depth;
+    let on = b.surface.color || b.surface.perspective || b.surface.depth || b.surface.stay_on.is_on();
     let resp = icons::button(ui, "grid-3x3", 24.0, on, tl!("Surface options"));
     let resp = crate::brush_picker::named(resp, "Surface options");
     let clear_enabled = crate::menus::is_enabled(app, "perspective.clearPlanes");
     let mut clear = false;
     let mut estimate_depth = false;
+    let mut set_up_finder = false;
     // Its Sample dropdown opens a list of its own over it.
     widgets::press_menu::show_popover(&resp, |ui| {
         ui.set_min_width(200.0);
@@ -180,13 +181,63 @@ pub(super) fn surface_options(app: &mut PhotocraftApp, ui: &mut egui::Ui, b: &mu
                 clear = true;
             }
         });
+        ui.separator();
+        set_up_finder = stay_on_object_controls(app, ui, s);
     });
+    if set_up_finder {
+        crate::dialogs::ai_setup::start_object_finding(app);
+    }
     if estimate_depth {
         crate::dialogs::depth_ui::start(app);
     }
     if clear {
         crate::brush_panel::run_or_status(app, "perspective.clearPlanes", json!({}));
     }
+}
+
+/// Stay on Object in the Surface popover: its dropdown, Feather, Depth Tolerance (only with depth)
+/// and, while it is on, which finder the next stroke runs. Returns true when the person asked to
+/// set up the AI object finder.
+fn stay_on_object_controls(app: &PhotocraftApp, ui: &mut egui::Ui, s: &mut photocraft_paint::SurfaceOptions) -> bool {
+    use photocraft_paint::StayOn;
+    let mut set_up_finder = false;
+    let stay = [(StayOn::Off, tl!("Off")), (StayOn::Object, tl!("Object")), (StayOn::ObjectAndDepth, tl!("Object and Depth"))];
+    ui.label(tl!("Stay on Object"));
+    widgets::dropdown(ui, "surface-stay-on", tl!("Stay on Object"), &mut s.stay_on, &stay, 120.0);
+    ui.add_enabled_ui(s.stay_on.is_on(), |ui| {
+        let mut feather = s.object_feather;
+        if widgets::slider_row(ui, tl!("Feather"), &mut feather, 0.0..=64.0, "px", None).changed() {
+            s.object_feather = feather.round().clamp(0.0, 64.0);
+        }
+    });
+    ui.add_enabled_ui(s.stay_on.uses_depth(), |ui| {
+        let mut percent = (s.depth_tolerance * 100.0).clamp(0.0, 100.0);
+        if widgets::slider_row(ui, tl!("Depth Tolerance"), &mut percent, 0.0..=100.0, "%", None).changed() {
+            s.depth_tolerance = (percent.round() / 100.0).clamp(0.0, 1.0);
+        }
+    });
+    if s.stay_on.is_on() {
+        // Which finder the next stroke runs, and a way to the AI one while it is not set up.
+        let status = photocraft_engine::brush_cmds::ai_status(&app.session);
+        match photocraft_engine::brush_cmds::finder(&app.session) {
+            photocraft_engine::brush_cmds::Finder::Ai => {
+                ui.label(egui::RichText::new(tl!("Finds objects with the AI object finder")).small());
+            }
+            photocraft_engine::brush_cmds::Finder::BuiltIn => {
+                ui.label(egui::RichText::new(tl!("Finds objects with the built-in object finder")).small());
+                let button = ui.add_enabled(!cfg!(target_arch = "wasm32"), egui::Button::new(tl!("Set Up AI Object Finding…")));
+                let button = match status {
+                    Some(reason) if cfg!(target_arch = "wasm32") => button.on_disabled_hover_text(reason),
+                    Some(reason) => button.on_hover_text(reason),
+                    None => button,
+                };
+                if button.clicked() {
+                    set_up_finder = true;
+                }
+            }
+        }
+    }
+    set_up_finder
 }
 
 /// A Useful mixer brush combinations entry: its label and the Wet, Load and Mix it sets.

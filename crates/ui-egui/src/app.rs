@@ -44,7 +44,7 @@ impl PhotocraftApp {
             session,
             ui: UiState::default(),
             services,
-            depth_ai: Default::default(),
+            ai_setup: Default::default(),
             canvases: HashMap::new(),
             navigator_textures: HashMap::new(),
             display_memo: HashMap::new(),

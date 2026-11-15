@@ -131,13 +131,13 @@ fn empty_host(dir: &std::path::Path) -> photocraft_engine::ai_layer::AiHost {
 fn wait_for_phase(app: &mut PhotocraftApp, phase: &str) {
     let ctx = egui::Context::default();
     for _ in 0..400 {
-        ctx.run_ui(egui::RawInput::default(), |ui| crate::dialogs::depth_ui::show(app, ui.ctx())).textures_delta.clear();
-        if crate::dialogs::depth_ui::inspect(app)["phase"] == phase {
+        ctx.run_ui(egui::RawInput::default(), |ui| crate::dialogs::ai_setup::show(app, ui.ctx())).textures_delta.clear();
+        if crate::dialogs::ai_setup::inspect(app)["phase"] == phase {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    panic!("the window never reached `{phase}`: {}", crate::dialogs::depth_ui::inspect(app));
+    panic!("the window never reached `{phase}`: {}", crate::dialogs::ai_setup::inspect(app));
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -149,12 +149,12 @@ fn estimate_depth_with_an_unset_tool_opens_the_missing_model_window() {
     let reason = app.session.ai.status_reason_now(photocraft_engine::depth_cmds::TOOL).expect("nothing is set up");
     assert_eq!(crate::dialogs::depth_ui::unavailable_reason(&app), Some(reason));
     crate::dialogs::depth_ui::start(&mut app);
-    assert_eq!(crate::dialogs::depth_ui::inspect(&app)["phase"], "loading");
+    assert_eq!(crate::dialogs::ai_setup::inspect(&app)["phase"], "loading");
     wait_for_phase(&mut app, "missing");
     // Nothing was estimated, and closing leaves no window.
     assert!(app.session.active().unwrap().doc.channels.is_empty());
-    crate::dialogs::depth_ui::cancel(&mut app);
-    assert!(crate::dialogs::depth_ui::inspect(&app).is_null());
+    crate::dialogs::ai_setup::cancel(&mut app);
+    assert!(crate::dialogs::ai_setup::inspect(&app).is_null());
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -163,7 +163,95 @@ fn estimate_depth_without_a_document_says_so() {
     let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
     crate::dialogs::depth_ui::start(&mut app);
     assert!(app.ui.status_error, "{}", app.ui.status);
-    assert!(crate::dialogs::depth_ui::inspect(&app).is_null());
+    assert!(crate::dialogs::ai_setup::inspect(&app).is_null());
+}
+
+/// The popover's Stay on Object dropdown, once the popover is open.
+fn stay_on_combo<'a>(h: &'a Harness<'static, PhotocraftApp>) -> egui_kittest::Node<'a> {
+    h.query_all_by_role(Role::ComboBox).find(|n| n.accesskit_node().label().is_some_and(|l| l.contains("Stay on Object"))).expect("the Stay on Object dropdown")
+}
+
+fn slider<'a>(h: &'a Harness<'static, PhotocraftApp>, name: &str) -> egui_kittest::Node<'a> {
+    h.query_all_by_role(Role::Slider).find(|n| n.accesskit_node().label().is_some_and(|l| l.contains(name))).unwrap_or_else(|| panic!("the {name} slider"))
+}
+
+#[test]
+fn the_stay_on_object_dropdown_writes_the_option() {
+    use photocraft_paint::StayOn;
+    // A dropdown inside the popover closes it as soon as it opens (as the Sample dropdown does), so
+    // the controls are driven on their own.
+    let mut h = Harness::builder().with_size(vec2(400.0, 500.0)).build_ui_state(
+        |ui, app: &mut PhotocraftApp| {
+            let mut surface = app.session.tools.brush.surface.clone();
+            crate::panels::brush_controls::stay_on_object_controls(app, ui, &mut surface);
+            app.session.tools.brush.surface = surface;
+        },
+        app(Tool::Brush),
+    );
+    PhotocraftApp::setup_context(&h.ctx, Default::default());
+    h.run_steps(4);
+    assert_eq!(h.state().session.tools.brush.surface.stay_on, StayOn::Off);
+    assert!(slider(&h, "Feather").accesskit_node().is_disabled() && slider(&h, "Depth Tolerance").accesskit_node().is_disabled());
+    for (label, want, feather, tolerance) in
+        [("Object", StayOn::Object, true, false), ("Object and Depth", StayOn::ObjectAndDepth, true, true), ("Off", StayOn::Off, false, false)]
+    {
+        stay_on_combo(&h).click();
+        h.run_steps(4);
+        h.get_by_label(label).click();
+        h.run_steps(4);
+        assert_eq!(h.state().session.tools.brush.surface.stay_on, want, "{label}");
+        assert_eq!(!slider(&h, "Feather").accesskit_node().is_disabled(), feather, "{label}: Feather");
+        assert_eq!(!slider(&h, "Depth Tolerance").accesskit_node().is_disabled(), tolerance, "{label}: Depth Tolerance");
+    }
+}
+
+#[test]
+fn the_finder_line_follows_the_tool_status() {
+    let on = json!({"brush": {"surface": {"stayOn": "object"}}});
+    // Nothing set up: the built-in finder, with a way to set up the AI one.
+    let mut unset = app(Tool::Brush);
+    unset.run("tools.setBrush", on.clone()).unwrap();
+    let h = open_popover(unset);
+    assert!(h.query_by_label("Finds objects with the built-in object finder").is_some());
+    assert!(h.query_by_label("Finds objects with the AI object finder").is_none());
+    assert!(h.query_by_label("Set Up AI Object Finding…").is_some());
+    drop(h);
+    // The tool is ready (a stand-in answers): the AI finder, and no setup button.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut ready = app(Tool::Brush);
+        ready.run("tools.setBrush", on.clone()).unwrap();
+        ready.session.ai.segmenter = Some(std::sync::Arc::new(|_, _, _, _| Err("unused".to_owned())));
+        let h = open_popover(ready);
+        assert!(h.query_by_label("Finds objects with the AI object finder").is_some());
+        assert!(h.query_by_label("Finds objects with the built-in object finder").is_none());
+        assert!(h.query_by_label("Set Up AI Object Finding…").is_none());
+    }
+    // Stay on Object off: no line at all.
+    let off = open_popover(app(Tool::Brush));
+    assert!(off.query_by_label("Finds objects with the built-in object finder").is_none());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn the_set_up_button_opens_the_object_finder_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = app(Tool::Brush);
+    a.run("tools.setBrush", json!({"brush": {"surface": {"stayOn": "object"}}})).unwrap();
+    a.session.ai.set_host(empty_host(dir.path()));
+    let mut h = open_popover(a);
+    h.get_by_label("Set Up AI Object Finding…").click();
+    h.run_steps(3);
+    let w = h.state().ai_setup.window.as_ref().expect("the setup window opens");
+    assert_eq!(w.tool, photocraft_engine::ai_layer::SELECT_SUBJECT_TOOL);
+}
+
+#[test]
+fn the_stay_on_object_options_reach_tools_set_brush() {
+    let mut app = app(Tool::Brush);
+    app.run("tools.setBrush", json!({"brush": {"surface": {"stayOn": "objectAndDepth", "objectFeather": 8, "depthTolerance": 0.25}}})).unwrap();
+    let s = &app.session.tools.brush.surface;
+    assert_eq!((s.stay_on, s.object_feather, s.depth_tolerance), (photocraft_paint::StayOn::ObjectAndDepth, 8.0, 0.25));
 }
 
 /// The popover's dropdown opens a list of its own: picking a row sets the option and leaves the

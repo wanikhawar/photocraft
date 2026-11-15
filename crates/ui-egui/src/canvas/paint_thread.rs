@@ -6,6 +6,7 @@
 //! Each step is the stroke's own copy of the document, as when it painted on the UI thread, so the
 //! canvas shows and refreshes it the same way (`LiveStroke::since`).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -52,6 +53,9 @@ struct State {
     failed: bool,
     /// The canvas let go of the stroke: the thread ends.
     closed: bool,
+    /// Stay on Object: the thread is finding the object under the first dab, and no step has
+    /// landed yet.
+    finding: bool,
     /// Tests: the thread holds a step it took until this is cleared (see `PaintThread::hold`).
     #[cfg(test)]
     held: bool,
@@ -62,13 +66,15 @@ struct State {
 
 impl State {
     fn idle(&self) -> bool {
-        self.stroke.is_some() && self.pending.is_empty()
+        self.stroke.is_some() && self.pending.is_empty() && !self.finding
     }
 }
 
 struct Shared {
     state: Mutex<State>,
     changed: Condvar,
+    /// Stops the pending find when the canvas lets go of the stroke (see `LiveStroke::cancel_pending`).
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Shared {
@@ -76,11 +82,13 @@ impl Shared {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Paint the pending points, if the stroke is free.
+    /// Paint the pending points, if the stroke is free. A Stay on Object stroke that has not found
+    /// its object starts with an empty push even when no points came yet, so the object is found
+    /// here, off the UI thread, and the points held back appear.
     fn paint_pending(&self) {
         let (pts, stroke) = {
             let mut st = self.lock();
-            if st.pending.is_empty() {
+            if st.pending.is_empty() && !st.finding {
                 return;
             }
             let Some(stroke) = st.stroke.take() else { return };
@@ -91,6 +99,7 @@ impl Shared {
         let mut stroke = stroke;
         let step = stroke.push(&pts);
         let mut st = self.lock();
+        st.finding = false;
         if step.is_ok() {
             st.shown = Shown::of(&stroke);
         } else {
@@ -119,7 +128,7 @@ impl Shared {
         loop {
             {
                 let mut st = self.lock();
-                while st.pending.is_empty() && !st.closed {
+                while st.pending.is_empty() && !st.finding && !st.closed {
                     st = self.changed.wait(st).unwrap_or_else(PoisonError::into_inner);
                 }
                 if st.closed {
@@ -142,6 +151,8 @@ pub(super) struct PaintThread {
 impl PaintThread {
     pub(super) fn start(stroke: EngineStroke) -> Self {
         let shown = Shown::of(&stroke);
+        let finding = stroke.is_pending();
+        let cancel = stroke.cancel_pending();
         let state = State {
             pending: Vec::new(),
             stroke: Some(stroke),
@@ -149,12 +160,13 @@ impl PaintThread {
             shown: shown.clone(),
             failed: false,
             closed: false,
+            finding,
             #[cfg(test)]
             held: false,
             #[cfg(test)]
             panic_next: false,
         };
-        let shared = Arc::new(Shared { state: Mutex::new(state), changed: Condvar::new() });
+        let shared = Arc::new(Shared { state: Mutex::new(state), changed: Condvar::new(), cancel });
         let thread = if cfg!(target_arch = "wasm32") {
             None
         } else {
@@ -162,7 +174,19 @@ impl PaintThread {
             // Without a thread (the system refused one) the stroke paints inline, as it used to.
             std::thread::Builder::new().name("live stroke".into()).spawn(move || worker.run()).ok()
         };
-        Self { shared, thread, shown }
+        let this = Self { shared, thread, shown };
+        if this.thread.is_none() {
+            // No thread (the web): the first step runs here, as every later one does.
+            this.shared.paint_pending();
+        } else {
+            this.shared.changed.notify_all();
+        }
+        this
+    }
+
+    /// Is the thread still finding the object a Stay on Object stroke stays on?
+    pub(super) fn finding(&self) -> bool {
+        self.shared.lock().finding
     }
 
     /// Hand points over to be painted (none after a failed step).
@@ -266,6 +290,10 @@ impl Drop for PaintThread {
     fn drop(&mut self) {
         // The thread finishes the step it is on, if any, and ends; nothing waits for it.
         self.shared.lock().closed = true;
+        // A find still running ends now, so the thread is free (a finished stroke has it resolved).
+        if let Some(cancel) = &self.shared.cancel {
+            cancel.store(true, Ordering::SeqCst);
+        }
         self.shared.changed.notify_all();
     }
 }
@@ -344,5 +372,78 @@ mod tests {
         assert!(matches!(steps.as_slice(), [Err(_)]), "only the failed step");
         assert!(Arc::ptr_eq(&thread.shown().doc, &good), "the last good step stays shown");
         assert!(!thread.busy());
+    }
+    /// A session with a red square on its first layer and an empty layer on top.
+    fn square_scene() -> Session {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 120, "height": 80, "background": "transparent"})).unwrap();
+        s.edit("square", |doc, active| {
+            let surf = doc.layer_mut(active.unwrap()).unwrap().surface_mut().unwrap();
+            surf.fill_rect(Rect::new(20, 10, 100, 70), &[0.8, 0.2, 0.2, 1.0]);
+            Ok(())
+        })
+        .unwrap();
+        s.execute("layer.new.layer", json!({})).unwrap();
+        s
+    }
+
+    fn stay_on_object(s: &Session) -> EngineStroke {
+        let p = json!({"points": [[60, 40]], "color": "#0000ff", "target": "pixels", "brush": {"size": 16, "hardness": 1, "surface": {"stayOn": "object", "objectFeather": 0}}});
+        EngineStroke::Brush(Box::new(LiveStroke::begin(s, &p).unwrap()))
+    }
+
+    #[test]
+    fn a_pending_stay_on_object_stroke_finds_its_object_on_the_thread_without_being_pushed() {
+        let s = square_scene();
+        let stroke = stay_on_object(&s);
+        assert!(stroke.is_pending(), "the stroke waits for its first push");
+        let mut thread = PaintThread::start(stroke);
+        // The canvas hands over no points; the thread alone starts the find.
+        let steps = thread.catch_up(Duration::MAX);
+        assert!(matches!(steps.as_slice(), [Ok(r)] if !r.is_empty()), "the held-back first point appears: {steps:?}");
+        assert!(!thread.finding() && !thread.busy());
+        let pending = thread.peek(EngineStroke::is_pending);
+        assert_eq!(pending, Some(false));
+    }
+
+    #[test]
+    fn a_failed_find_is_a_failed_step_and_paints_nothing() {
+        // Nothing under the first dab: a clear canvas on the layer sampled.
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 120, "height": 80, "background": "transparent"})).unwrap();
+        s.execute("layer.new.layer", json!({})).unwrap();
+        let before = s.active().unwrap().doc.clone();
+        let mut thread = PaintThread::start(stay_on_object(&s));
+        let steps = thread.catch_up(Duration::MAX);
+        assert!(matches!(steps.as_slice(), [Err(_)]), "{steps:?}");
+        assert!(!thread.finding());
+        let layer = s.active().unwrap().active_layer.unwrap();
+        assert!(thread.shown().doc.layer(layer).unwrap().surface().unwrap().content_bounds().is_empty());
+        assert!(Arc::ptr_eq(&s.active().unwrap().doc, &before), "the session's document is untouched");
+    }
+
+    #[test]
+    fn letting_go_of_a_stroke_that_is_still_finding_stops_the_find() {
+        let mut s = square_scene();
+        let release = Arc::new(AtomicBool::new(false));
+        let gate = release.clone();
+        s.ai.segmenter = Some(Arc::new(move |_, _, _, _| {
+            while !gate.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err("released".to_owned())
+        }));
+        let thread = PaintThread::start(stay_on_object(&s));
+        let alive = thread.thread_alive();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(thread.finding() && alive(), "the thread waits for the finder");
+        drop(thread);
+        // The finder never answered, yet the thread ends.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!alive(), "the thread is still waiting for the finder");
+        release.store(true, Ordering::SeqCst);
     }
 }

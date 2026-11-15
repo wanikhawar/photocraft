@@ -751,6 +751,14 @@ impl LiveStroke {
         self.object.is_some() && !self.object_ready
     }
 
+    /// A flag that, once set, stops a pending Stay on Object find: the paint thread blocked in
+    /// [`push`](Self::push) then gets [`EngineError::Cancelled`]. `None` without Stay on Object.
+    /// Take it before handing the stroke to the thread that paints; whoever lets the stroke go
+    /// (Escape, a tool switch) sets it.
+    pub fn cancel_pending(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.object.as_ref().map(|o| o.cancel_handle())
+    }
+
     /// The stroke as its commit would take it over (see [`LiveCommit`]).
     pub fn into_commit(mut self) -> Result<LiveCommit> {
         let bounds = self.bounds();

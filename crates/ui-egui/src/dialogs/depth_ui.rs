@@ -1,45 +1,35 @@
 //! Estimate Depth: the Surface popover's button.
 //!
 //! The estimate runs `image.estimateDepth`, which uses the shared Craft AI layer's `estimate-depth`
-//! tool. When the tool is not set up, [`native`] draws the shared layer's own screens over its
-//! state (the missing-model popup, then `craft_ai_egui::native_model_setup` over a `SetupSession`),
-//! so setup, the download and the consent to it are the shared flow, not a second one here.
-//! Everything that reads or writes disk or the network runs on a worker thread. The web build has
-//! no AI layer: the button is disabled there.
+//! tool. When the tool is not set up, the shared setup window ([`super::ai_setup`]) opens for it and
+//! runs the estimate when setup ends.
 
-#[cfg(not(target_arch = "wasm32"))]
-mod native;
-#[cfg(not(target_arch = "wasm32"))]
-pub use native::*;
+use crate::PhotocraftApp;
 
-#[cfg(target_arch = "wasm32")]
-mod web {
-    use serde_json::Value;
+use super::ai_setup::{After, Ask, DEPTH_TOOL};
 
-    use crate::PhotocraftApp;
-
-    /// Nothing to keep: there is no setup flow on the web.
-    #[derive(Default)]
-    pub struct DepthAi;
-
-    pub fn start(app: &mut PhotocraftApp) {
-        app.ui.status = tl!("Not available in this build").into();
+/// The Estimate Depth… button: estimate at once when the tool is ready, else open the setup window.
+pub fn start(app: &mut PhotocraftApp) {
+    let Some(doc) = app.session.active().map(|d| d.doc.id) else {
+        app.ui.status = tl!("No document open").into();
         app.ui.status_error = true;
-    }
-
-    pub fn show(_app: &mut PhotocraftApp, _ctx: &egui::Context) {}
-
-    /// There is no setup window to close.
-    pub fn cancel_stale(_app: &mut PhotocraftApp) {}
-
-    pub fn inspect(_app: &PhotocraftApp) -> Value {
-        Value::Null
-    }
-
-    /// Why the button is off, for its tooltip.
-    pub fn unavailable_reason(_app: &PhotocraftApp) -> Option<String> {
-        Some(tl!("Not available in this build").into())
-    }
+        return;
+    };
+    let after = After::EstimateDepth(Ask::now(app));
+    super::ai_setup::start(app, DEPTH_TOOL, after, Some(doc));
 }
+
+/// Why the Estimate Depth button is off, for its tooltip, or `None` while it can be used.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn unavailable_reason(app: &PhotocraftApp) -> Option<String> {
+    app.session.ai.status_reason(DEPTH_TOOL)
+}
+
 #[cfg(target_arch = "wasm32")]
-pub use web::*;
+pub fn unavailable_reason(_app: &PhotocraftApp) -> Option<String> {
+    Some(tl!("Not available in this build").into())
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod tests;

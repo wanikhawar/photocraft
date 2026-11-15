@@ -42,7 +42,7 @@ fn assert_commit_replays(app: &mut PhotocraftApp, cmd: &str, what: &str) {
     assert_eq!(*app.session.active().unwrap().doc, *doc, "{what}: the committed stroke");
 }
 
-fn wait_until(what: &str, done: impl Fn() -> bool) {
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     let start = Instant::now();
     while !done() {
         assert!(start.elapsed() < Duration::from_secs(10), "{what}");
@@ -146,4 +146,36 @@ fn a_step_that_panics_on_the_thread_leaves_the_document_and_the_release_paints_t
         assert_commit_replays(&mut app, cmd, &what);
         wait_until("the thread ended", || !alive());
     }
+}
+
+/// Stay on Object: while the stroke finds its object (off the UI thread) the status line says so;
+/// when nothing is found the error is the status at once, and the document is left as it was.
+#[test]
+fn a_stroke_finding_its_object_says_so_and_a_failed_find_is_the_error_status() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut app = app_for(Tool::Brush);
+    app.run("tools.setBrush", json!({"brush": {"surface": {"stayOn": "object", "objectFeather": 0}}})).unwrap();
+    let gate = Arc::new(AtomicBool::new(false));
+    let open = gate.clone();
+    app.session.ai.segmenter = Some(Arc::new(move |_, _, _, _| {
+        while !open.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err("no object found under the brush".to_owned())
+    }));
+    let steps = app.session.active().unwrap().history.past_len();
+    tool_event(&mut app, ToolEvent::Down { x: 20.0, y: 30.0, pressure: 1.0 }, M);
+    assert!(live_stroke_busy(&app), "the thread is finding the object");
+    assert_eq!(app.ui.status, "Finding the object…");
+    assert!(!app.ui.status_error);
+    gate.store(true, Ordering::SeqCst);
+    wait_until("the find ends", || {
+        feed_live_stroke_waiting(&mut app, Duration::from_millis(20));
+        app.live_stroke.is_none()
+    });
+    assert!(app.ui.status_error && app.ui.status.contains("no object found"), "{}", app.ui.status);
+    // The release does not paint anything either.
+    tool_event(&mut app, ToolEvent::Up { x: 20.0, y: 30.0 }, M);
+    assert_eq!(app.session.active().unwrap().history.past_len(), steps, "nothing was painted");
+    assert!(app.ui.status_error, "{}", app.ui.status);
 }

@@ -243,6 +243,18 @@ impl EngineStroke {
             Self::Mixer(s) => s.push(pts),
         }
     }
+    /// Stay on Object: the stroke has not found its object yet, so nothing has painted. The paint
+    /// thread starts it with an empty push (see `LiveStroke::is_pending`).
+    pub(super) fn is_pending(&self) -> bool {
+        matches!(self, Self::Brush(s) if s.is_pending())
+    }
+    /// The flag that stops the pending find when the canvas lets the stroke go.
+    pub(super) fn cancel_pending(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        match self {
+            Self::Brush(s) => s.cancel_pending(),
+            _ => None,
+        }
+    }
     /// The jitter seed the commit must reuse (the Clone Stamp's comes from the session brush).
     fn seed(&self) -> Option<u64> {
         match self {
@@ -259,6 +271,8 @@ impl EngineStroke {
 /// changed.
 pub(crate) struct LiveStroke {
     pub(super) preview_failed: bool,
+    /// The status line says "Finding the object…" for this stroke (Stay on Object).
+    finding_shown: bool,
     pub(super) paint: PaintThread,
     /// The jitter seed the commit must reuse (`EngineStroke::seed`).
     pub(super) seed: Option<u64>,
@@ -473,6 +487,7 @@ pub(super) fn begin_live_stroke(app: &PhotocraftApp) -> Option<LiveStroke> {
         damage,
         fed: if d.tool == Tool::MixerBrush { 1 } else { d.points.len() },
         preview_failed: false,
+        finding_shown: false,
     })
 }
 
@@ -528,7 +543,26 @@ pub(super) fn feed_live_stroke_waiting(app: &mut PhotocraftApp, wait: std::time:
     let steps = l.paint.catch_up(wait);
     let tool = d.tool;
     take_steps(app, tool, steps);
+    sync_finding_status(app);
     app.perf.stage.stroke_ms += crate::gpu_canvas::now_ms() - started;
+}
+
+/// The status line while a Stay on Object stroke is finding its object, and clear again when the
+/// first step lands.
+pub(super) fn sync_finding_status(app: &mut PhotocraftApp) {
+    let text = tl!("Finding the object…");
+    let Some(l) = app.live_stroke.as_mut() else { return };
+    let finding = l.paint.finding();
+    if finding && !l.finding_shown {
+        l.finding_shown = true;
+        app.ui.status = text.to_string();
+        app.ui.status_error = false;
+    } else if !finding && l.finding_shown {
+        l.finding_shown = false;
+        if app.ui.status == text {
+            app.ui.status.clear();
+        }
+    }
 }
 
 /// How long a frame waits for the live stroke to paint the points it was just given. A light
@@ -546,6 +580,16 @@ fn take_steps(app: &mut PhotocraftApp, tool: Tool, steps: Vec<Step>) {
         match step {
             Ok(r) => l.damage.push(r),
             Err(e) => {
+                if l.finding_shown {
+                    // The object was not found (or the find stopped): say why now, not on release.
+                    l.finding_shown = false;
+                    if matches!(e, photocraft_engine::EngineError::Cancelled) {
+                        app.ui.status.clear();
+                    } else {
+                        app.ui.status = e.to_string();
+                        app.ui.status_error = true;
+                    }
+                }
                 if tool == Tool::MixerBrush {
                     // Keep the last valid preview and its document/revision guard. All input
                     // stays in the drag; release replays it without the preview tile budget.

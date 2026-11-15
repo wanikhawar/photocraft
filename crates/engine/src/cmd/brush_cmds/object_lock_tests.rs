@@ -329,3 +329,32 @@ fn bad_options_are_errors() {
     erase.ai.segmenter = Some(Arc::new(|_, _, _, _| Err("never asked".to_owned())));
     erase.execute("paint.stroke", json!({"points": ACROSS, "erase": true, "target": "pixels", "brush": {"size": 20, "surface": stay(json!({}))}})).unwrap();
 }
+
+#[test]
+fn cancelling_a_pending_find_ends_the_wait_at_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut s = two_objects();
+    // A segmenter that does not answer until released.
+    let release = Arc::new(AtomicBool::new(false));
+    let gate = release.clone();
+    s.ai.segmenter = Some(Arc::new(move |_, _, _, _| {
+        while !gate.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Err("released".to_owned())
+    }));
+    let mut live = LiveStroke::begin_with(&s, "paint.stroke", &stroke(json!([[60, 50]]), stay(json!({})))).unwrap();
+    let cancel = live.cancel_pending().expect("Stay on Object has a pending find to cancel");
+    let waiting = std::thread::spawn(move || live.push(&[]));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(!waiting.is_finished(), "the push waits for the finder");
+    let started = std::time::Instant::now();
+    cancel.store(true, Ordering::SeqCst);
+    let result = waiting.join().unwrap();
+    assert!(matches!(result, Err(EngineError::Cancelled)), "{result:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "the wait ended without the finder answering");
+    release.store(true, Ordering::SeqCst);
+    // Without Stay on Object there is nothing to cancel.
+    let plain = LiveStroke::begin_with(&s, "paint.stroke", &stroke(json!([[60, 50]]), json!({}))).unwrap();
+    assert!(plain.cancel_pending().is_none());
+}

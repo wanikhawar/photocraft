@@ -695,6 +695,7 @@ pub(super) fn tool_event_with_view(app: &mut PhotocraftApp, ev: ToolEvent, mods:
                 app.stylus.record_point();
             }
             app.live_stroke = if strokes_live(tool) { begin_live_stroke(app) } else { None };
+            super::strokes::sync_finding_status(app);
             if tool == Tool::MixerBrush && app.live_stroke.is_none() {
                 use photocraft_engine::brush_cmds::mixer_live::LiveMixer;
                 let p = app.drag.as_ref().map(|d| stroke_params(app, d, &app.stylus.stroke_points(&d.points)));

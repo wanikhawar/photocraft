@@ -20,7 +20,7 @@
 //! an All Layers sample) hit the session's cache.
 
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use photocraft_algo::selection::{self, Region, SelectionMode};
@@ -224,6 +224,9 @@ pub(crate) struct ObjectLock {
     cache: Arc<ObjectCache>,
     depth: Option<DepthGate>,
     result: OnceLock<std::result::Result<Arc<Region>, String>>,
+    /// Set when whoever started the stroke let go of it: a wait for the finder ends (see
+    /// [`ObjectLock::cancel_handle`]).
+    cancel: Arc<AtomicBool>,
 }
 
 impl ObjectLock {
@@ -256,14 +259,30 @@ impl ObjectLock {
             cache: s.surface_cache.objects.clone(),
             depth,
             result: OnceLock::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// The flag that stops a pending [`resolve`](Self::resolve): once set, the finder wait ends and
+    /// `resolve` gives [`EngineError::Cancelled`]. Shared, so it can be set while another thread is
+    /// inside `resolve`.
+    pub(crate) fn cancel_handle(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
     }
 
     /// The region the stroke paints in, for a stroke whose first dab is at `click` (document
     /// pixels). Computed once; later calls give the same answer (or error). May take a while (the
     /// finder runs): call it off the UI thread where a person is waiting.
     pub(crate) fn resolve(&self, click: (f64, f64)) -> Result<Arc<Region>> {
-        self.result.get_or_init(|| self.compute(click).map_err(|e| e.to_string())).clone().map_err(EngineError::Other)
+        if self.cancelled() {
+            return Err(EngineError::Cancelled);
+        }
+        let result = self.result.get_or_init(|| self.compute(click).map_err(|e| e.to_string())).clone();
+        result.map_err(|msg| if self.cancelled() { EngineError::Cancelled } else { EngineError::Other(msg) })
     }
 
     fn compute(&self, click: (f64, f64)) -> Result<Arc<Region>> {
@@ -303,15 +322,41 @@ impl ObjectLock {
             Backend::BuiltIn => built_in(&sampled, self.layer, all_layers, click),
             #[cfg(not(target_arch = "wasm32"))]
             Backend::StandIn(seg) => {
-                let ask = |png: Vec<u8>, w: u32, h: u32, c: craft_ai_core::segment::Click| seg(&png, w, h, &[c]).map(Some).map_err(fail);
+                let ask = |png: Vec<u8>, w: u32, h: u32, c: craft_ai_core::segment::Click| self.run_stand_in(seg, png, w, h, c);
                 self.segment(&sampled, click, canvas, &ask)?.map_or_else(|| built_in(&sampled, self.layer, all_layers, click), Ok)
             }
             #[cfg(not(target_arch = "wasm32"))]
             Backend::Ai(tools) => {
-                let ask = |png: Vec<u8>, _: u32, _: u32, c: craft_ai_core::segment::Click| ask_tool(tools, png, c);
+                let ask = |png: Vec<u8>, _: u32, _: u32, c: craft_ai_core::segment::Click| ask_tool(tools, png, c, &|| self.cancelled());
                 // A model that would send the picture away without the person's agreement leaves the
                 // built-in finder to do the work.
                 self.segment(&sampled, click, canvas, &ask)?.map_or_else(|| built_in(&sampled, self.layer, all_layers, click), Ok)
+            }
+        }
+    }
+
+    /// Runs the stand-in segmenter on a thread of its own and waits for it, so a cancel ends the
+    /// wait at once (the thread, if it is still inside the stand-in, finishes unseen).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn run_stand_in(&self, seg: &Segmenter, png: Vec<u8>, w: u32, h: u32, click: craft_ai_core::segment::Click) -> Result<Option<Segmented>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let seg = seg.clone();
+        std::thread::Builder::new()
+            .name("stand-in segmenter".into())
+            .spawn(move || {
+                let _ = tx.send(seg(&png, w, h, &[click]));
+            })
+            .map_err(|_| fail("could not start the object finder"))?;
+        let started = std::time::Instant::now();
+        loop {
+            if self.cancelled() {
+                return Err(EngineError::Cancelled);
+            }
+            match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(answer) => return answer.map(Some).map_err(fail),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if started.elapsed() < TOOL_LIMIT => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Err(fail("the object finder took too long")),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(fail("the object finder stopped unexpectedly")),
             }
         }
     }
@@ -344,14 +389,19 @@ impl ObjectLock {
 
 /// One Select Subject run on the shared layer: `png` and a click in, the mask and what was found out.
 #[cfg(not(target_arch = "wasm32"))]
-fn ask_tool(tools: &craft_ai_client::AppTools, png: Vec<u8>, click: craft_ai_core::segment::Click) -> Result<Option<Segmented>> {
+fn ask_tool(
+    tools: &craft_ai_client::AppTools,
+    png: Vec<u8>,
+    click: craft_ai_core::segment::Click,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<Option<Segmented>> {
     use craft_ai_core::segment::{self, Found};
     use craft_ai_core::{InputRole, Payload};
     let tool = crate::ai_layer::SELECT_SUBJECT_TOOL;
     let request = tools.request(tool).ok_or_else(|| fail("Select Subject is not available here"))?;
     let source = Payload::inline("image/png", png).map_err(|e| fail(e.message))?;
     let request = segment::with_clicks(request.with_input(InputRole::Source, source), &[click]);
-    let Some(outputs) = crate::ai_layer::call_tool(tools, tool, request, &|| false, TOOL_LIMIT)? else { return Ok(None) };
+    let Some(outputs) = crate::ai_layer::call_tool(tools, tool, request, cancelled, TOOL_LIMIT)? else { return Ok(None) };
     let mask = match segment::mask(&outputs) {
         Some(Payload::Inline { data, .. }) => data.clone(),
         _ => return Err(fail("Select Subject returned no mask")),

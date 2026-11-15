@@ -1339,6 +1339,7 @@ pub fn open_command_dialog(app: &mut PhotocraftApp, command: &str, label: &str) 
 pub mod adjust_dialog;
 pub mod adjust_editors;
 pub mod adjust_preview;
+pub(crate) mod ai_setup;
 #[cfg(test)]
 mod arbitrary_ruler_prefill_tests;
 pub(crate) mod bitmap_dialog;
