@@ -102,7 +102,6 @@ use selection::selection_shown_offset;
 pub use selection::{SelCursor, selection_cursor};
 pub(crate) use selection::{floating_outline, selection_drag_delta};
 pub(crate) use start_screen::start_screen_drop_hint;
-pub(crate) use strokes::multiple_color_target;
 pub use strokes::paint_target;
 pub(crate) use strokes::{
     ClonePreviewCache, CommittedStroke, LiveStroke, cancel_mixer_on_context_change, freehand_tool, spread_ms, strokes_live, unsmoothed_line,
@@ -112,6 +111,7 @@ use strokes::{
 };
 #[cfg(test)]
 pub(crate) use strokes::{SPOT_HEALING_TRAIL, live_retouch_points};
+pub(crate) use strokes::{clear_stale_finding_status, multiple_color_target};
 pub(crate) use tabs::arranged_cells;
 pub(crate) use tabs::tab_title_at;
 #[cfg(test)]

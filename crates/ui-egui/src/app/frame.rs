@@ -379,6 +379,7 @@ impl PhotocraftApp {
         notices::show(self, &ctx);
         updates_ui::show(self, &ctx);
         crate::dialogs::ai_setup::show(self, &ctx);
+        canvas::clear_stale_finding_status(self);
         gpu_status::show_fallback(self, &ctx);
         kys_import::show_offer(self, &ctx);
         if self.titlebar_modal_drag(chrome) {

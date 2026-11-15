@@ -273,6 +273,10 @@ pub(crate) struct LiveStroke {
     pub(super) preview_failed: bool,
     /// The status line says "Finding the object…" for this stroke (Stay on Object).
     finding_shown: bool,
+    /// Stay on Object: no step has landed yet, so a failed first step is a failed find.
+    find_pending: bool,
+    /// The find failed: the stroke is over, and the release runs nothing (the error stays).
+    pub(super) find_failed: bool,
     pub(super) paint: PaintThread,
     /// The jitter seed the commit must reuse (`EngineStroke::seed`).
     pub(super) seed: Option<u64>,
@@ -478,6 +482,7 @@ pub(super) fn begin_live_stroke(app: &PhotocraftApp) -> Option<LiveStroke> {
     };
     let n = STROKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0xff_ffff;
     let damage = vec![stroke.bounds()];
+    let find_pending = stroke.is_pending();
     Some(LiveStroke {
         seed: stroke.seed(),
         paint: PaintThread::start(stroke),
@@ -488,6 +493,8 @@ pub(super) fn begin_live_stroke(app: &PhotocraftApp) -> Option<LiveStroke> {
         fed: if d.tool == Tool::MixerBrush { 1 } else { d.points.len() },
         preview_failed: false,
         finding_shown: false,
+        find_pending,
+        find_failed: false,
     })
 }
 
@@ -547,6 +554,15 @@ pub(super) fn feed_live_stroke_waiting(app: &mut PhotocraftApp, wait: std::time:
     app.perf.stage.stroke_ms += crate::gpu_canvas::now_ms() - started;
 }
 
+/// Clears "Finding the object…" once no live stroke is finding any more (Escape, a tool switch, any
+/// drop of a pending stroke), but only while the status still shows that text.
+pub(crate) fn clear_stale_finding_status(app: &mut PhotocraftApp) {
+    let text = tl!("Finding the object…");
+    if app.ui.status == text && !app.live_stroke.as_ref().is_some_and(|l| l.finding_shown) {
+        app.ui.status.clear();
+    }
+}
+
 /// The status line while a Stay on Object stroke is finding its object, and clear again when the
 /// first step lands.
 pub(super) fn sync_finding_status(app: &mut PhotocraftApp) {
@@ -578,8 +594,24 @@ fn take_steps(app: &mut PhotocraftApp, tool: Tool, steps: Vec<Step>) {
     let Some(l) = app.live_stroke.as_mut() else { return };
     for step in steps {
         match step {
-            Ok(r) => l.damage.push(r),
+            Ok(r) => {
+                l.find_pending = false;
+                l.damage.push(r);
+            }
             Err(e) => {
+                let find = l.find_pending && tool != Tool::MixerBrush;
+                if find {
+                    // Not found, or stopped: the stroke is over. The release must not run the
+                    // finder again (on the UI thread), so the dead stroke is kept to say so.
+                    l.find_failed = true;
+                    l.preview_failed = true;
+                    l.finding_shown = false;
+                    if !matches!(e, photocraft_engine::EngineError::Cancelled) {
+                        app.ui.status = e.to_string();
+                        app.ui.status_error = true;
+                    }
+                    return;
+                }
                 if l.finding_shown {
                     // The object was not found (or the find stopped): say why now, not on release.
                     l.finding_shown = false;
@@ -789,6 +821,10 @@ pub(super) fn commit_brush_stroke(app: &mut PhotocraftApp, d: &Drag) {
         let _ = app.run(stroke_command(app, d.tool), p);
         return;
     };
+    // The find failed while the stroke was drawn: it is over, and the error is already shown.
+    if l.find_failed {
+        return;
+    }
     // Points the live stroke hasn't rendered yet (the release frame's last moves).
     let t0 = app.stylus.point_ms(0);
     let rest: Vec<_> = (l.fed..d.points.len())
@@ -802,8 +838,16 @@ pub(super) fn commit_brush_stroke(app: &mut PhotocraftApp, d: &Drag) {
         })
         .collect();
     // What the live stroke's thread was still painting, then those points.
-    let LiveStroke { paint, doc, key, mut damage, .. } = l;
+    let LiveStroke { paint, doc, key, mut damage, find_pending, .. } = l;
     let (steps, stroke) = paint.finish();
+    // The find failed in the last moment before the release: the same, without a second find.
+    if find_pending && let Some(Err(e)) = steps.first() {
+        if !matches!(e, photocraft_engine::EngineError::Cancelled) {
+            app.ui.status = e.to_string();
+            app.ui.status_error = true;
+        }
+        return;
+    }
     let painted = stroke.and_then(|mut stroke| {
         for step in steps.into_iter().chain((!rest.is_empty()).then(|| stroke.push(&rest))) {
             damage.push(step.ok()?);

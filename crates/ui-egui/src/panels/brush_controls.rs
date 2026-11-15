@@ -206,8 +206,9 @@ fn stay_on_object_controls(app: &PhotocraftApp, ui: &mut egui::Ui, s: &mut photo
     widgets::dropdown(ui, "surface-stay-on", tl!("Stay on Object"), &mut s.stay_on, &stay, 120.0);
     ui.add_enabled_ui(s.stay_on.is_on(), |ui| {
         let mut feather = s.object_feather;
-        if widgets::slider_row(ui, tl!("Feather"), &mut feather, 0.0..=64.0, "px", None).changed() {
-            s.object_feather = feather.round().clamp(0.0, 64.0);
+        if widgets::slider_row_prec(ui, tl!("Feather"), &mut feather, 0.0..=64.0, "px", None, widgets::RowGestures::default(), Some(1)).changed() {
+            // Half pixels, so the 1.5 default survives a nudge.
+            s.object_feather = ((feather * 2.0).round() / 2.0).clamp(0.0, 64.0);
         }
     });
     ui.add_enabled_ui(s.stay_on.uses_depth(), |ui| {

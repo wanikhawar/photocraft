@@ -171,11 +171,80 @@ fn a_stroke_finding_its_object_says_so_and_a_failed_find_is_the_error_status() {
     gate.store(true, Ordering::SeqCst);
     wait_until("the find ends", || {
         feed_live_stroke_waiting(&mut app, Duration::from_millis(20));
-        app.live_stroke.is_none()
+        app.live_stroke.as_ref().is_some_and(|l| l.find_failed)
     });
     assert!(app.ui.status_error && app.ui.status.contains("no object found"), "{}", app.ui.status);
     // The release does not paint anything either.
     tool_event(&mut app, ToolEvent::Up { x: 20.0, y: 30.0 }, M);
     assert_eq!(app.session.active().unwrap().history.past_len(), steps, "nothing was painted");
     assert!(app.ui.status_error, "{}", app.ui.status);
+}
+
+/// A stand-in Select Subject that finds nothing and counts how often it is asked.
+fn counting_finder(app: &mut PhotocraftApp) -> Arc<std::sync::atomic::AtomicUsize> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    app.session.ai.segmenter = Some(Arc::new(move |_, _, _, _| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        Err("no object found under the brush".to_owned())
+    }));
+    calls
+}
+
+/// A failed find ends the stroke: the release does not run the stroke (and the finder) again.
+#[test]
+fn a_failed_find_is_not_run_again_on_release() {
+    use std::sync::atomic::Ordering;
+    for fed_before_release in [true, false] {
+        let mut app = app_for(Tool::Brush);
+        app.run("tools.setBrush", json!({"brush": {"surface": {"stayOn": "object", "objectFeather": 0}}})).unwrap();
+        let calls = counting_finder(&mut app);
+        let steps = app.session.active().unwrap().history.past_len();
+        let before = app.session.active().unwrap().doc.clone();
+        tool_event(&mut app, ToolEvent::Down { x: 20.0, y: 30.0, pressure: 1.0 }, M);
+        if fed_before_release {
+            wait_until("the find ends", || {
+                feed_live_stroke_waiting(&mut app, Duration::from_millis(20));
+                calls.load(Ordering::SeqCst) > 0 && !live_stroke_busy(&app)
+            });
+        }
+        move_without_feeding(&mut app);
+        tool_event(&mut app, ToolEvent::Up { x: 130.0, y: 30.0 }, M);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "fed {fed_before_release}: the finder ran once");
+        assert!(app.live_stroke.is_none());
+        assert_eq!(app.session.active().unwrap().history.past_len(), steps, "fed {fed_before_release}: nothing was painted");
+        assert!(Arc::ptr_eq(&app.session.active().unwrap().doc, &before), "fed {fed_before_release}: the document is untouched");
+        assert!(app.ui.status_error && app.ui.status.contains("no object found"), "fed {fed_before_release}: {}", app.ui.status);
+    }
+}
+
+/// Letting go of a stroke that is still finding clears its status line, and only that text.
+#[test]
+fn letting_go_of_a_finding_stroke_clears_the_finding_status() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut app = app_for(Tool::Brush);
+    app.run("tools.setBrush", json!({"brush": {"surface": {"stayOn": "object", "objectFeather": 0}}})).unwrap();
+    let gate = Arc::new(AtomicBool::new(false));
+    let open = gate.clone();
+    app.session.ai.segmenter = Some(Arc::new(move |_, _, _, _| {
+        while !open.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err("released".to_owned())
+    }));
+    tool_event(&mut app, ToolEvent::Down { x: 20.0, y: 30.0, pressure: 1.0 }, M);
+    assert_eq!(app.ui.status, "Finding the object…");
+    super::clear_stale_finding_status(&mut app);
+    assert_eq!(app.ui.status, "Finding the object…", "still finding");
+    // Escape or a tool switch drops the stroke.
+    app.drag = None;
+    app.live_stroke = None;
+    super::clear_stale_finding_status(&mut app);
+    assert_eq!(app.ui.status, "");
+    // Another message is not touched.
+    app.ui.status = "Saved".into();
+    super::clear_stale_finding_status(&mut app);
+    assert_eq!(app.ui.status, "Saved");
+    gate.store(true, Ordering::SeqCst);
 }
