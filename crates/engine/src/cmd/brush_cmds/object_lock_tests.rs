@@ -427,6 +427,44 @@ fn cancelling_a_pending_find_ends_the_wait_at_once() {
 
 /// Painting straight onto the photo (its only layer) looks at the photo: hiding the layer being
 /// painted, as a paint layer above the photo is hidden, would leave an empty canvas to look at.
+/// The photo is the layer being painted and a white background lies under it: the finder is sent
+/// the photo. It was sent the white background alone (the painted layer was hidden from the
+/// sample whenever another layer showed anything), found nothing in particular and painted
+/// everything.
+#[test]
+fn painting_onto_a_photo_over_a_background_looks_at_the_photo() {
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": W, "height": H, "background": "white"})).unwrap();
+    s.execute("layer.new.layer", json!({})).unwrap();
+    s.edit("photo", |doc, active| {
+        let surf = doc.layer_mut(active.unwrap()).unwrap().surface_mut().unwrap();
+        surf.fill_rect(A, &RED);
+        surf.fill_rect(B, &RED);
+        Ok(())
+    })
+    .unwrap();
+    let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+    let record = seen.clone();
+    let (inner, _) = segmenter(vec![A, B]);
+    s.ai.segmenter = Some(Arc::new(move |png, w, h, clicks| {
+        record.lock().unwrap().push(png.to_vec());
+        inner(png, w, h, clicks)
+    }));
+    s.execute("paint.stroke", stroke(json!(ACROSS), stay(json!({})))).unwrap();
+    let pngs = seen.lock().unwrap();
+    let png = pngs.first().expect("the segmenter ran");
+    let mut reader = png::Decoder::new(std::io::Cursor::new(png.clone())).read_info().unwrap();
+    let mut px = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut px).unwrap();
+    let ch = info.color_type.samples();
+    let i = (50 * info.width as usize + 60) * ch;
+    assert!(px[i] > 150 && px[i + 1] < 100, "the photo's red object was sent, not the white background");
+    drop(pngs);
+    // A second stroke on the same object reuses it, though the first one painted the photo.
+    s.execute("paint.stroke", stroke(json!([[50, 30], [90, 70]]), stay(json!({})))).unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 1, "the stroke's own paint does not make it find again");
+}
+
 #[test]
 fn painting_onto_the_photo_itself_looks_at_the_photo() {
     let mut s = two_objects();

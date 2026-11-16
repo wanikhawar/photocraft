@@ -1,8 +1,8 @@
 //! Stay on Object: the brush's Surface option that keeps a stroke on the object under its first
 //! dab (see [`photocraft_paint::StayOn`]).
 //!
-//! The object is found once per stroke, from the picture the stroke samples (All Layers without
-//! the layer being painted, or that layer alone: the same sample as Surface Color), and the stroke
+//! The object is found once per stroke, from the picture the stroke samples (All Layers as seen,
+//! the layer being painted included, or that layer alone), and the stroke
 //! paints through it: the clip is the document's selection intersected with the object's region,
 //! softened by `objectFeather`, and (with `ObjectAndDepth`) cut to the part reached from the first
 //! dab without crossing a jump in depth. The renderers are unchanged: strokes already multiply their
@@ -19,7 +19,6 @@
 //! thread, and finds each object once: later strokes on it (the stroke's own paint does not change
 //! an All Layers sample) hit the session's cache.
 
-use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
@@ -385,20 +384,24 @@ impl ObjectLock {
     #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
     fn find(&self, click: (f64, f64), canvas: Rect) -> Result<Region> {
         let all_layers = self.sample == SampleMode::AllLayers;
-        let sampled = sampled_doc(&self.doc, all_layers, self.layer);
+        // All Layers is the picture as it is seen, the layer being painted included: hiding it (as
+        // Surface Color does) sent the finder a blank picture whenever that layer was the photo and
+        // another layer showed anything (a white background). The cache ignores the painted layer
+        // (`same_sources`), so the stroke's own paint never makes later strokes find again.
+        let sampled: &Document = &self.doc;
         match &self.backend {
-            Backend::BuiltIn => built_in(&sampled, self.layer, all_layers, click),
+            Backend::BuiltIn => built_in(sampled, self.layer, all_layers, click),
             #[cfg(not(target_arch = "wasm32"))]
             Backend::StandIn(seg) => {
                 let ask = |png: Vec<u8>, w: u32, h: u32, c: craft_ai_core::segment::Click| self.run_stand_in(seg, png, w, h, c);
-                self.segment(&sampled, click, canvas, &ask)?.map_or_else(|| built_in(&sampled, self.layer, all_layers, click), Ok)
+                self.segment(sampled, click, canvas, &ask)?.map_or_else(|| built_in(sampled, self.layer, all_layers, click), Ok)
             }
             #[cfg(not(target_arch = "wasm32"))]
             Backend::Ai(tools) => {
                 let ask = |png: Vec<u8>, _: u32, _: u32, c: craft_ai_core::segment::Click| ask_tool(tools, png, c, &|| self.cancelled());
                 // A model that would send the picture away without the person's agreement leaves the
                 // built-in finder to do the work.
-                self.segment(&sampled, click, canvas, &ask)?.map_or_else(|| built_in(&sampled, self.layer, all_layers, click), Ok)
+                self.segment(sampled, click, canvas, &ask)?.map_or_else(|| built_in(sampled, self.layer, all_layers, click), Ok)
             }
         }
     }
@@ -476,35 +479,6 @@ fn ask_tool(
     };
     let found = segment::read_found(&outputs).unwrap_or(Found { matched: true, score: None, name: None });
     Ok(Some(Segmented { mask, found }))
-}
-
-/// The document a sample is read from. With All Layers the one being painted is hidden first (as
-/// for Surface Color), so earlier strokes on a paint layer never change what is found, but only
-/// when another visible layer shows something: painting straight onto the photo (often the only
-/// layer) must look at the photo, not at an empty canvas.
-fn sampled_doc(doc: &Arc<Document>, all_layers: bool, layer: Option<LayerId>) -> Cow<'_, Document> {
-    if all_layers && layer.is_some_and(|id| others_show_something(&doc.layers, id, 0)) {
-        super::surface_wire::hide_target(doc, layer)
-    } else {
-        Cow::Borrowed(&**doc)
-    }
-}
-
-/// Deepest group nesting [`others_show_something`] looks into (documents can be deep).
-const MAX_GROUP_DEPTH: usize = 64;
-
-/// Whether a visible layer other than `target` (inside visible groups) can show pixels: a fill, a
-/// layer with content, or a type, shape or smart object layer. Adjustments and empty layers show
-/// nothing of their own.
-fn others_show_something(layers: &[photocraft_doc::Layer], target: LayerId, depth: usize) -> bool {
-    use photocraft_doc::LayerContent;
-    layers.iter().filter(|l| l.visible && l.id != target).any(|l| match &l.content {
-        LayerContent::Group(g) => depth < MAX_GROUP_DEPTH && others_show_something(&g.children, target, depth + 1),
-        LayerContent::Adjustment(_) => false,
-        LayerContent::Fill(_) => true,
-        LayerContent::Raster(s) => !s.content_bounds().is_empty(),
-        LayerContent::Text(_) | LayerContent::Shape(_) | LayerContent::Smart(_) => l.surface().is_none_or(|s| !s.content_bounds().is_empty()),
-    })
 }
 
 fn built_in(sampled: &Document, layer: Option<LayerId>, all_layers: bool, click: (f64, f64)) -> Result<Region> {
