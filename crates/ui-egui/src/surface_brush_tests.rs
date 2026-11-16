@@ -221,9 +221,9 @@ fn the_stay_on_object_dropdown_writes_the_option() {
     PhotocraftApp::setup_context(&h.ctx, Default::default());
     h.run_steps(4);
     assert_eq!(h.state().session.tools.brush.surface.stay_on, StayOn::Off);
-    assert!(slider(&h, "Feather").accesskit_node().is_disabled() && slider(&h, "Depth Tolerance").accesskit_node().is_disabled());
+    assert!(slider(&h, "Feather").accesskit_node().is_disabled() && slider(&h, "Depth Edge").accesskit_node().is_disabled());
     for (label, want, feather, tolerance) in
-        [("Object", StayOn::Object, true, false), ("Object and Depth", StayOn::ObjectAndDepth, true, true), ("Off", StayOn::Off, false, false)]
+        [("Object", StayOn::Object, true, false), ("Object, Split at Depth", StayOn::ObjectAndDepth, true, true), ("Off", StayOn::Off, false, false)]
     {
         stay_on_combo(&h).click();
         h.run_steps(4);
@@ -231,7 +231,18 @@ fn the_stay_on_object_dropdown_writes_the_option() {
         h.run_steps(4);
         assert_eq!(h.state().session.tools.brush.surface.stay_on, want, "{label}");
         assert_eq!(!slider(&h, "Feather").accesskit_node().is_disabled(), feather, "{label}: Feather");
-        assert_eq!(!slider(&h, "Depth Tolerance").accesskit_node().is_disabled(), tolerance, "{label}: Depth Tolerance");
+        assert_eq!(!slider(&h, "Confidence").accesskit_node().is_disabled(), feather, "{label}: Confidence");
+        assert_eq!(!slider(&h, "Depth Edge").accesskit_node().is_disabled(), tolerance, "{label}: Depth Edge");
+        // A line under the dropdown says what the mode does.
+        let says = match want {
+            StayOn::Off => "wherever the brush goes",
+            StayOn::Object => "only the object under",
+            StayOn::ObjectAndDepth => "stops where the depth jumps",
+        };
+        assert!(
+            h.query_all_by_role(Role::Label).any(|n| n.accesskit_node().value().or(n.accesskit_node().label()).is_some_and(|t| t.contains(says))),
+            "{label}: {says}"
+        );
     }
 }
 

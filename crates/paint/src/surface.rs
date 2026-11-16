@@ -26,6 +26,9 @@ pub const DETAIL_RANGE: std::ops::RangeInclusive<f32> = 1.0..=512.0;
 
 /// Valid range of [`SurfaceOptions::object_feather`] (pixels).
 pub const OBJECT_FEATHER_MAX: f32 = 64.0;
+/// The values `SurfaceOptions::object_confidence` takes: never 0 or 1, which would select every
+/// pixel the finder looked at, or none.
+pub const OBJECT_CONFIDENCE_RANGE: std::ops::RangeInclusive<f32> = 0.01..=0.99;
 
 /// What Stay on Object keeps the paint on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +90,10 @@ pub struct SurfaceOptions {
     /// Softness of the object's edge, in pixels (0..=64): the paint fades out over about this
     /// distance instead of stopping on a hard line.
     pub object_feather: f32,
+    /// How sure the object finder must be that a pixel is the object for the stroke to paint it
+    /// (0.01..=0.99, default 0.5: more likely than not). Lower paints the parts it is unsure of
+    /// too (a rim in shadow); higher keeps to what it is sure of.
+    pub object_confidence: f32,
     /// 0..1: with `ObjectAndDepth`, the largest jump in depth (in the depth channel's own 0..1
     /// values, over a few pixels of the depth estimate) the paint crosses on the object: a surface
     /// that runs nearer or farther gradually is painted in full, and the paint stops where something
@@ -109,6 +116,7 @@ impl Default for SurfaceOptions {
             depth_high_quality: true,
             stay_on: StayOn::Off,
             object_feather: 1.5,
+            object_confidence: 0.5,
             depth_tolerance: 0.08,
         }
     }
@@ -131,6 +139,14 @@ impl SurfaceOptions {
         }
         if !self.object_feather.is_finite() || !(0.0..=OBJECT_FEATHER_MAX).contains(&self.object_feather) {
             return Err(format!("surface object feather must be between 0 and {OBJECT_FEATHER_MAX} pixels, got {}", self.object_feather));
+        }
+        if !self.object_confidence.is_finite() || !OBJECT_CONFIDENCE_RANGE.contains(&self.object_confidence) {
+            return Err(format!(
+                "surface object confidence must be between {} and {}, got {}",
+                OBJECT_CONFIDENCE_RANGE.start(),
+                OBJECT_CONFIDENCE_RANGE.end(),
+                self.object_confidence
+            ));
         }
         if !self.depth_tolerance.is_finite() || !(0.0..=1.0).contains(&self.depth_tolerance) {
             return Err(format!("surface depth tolerance must be between 0 and 1, got {}", self.depth_tolerance));
@@ -323,6 +339,12 @@ mod tests {
         for bad in [f32::NAN, -0.1, 1.5, f32::INFINITY] {
             assert!(SurfaceOptions { depth_tolerance: bad, ..Default::default() }.validate().is_err(), "tolerance {bad}");
         }
+        for bad in [f32::NAN, 0.0, 1.0, -0.5, f32::INFINITY] {
+            assert!(SurfaceOptions { object_confidence: bad, ..Default::default() }.validate().is_err(), "confidence {bad}");
+        }
+        assert_eq!(o.object_confidence, 0.5);
+        let o: SurfaceOptions = serde_json::from_str(r#"{"objectConfidence":0.2}"#).unwrap();
+        assert_eq!(o.object_confidence, 0.2);
         assert!(SurfaceOptions { object_feather: 64.0, depth_tolerance: 1.0, ..Default::default() }.validate().is_ok());
         assert!(SurfaceOptions { object_feather: 0.0, depth_tolerance: 0.0, ..Default::default() }.validate().is_ok());
         for (name, want) in [("off", StayOn::Off), ("object", StayOn::Object), ("objectAndDepth", StayOn::ObjectAndDepth)] {

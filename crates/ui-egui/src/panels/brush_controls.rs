@@ -195,25 +195,48 @@ pub(super) fn surface_options(app: &mut PhotocraftApp, ui: &mut egui::Ui, b: &mu
     }
 }
 
-/// Stay on Object in the Surface popover: its dropdown, Feather, Depth Tolerance (only with depth)
-/// and, while it is on, which finder the next stroke runs. Returns true when the person asked to
-/// set up the AI object finder.
+/// Stay on Object in the Surface popover: its dropdown with a line saying what the chosen (or
+/// pointed at) mode does, Confidence and Feather, Depth Edge (only when splitting at depth) and,
+/// while it is on, which finder the next stroke runs. Returns true when the person asked to set up
+/// the AI object finder.
 fn stay_on_object_controls(app: &PhotocraftApp, ui: &mut egui::Ui, s: &mut photocraft_paint::SurfaceOptions) -> bool {
     use photocraft_paint::StayOn;
     let mut set_up_finder = false;
-    let stay = [(StayOn::Off, tl!("Off")), (StayOn::Object, tl!("Object")), (StayOn::ObjectAndDepth, tl!("Object and Depth"))];
+    let stay = [(StayOn::Off, tl!("Off")), (StayOn::Object, tl!("Object")), (StayOn::ObjectAndDepth, tl!("Object, Split at Depth"))];
     ui.label(tl!("Stay on Object"));
-    widgets::dropdown(ui, "surface-stay-on", tl!("Stay on Object"), &mut s.stay_on, &stay, 120.0);
+    let (_, pointed) = widgets::dropdown_hovered(ui, "surface-stay-on", tl!("Stay on Object"), &mut s.stay_on, &stay, 160.0);
+    let what = match pointed.unwrap_or(s.stay_on) {
+        StayOn::Off => tl!("Paints wherever the brush goes."),
+        StayOn::Object => tl!("Paints only the object under the stroke's first dab."),
+        StayOn::ObjectAndDepth => tl!(
+            "As Object, and also stops where the depth jumps, so what lies in front of the object or behind it inside its outline (a leaf over a pot's rim) stays unpainted. Needs a Depth channel: Estimate Depth…"
+        ),
+    };
+    ui.add(egui::Label::new(egui::RichText::new(what).small()).wrap());
     ui.add_enabled_ui(s.stay_on.is_on(), |ui| {
+        let range = photocraft_paint::surface::OBJECT_CONFIDENCE_RANGE;
+        let mut percent = (s.object_confidence * 100.0).clamp(range.start() * 100.0, range.end() * 100.0);
+        let confidence = widgets::slider_row(ui, tl!("Confidence"), &mut percent, range.start() * 100.0..=range.end() * 100.0, "%", None).on_hover_text(tl!(
+            "How sure the object finder must be that a pixel is the object: lower paints the parts it is unsure of too (a rim in shadow), higher keeps to what it is sure of"
+        ));
+        if confidence.changed() {
+            s.object_confidence = (percent.round() / 100.0).clamp(*range.start(), *range.end());
+        }
         let mut feather = s.object_feather;
-        if widgets::slider_row_prec(ui, tl!("Feather"), &mut feather, 0.0..=64.0, "px", None, widgets::RowGestures::default(), Some(1)).changed() {
+        if widgets::slider_row_prec(ui, tl!("Feather"), &mut feather, 0.0..=64.0, "px", None, widgets::RowGestures::default(), Some(1))
+            .on_hover_text(tl!("Softens the edge of the object, in pixels"))
+            .changed()
+        {
             // Half pixels, so the 1.5 default survives a nudge.
             s.object_feather = ((feather * 2.0).round() / 2.0).clamp(0.0, 64.0);
         }
     });
     ui.add_enabled_ui(s.stay_on.uses_depth(), |ui| {
         let mut percent = (s.depth_tolerance * 100.0).clamp(0.0, 100.0);
-        if widgets::slider_row(ui, tl!("Depth Tolerance"), &mut percent, 0.0..=100.0, "%", None).changed() {
+        let edge = widgets::slider_row(ui, tl!("Depth Edge"), &mut percent, 0.0..=100.0, "%", None).on_hover_text(tl!(
+            "How big a jump in depth stops the paint: lower stops at smaller steps (a leaf just in front of the object), higher paints across them"
+        ));
+        if edge.changed() {
             s.depth_tolerance = (percent.round() / 100.0).clamp(0.0, 1.0);
         }
     });

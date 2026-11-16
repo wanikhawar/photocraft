@@ -251,6 +251,47 @@ fn the_object_is_cached_while_the_sampled_pixels_stay_the_same() {
     assert_eq!(s.surface_cache.object_finds(), 3, "a changed photo is found again");
 }
 
+/// A stand-in that is sure of object A (100%) and half sure of B beside it (40%), as SAM is of a
+/// rim in shadow; it records how often it ran.
+fn unsure_of_b() -> (Segmenter, Calls) {
+    let calls: Calls = Arc::default();
+    let seen = calls.clone();
+    let seg: Segmenter = Arc::new(move |_png, w, h, clicks| {
+        seen.lock().unwrap().push((w, h, clicks.to_vec()));
+        let mask = gray_png(w, h, |x, y| {
+            if A.contains(x as i32, y as i32) {
+                255
+            } else if B.contains(x as i32, y as i32) {
+                102
+            } else {
+                1
+            }
+        });
+        Ok(Segmented { mask, found: Found { matched: true, score: Some(0.7), name: None } })
+    });
+    (seg, calls)
+}
+
+/// Object Confidence picks how sure the finder must be: by default (more likely than not) the
+/// stroke keeps to A, a low confidence takes in B the finder was unsure of, and nothing else is
+/// painted either way. Changing it does not run the finder again.
+#[test]
+fn the_object_confidence_picks_how_sure_the_finder_must_be() {
+    let mut s = two_objects();
+    let (seg, calls) = unsure_of_b();
+    s.ai.segmenter = Some(seg);
+    s.execute("paint.stroke", stroke(json!(ACROSS), stay(json!({})))).unwrap();
+    let paint = layer_surface(&s);
+    assert!(painted(&paint, 60, 50) && !painted(&paint, 130, 50), "the default keeps to what the finder is sure of");
+    s.execute("edit.undo", json!({})).unwrap();
+    // This stroke runs on past B, over pixels the finder gave no chance.
+    s.execute("paint.stroke", stroke(json!([[60, 50], [196, 50], [196, 96]]), stay(json!({"objectConfidence": 0.3})))).unwrap();
+    let paint = layer_surface(&s);
+    assert!(painted(&paint, 60, 50) && painted(&paint, 130, 50), "a low confidence takes in what it was unsure of");
+    assert!(!painted(&paint, 190, 50) && !painted(&paint, 196, 94), "and nothing the finder gave no chance");
+    assert_eq!(calls.lock().unwrap().len(), 1, "the second stroke reused the object");
+}
+
 #[test]
 fn the_selection_still_applies_and_a_disjoint_one_paints_nothing() {
     let mut s = two_objects();
@@ -338,6 +379,8 @@ fn bad_options_are_errors() {
         json!({"stayOn": "object", "objectFeather": -1}),
         json!({"stayOn": "object", "depthTolerance": 1.5}),
         json!({"stayOn": "object", "depthTolerance": -0.1}),
+        json!({"stayOn": "object", "objectConfidence": 0}),
+        json!({"stayOn": "object", "objectConfidence": 1}),
     ] {
         assert!(s.execute("paint.stroke", stroke(json!(ACROSS), bad.clone())).is_err(), "{bad}");
         assert!(s.execute("tools.setBrush", json!({"surface": bad.clone()})).is_err(), "{bad}");

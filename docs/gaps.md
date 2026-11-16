@@ -270,7 +270,7 @@ what an agent can't finish alone.
   canvas changes not detected as stale, Mixer Brush and retouch tools not wired, PSD vanishing
   point resource opaque, light painting. Percentages and estimates unchanged.
 - **Beyond parity (2026-11-16):** Stay on Object (Surface options) keeps a Brush or Pencil stroke on
-  the object under its first dab, optionally stopping where the depth jumps (Object and Depth). The object comes
+  the object under its first dab, optionally stopping where the depth jumps (Object, Split at Depth), painting the pixels the finder is at least Confidence sure of. The object comes
   from the shared Select Subject tool when it is set up, else from the built-in Object Finder; the setup
   is the same window as Estimate Depth's. Tried by hand once with the real Select Subject model (SAM 2.1)
   on one photo, on Linux; the tests use a stand-in segmenter and the built-in finder. Open: ending a stroke
