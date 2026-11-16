@@ -270,10 +270,11 @@ what an agent can't finish alone.
   canvas changes not detected as stale, Mixer Brush and retouch tools not wired, PSD vanishing
   point resource opaque, light painting. Percentages and estimates unchanged.
 - **Beyond parity (2026-11-16):** Stay on Object (Surface options) keeps a Brush or Pencil stroke on
-  the object under its first dab, optionally also to a depth band (Object and Depth). The object comes
+  the object under its first dab, optionally stopping where the depth jumps (Object and Depth). The object comes
   from the shared Select Subject tool when it is set up, else from the built-in Object Finder; the setup
-  is the same window as Estimate Depth's. Tested with a stand-in segmenter and the built-in finder only:
-  the real Select Subject model's mask quality, run time and setup flow are not tried. Open: no cursor
+  is the same window as Estimate Depth's. Tried by hand once with the real Select Subject model (SAM 2.1)
+  on one photo, on Linux; the tests use a stand-in segmenter and the built-in finder. Open: ending a stroke
+  while the first find of a picture runs holds the window until it finishes (about 2 s); no cursor
   tint of the locked object; Mixer Brush and retouch tools not wired. Percentages and estimates unchanged.
 - **Progress (2026-10-25):** Shift-selected colour sets now constrain raster drawing,
   erasers, tone adjustments and supported filters at native depths. Live previews,

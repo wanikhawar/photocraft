@@ -268,6 +268,29 @@ fn the_selection_still_applies_and_a_disjoint_one_paints_nothing() {
     assert!(layer_surface(&far).content_bounds().is_empty());
 }
 
+/// An object whose surface runs gradually nearer (an urn's foot nearer than its rim) is painted
+/// in full with Object and Depth, however far its depth runs from the depth under the first dab;
+/// before, only the depths within the tolerance of the first dab were painted.
+#[test]
+fn depth_paints_all_of_an_object_whose_depth_runs_gradually() {
+    let mut s = two_objects();
+    let both = Rect::new(20, 10, 180, 90);
+    s.ai.segmenter = Some(segmenter(vec![both]).0);
+    s.edit("depth", |doc, _| {
+        let fmt = photocraft_color::PixelFormat::new(photocraft_color::ColorMode::Grayscale, doc.depth, false);
+        let mut surf = Surface::new(fmt);
+        // From 0.1 at the left edge to 0.9 at the right, evenly.
+        let data: Vec<f32> = (0..H as i32).flat_map(|_| (0..W as i32).map(|x| 0.1 + 0.8 * x as f32 / W as f32)).collect();
+        surf.write_region(Rect::new(0, 0, W as i32, H as i32), &data);
+        doc.channels.push(photocraft_doc::AlphaChannel::new("Depth".to_string(), surf));
+        Ok(())
+    })
+    .unwrap();
+    s.execute("paint.stroke", stroke(json!(ACROSS), stay(json!({"stayOn": "objectAndDepth", "depthTolerance": 0.08})))).unwrap();
+    let paint = layer_surface(&s);
+    assert!(painted(&paint, 60, 50) && painted(&paint, 100, 50) && painted(&paint, 140, 50), "all along the stroke");
+}
+
 #[test]
 fn depth_tells_apart_two_objects_of_one_colour() {
     // One segment covers both (they are one colour); the depth is far on the left, near on the right.

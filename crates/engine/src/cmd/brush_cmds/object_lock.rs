@@ -4,8 +4,8 @@
 //! The object is found once per stroke, from the picture the stroke samples (All Layers without
 //! the layer being painted, or that layer alone: the same sample as Surface Color), and the stroke
 //! paints through it: the clip is the document's selection intersected with the object's region,
-//! softened by `objectFeather`, and (with `ObjectAndDepth`) cut to the pixels whose depth is near
-//! the depth under the first dab. The renderers are unchanged: strokes already multiply their
+//! softened by `objectFeather`, and (with `ObjectAndDepth`) cut to the part reached from the first
+//! dab without crossing a jump in depth. The renderers are unchanged: strokes already multiply their
 //! coverage by the selection.
 //!
 //! Two finders produce the region:
@@ -176,39 +176,101 @@ impl ObjectCache {
     }
 }
 
-/// Keeps the paint to where the depth is near the depth under the first dab.
+/// Keeps the paint to the part of the object reached from the first dab without crossing a jump in
+/// depth: the object's surface may run far nearer or farther (an urn's rim and foot), but where
+/// something lies in front of it or behind it (a leaf over the rim) the depth jumps, and the paint
+/// stops there.
+///
+/// The fill runs on cells about the size of a pixel of the depth estimate (its model sees about
+/// 512 pixels across, so its edges blur over a few of them at the canvas's size), and compares each
+/// cell with the one `SPAN` cells back the way the fill came: a jump blurred over a few cells still
+/// shows in full, while a smooth surface changes little over that distance.
 struct DepthGate {
     surface: Surface,
+    /// The largest depth change (in the channel's 0..1 values) over `SPAN` cells that is still the
+    /// same surface.
     tolerance: f32,
 }
 
 impl DepthGate {
-    /// The weight of a pixel whose depth is `diff` away from the reference: 1 within the
-    /// tolerance, easing to 0 at one and a half times it.
-    fn weight(&self, diff: f32) -> f32 {
-        if !diff.is_finite() {
-            return 0.0;
-        }
-        let (tol, edge) = (self.tolerance, self.tolerance * 1.5);
-        if diff <= tol {
-            1.0
-        } else if diff >= edge {
-            0.0
-        } else {
-            let t = (diff - tol) / (edge - tol);
-            1.0 - t * t * (3.0 - 2.0 * t)
-        }
-    }
+    /// Cells across the canvas's longer side (about the depth model's own resolution).
+    const CELLS: u32 = 512;
+    /// How far back the fill looks for a jump, in cells.
+    const SPAN: usize = 4;
 
-    /// `region` cut to the pixels near the depth at `(cx, cy)`.
-    fn apply(&self, region: &Region, cx: i32, cy: i32) -> Result<Region> {
+    /// The part of `object` reached from `(cx, cy)` without crossing a depth jump. Each cell's depth
+    /// is the mean over the object's pixels in it; cells with none are not the object.
+    fn apply(&self, object: &Region, cx: i32, cy: i32, canvas: Rect) -> Result<Region> {
+        let bbox = object.bbox;
+        let (bw, bh) = (bbox.width() as usize, bbox.height() as usize);
+        if bw == 0 || bh == 0 || object.mask.len() != bw.saturating_mul(bh) || !bbox.contains(cx, cy) {
+            return Err(fail(NOT_FOUND));
+        }
+        let cell = (canvas.width().max(canvas.height()) / Self::CELLS).max(1) as usize;
+        let (gw, gh) = (bw.div_ceil(cell), bh.div_ceil(cell));
         let channels = self.surface.channels().max(1);
-        let at = Rect::new(cx, cy, cx.saturating_add(1), cy.saturating_add(1));
-        let reference = crate::allocation::read_region(&self.surface, at, "the depth channel")?.first().copied().unwrap_or(0.0);
-        let depth = crate::allocation::read_region(&self.surface, region.bbox, "the depth channel")?;
-        let first = |i: usize| depth.get(i * channels).copied().unwrap_or(0.0);
-        let mask = region.mask.iter().enumerate().map(|(i, v)| (f32::from(*v) * self.weight((first(i) - reference).abs()) + 0.5) as u8).collect();
-        Ok(Region { bbox: region.bbox, mask })
+        let depth = crate::allocation::read_region(&self.surface, bbox, "the depth channel")?;
+        let mut sum = vec![0.0f32; gw * gh];
+        let mut count = vec![0u32; gw * gh];
+        for (i, v) in object.mask.iter().enumerate() {
+            let d = depth.get(i * channels).copied().unwrap_or(f32::NAN);
+            if *v >= SELECTED && d.is_finite() {
+                let g = (i / bw / cell) * gw + (i % bw / cell);
+                if let (Some(s), Some(n)) = (sum.get_mut(g), count.get_mut(g)) {
+                    *s += d;
+                    *n += 1;
+                }
+            }
+        }
+        let mean: Vec<Option<f32>> = sum.iter().zip(&count).map(|(s, n)| (*n > 0).then(|| s / *n as f32)).collect();
+        let start = ((cy - bbox.y0) as usize / cell) * gw + (cx - bbox.x0) as usize / cell;
+        if mean.get(start).copied().flatten().is_none() {
+            return Err(fail(NOT_FOUND));
+        }
+        let mut reached = vec![false; gw * gh];
+        let mut queue = std::collections::VecDeque::from([start]);
+        if let Some(r) = reached.get_mut(start) {
+            *r = true;
+        }
+        let tol = self.tolerance;
+        while let Some(c) = queue.pop_front() {
+            let (x, y) = (c % gw, c / gw);
+            for (dx, dy) in [(-1isize, 0isize), (1, 0), (0, -1), (0, 1)] {
+                let (Some(nx), Some(ny)) = (x.checked_add_signed(dx), y.checked_add_signed(dy)) else { continue };
+                if nx >= gw || ny >= gh {
+                    continue;
+                }
+                let n = ny * gw + nx;
+                if reached.get(n).copied().unwrap_or(true) {
+                    continue;
+                }
+                let Some(dn) = mean.get(n).copied().flatten() else { continue };
+                // The reached cell farthest back the way the fill came, up to `SPAN` cells.
+                let back = (1..Self::SPAN)
+                    .rev()
+                    .find_map(|k| {
+                        let bx = x.checked_add_signed(-dx * k as isize)?;
+                        let by = y.checked_add_signed(-dy * k as isize)?;
+                        let b = by.checked_mul(gw)?.checked_add(bx)?;
+                        (bx < gw && by < gh && reached.get(b).copied().unwrap_or(false)).then_some(b)
+                    })
+                    .unwrap_or(c);
+                let Some(db) = mean.get(back).copied().flatten() else { continue };
+                if (dn - db).abs() <= tol {
+                    if let Some(r) = reached.get_mut(n) {
+                        *r = true;
+                    }
+                    queue.push_back(n);
+                }
+            }
+        }
+        let mask = object
+            .mask
+            .iter()
+            .enumerate()
+            .map(|(i, v)| if reached.get((i / bw / cell) * gw + (i % bw / cell)).copied().unwrap_or(false) { *v } else { 0 })
+            .collect();
+        Ok(Region { bbox, mask })
     }
 }
 
@@ -303,10 +365,12 @@ impl ObjectLock {
                 found
             }
         };
-        let mut region = if self.feather > 0.0 { Arc::new(feathered(&object, self.feather, canvas)) } else { object };
-        if let Some(gate) = &self.depth {
-            region = Arc::new(gate.apply(&region, cx, cy)?);
-        }
+        // The depth cut comes before the feather, so its edge is softened too.
+        let object = match &self.depth {
+            Some(gate) => Arc::new(gate.apply(&object, cx, cy, canvas)?),
+            None => object,
+        };
+        let region = if self.feather > 0.0 { Arc::new(feathered(&object, self.feather, canvas)) } else { object };
         if region.mask.iter().all(|v| *v == 0) {
             return Err(fail(NOT_FOUND));
         }
@@ -526,7 +590,6 @@ fn decode_mask(bytes: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
 }
 
 /// The mask value from which a pixel is the object (see [`region_from_mask`]).
-#[cfg(not(target_arch = "wasm32"))]
 const SELECTED: u8 = 128;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -642,17 +705,6 @@ mod tests {
         // No feather is no change in the rest of the code path; a box at the canvas edge stays inside it.
         let edge_box = feathered(&region(Rect::new(0, 0, 10, 10), |_, _| 255), 6.0, canvas);
         assert!(canvas.contains_rect(&edge_box.bbox));
-    }
-
-    #[test]
-    fn the_depth_gate_is_one_inside_the_tolerance_and_eases_to_zero() {
-        let gate = DepthGate { surface: Surface::new(photocraft_color::PixelFormat::GRAY8), tolerance: 0.1 };
-        assert_eq!((gate.weight(0.0), gate.weight(0.1)), (1.0, 1.0));
-        assert_eq!((gate.weight(0.15), gate.weight(0.5), gate.weight(f32::NAN)), (0.0, 0.0, 0.0));
-        let ramp: Vec<f32> = (0..=10).map(|i| gate.weight(0.1 + 0.005 * i as f32)).collect();
-        assert!(ramp.windows(2).all(|w| w[0] >= w[1]) && ramp.iter().all(|v| (0.0..=1.0).contains(v)));
-        let exact = DepthGate { tolerance: 0.0, ..gate };
-        assert_eq!((exact.weight(0.0), exact.weight(0.01)), (1.0, 0.0));
     }
 
     /// A mask of another size than the sample, an empty one or a mismatched buffer is nothing, not a panic.

@@ -36,8 +36,10 @@ pub enum StayOn {
     Off,
     /// Paint only on the object under the first dab of the stroke.
     Object,
-    /// Only on that object and only where its depth is near the depth under the first dab (two
-    /// objects of one colour at different distances are told apart).
+    /// Only on the part of that object reached from the first dab without crossing a jump in depth:
+    /// all of an object whose surface runs nearer or farther, but not what lies in front of it or
+    /// behind it inside the same outline (two objects of one colour at different distances are told
+    /// apart).
     ObjectAndDepth,
 }
 
@@ -85,8 +87,10 @@ pub struct SurfaceOptions {
     /// Softness of the object's edge, in pixels (0..=64): the paint fades out over about this
     /// distance instead of stopping on a hard line.
     pub object_feather: f32,
-    /// 0..1: with `ObjectAndDepth`, how far from the depth under the first dab the paint still
-    /// lands (in the depth channel's own 0..1 values); beyond 1.5 times it there is none.
+    /// 0..1: with `ObjectAndDepth`, the largest jump in depth (in the depth channel's own 0..1
+    /// values, over a few pixels of the depth estimate) the paint crosses on the object: a surface
+    /// that runs nearer or farther gradually is painted in full, and the paint stops where something
+    /// lies in front of it or behind it.
     pub depth_tolerance: f32,
 }
 
