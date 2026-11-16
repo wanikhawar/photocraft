@@ -525,9 +525,17 @@ fn decode_mask(bytes: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
     Ok(if wide { buf.as_chunks::<2>().0.iter().map(|p| p[0]).collect() } else { buf })
 }
 
+/// The mask value from which a pixel is the object (see [`region_from_mask`]).
 #[cfg(not(target_arch = "wasm32"))]
-/// A `mw` x `mh` mask stretched over `canvas` (bilinear) as a region over the box of its nonzero
-/// pixels; `None` when it selects nothing.
+const SELECTED: u8 = 128;
+
+#[cfg(not(target_arch = "wasm32"))]
+/// A `mw` x `mh` mask stretched over `canvas` (bilinear) as a region over the box of its selected
+/// pixels; `None` when it selects nothing. The tool's mask is how sure the model is that each pixel
+/// is the object (SAM's coverage), not how much of it to paint, so a pixel is in when the model
+/// says more likely than not (`>= 128`), as SAM itself decides, and out otherwise. Taken as
+/// coverage, the parts the model is less sure of (a rim, a foot in shadow) painted faded. The
+/// Feather option softens the edge.
 fn region_from_mask(mask: &[u8], mw: usize, mh: usize, canvas: Rect) -> Option<Region> {
     let (cw, ch) = (canvas.width() as usize, canvas.height() as usize);
     if mw == 0 || mh == 0 || cw == 0 || ch == 0 || mask.len() != mw.checked_mul(mh)? {
@@ -535,7 +543,7 @@ fn region_from_mask(mask: &[u8], mw: usize, mh: usize, canvas: Rect) -> Option<R
     }
     let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0, 0);
     for (i, v) in mask.iter().enumerate() {
-        if *v > 0 {
+        if *v >= SELECTED {
             let (x, y) = (i % mw, i / mw);
             (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
         }
@@ -558,7 +566,7 @@ fn region_from_mask(mask: &[u8], mw: usize, mh: usize, canvas: Rect) -> Option<R
             let (fx, tx) = (u.floor() as usize, u.fract());
             let top = at(fx, fy) * (1.0 - tx) + at(fx + 1, fy) * tx;
             let bottom = at(fx, fy + 1) * (1.0 - tx) + at(fx + 1, fy + 1) * tx;
-            out.push((top * (1.0 - ty) + bottom * ty + 0.5).clamp(0.0, 255.0) as u8);
+            out.push(if top * (1.0 - ty) + bottom * ty >= f32::from(SELECTED) { 255 } else { 0 });
         }
     }
     let bbox = Rect::new(
@@ -660,6 +668,19 @@ mod tests {
         let shifted = region_from_mask(&[255; 16], 4, 4, Rect::new(100, 50, 140, 70)).unwrap();
         assert!(shifted.bbox.x0 >= 100 && shifted.bbox.y0 >= 50 && shifted.bbox.x1 <= 140 && shifted.bbox.y1 <= 70);
         assert_eq!(shifted.at(120, 60), 1.0);
+    }
+
+    /// The tool's mask says how sure the model is, not how much to paint: a pixel the model thinks
+    /// more likely the object than not is painted in full, and a less likely one not at all (taken as
+    /// coverage, a 60% sure rim painted at 60%).
+    #[test]
+    fn a_soft_mask_selects_what_the_model_thinks_more_likely_than_not() {
+        let mask = [153u8, 153, 102, 102];
+        let r = region_from_mask(&mask, 4, 1, Rect::new(0, 0, 40, 10)).unwrap();
+        assert_eq!(r.at(5, 5), 1.0, "a 60% sure pixel is fully in");
+        assert_eq!(r.at(35, 5), 0.0, "a 40% sure pixel is out");
+        assert!(r.mask.iter().all(|v| *v == 0 || *v == 255), "no faded coverage");
+        assert!(region_from_mask(&[100; 4], 2, 2, Rect::new(0, 0, 4, 4)).is_none(), "nothing the model thinks likely");
     }
 
     /// A mask smaller than the canvas is stretched over it, with the object where it was.
