@@ -35,7 +35,6 @@ pub(super) fn object_selection(ui: &mut egui::Ui, app: &mut PhotocraftApp) -> Op
     crate::panels::options_bar::selection::operation_segments(app, ui, true);
     Divider::vertical().show(ui);
     let o = &mut app.ui.tool_options;
-
     check(ui, tl!("Sample All Layers"), &mut o.sample_all.object_selection, true, None);
     check(ui, tl!("Hard Edge"), &mut o.object_hard_edge, true, None);
     crate::object_finder::bar_buttons(app, ui);

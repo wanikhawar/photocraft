@@ -57,7 +57,9 @@ pub(crate) struct Finder {
     /// Points already looked up that found nothing (the background).
     misses: Vec<[i32; 2]>,
     shown: Option<Arc<Region>>,
+    /// The pixels analysed at the last explicit refresh in Manual mode.
     basis: Arc<Document>,
+    /// The hover mask of `shown`, with the object it was made from.
     mask: Option<(Arc<Region>, HoverMask)>,
 }
 
@@ -266,13 +268,14 @@ fn start(app: &PhotocraftApp) -> Option<Finder> {
 
 /// The options bar's Refresh and gear buttons (#12857).
 pub(crate) fn bar_buttons(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
-    use craft::ui::buttons::Button;
+    use craft::behavior::IconId;
+    use craft::ui::buttons::IconButton;
     use craft::ui::contract::{Props as _, ShowContainer as _, Trigger, clicked};
     use craft::ui::menu::{Menu, MenuItem};
-    if clicked(&Button::new(tl!("Refresh")).tooltip(tl!("Click to refresh object finder.")).show(ui)) {
+    if clicked(&IconButton::new(IconId::new("rotate-cw")).label(tl!("Refresh")).tooltip(tl!("Click to refresh object finder.")).show(ui)) {
         refresh(app);
     }
-    let opener = Button::new("⚙").tooltip(tl!("Set additional options")).show(ui);
+    let opener = IconButton::new(IconId::new("settings")).label(tl!("Set additional options")).tooltip(tl!("Set additional options")).show(ui);
     let o: &mut ToolOptions = &mut app.ui.tool_options;
     Menu::new(tl!("Set additional options")).opened_by(&opener, Trigger::Click).show(ui, |ui, _| {
         if MenuItem::new(tl!("Object Finder")).check(o.object_finder).keep_open(true).show(ui).ran {
