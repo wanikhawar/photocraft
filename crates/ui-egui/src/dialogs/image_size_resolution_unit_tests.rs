@@ -63,10 +63,8 @@ fn type_into(h: &mut Harness<'static, PhotocraftApp>, n: usize, text: &str) {
 }
 
 fn res(h: &Harness<'static, PhotocraftApp>) -> f64 {
-    {
-        let f = fields(h);
-        f["resolution"].as_f64().unwrap() * if f["resolutionUnit"] == serde_json::to_value(UnitKind::PixelsPerCentimetre).unwrap() { 2.54 } else { 1.0 }
-    }
+    let f = fields(h);
+    f["resolution"].as_f64().unwrap() * if f["resolutionUnit"] == serde_json::to_value(UnitKind::PixelsPerCentimetre).unwrap() { 2.54 } else { 1.0 }
 }
 
 fn doc_res(h: &Harness<'static, PhotocraftApp>) -> f64 {
@@ -154,7 +152,7 @@ fn one_pixel_per_inch_is_not_clamped_when_shown_per_centimeter() {
 /// pixels double.
 #[test]
 fn a_resolution_typed_per_centimeter_keeps_the_print_size() {
-    let (mut h, _) = dialog(72.0);
+    let (mut h, id) = dialog(72.0);
     set_field(&mut h, "unit", serde_json::to_value(UnitKind::Inches).unwrap());
     pick_unit(&mut h, "Pixels/Inch", "Pixels/Centimeter");
     type_into(&mut h, 2, "56.693");
@@ -162,4 +160,6 @@ fn a_resolution_typed_per_centimeter_keeps_the_print_size() {
     let ratio = res(&h) / 72.0;
     assert!((ratio - 2.0).abs() < 1e-3, "{f:?}");
     assert!((f["width"].as_f64().unwrap() - 400.0 / 144.00022).abs() < 0.5 && (f["height"].as_f64().unwrap() - 200.0 / 144.00022).abs() < 0.5, "{f:?}");
+    crate::dialogs::testing::confirm(h.state_mut(), id).unwrap();
+    assert_eq!(h.state().session.active().unwrap().doc.size, photocraft_doc::Size::new(400, 200));
 }
