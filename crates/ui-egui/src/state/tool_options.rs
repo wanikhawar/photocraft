@@ -7,7 +7,7 @@ use super::tool::Tool;
 use super::{Deserialize, Serialize};
 
 /// Object Selection › gear › Object Finder Mode (#12857).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ObjectFinderMode {
     /// Auto Refresh: the finder re-analyses the document after every edit.
     #[default]
