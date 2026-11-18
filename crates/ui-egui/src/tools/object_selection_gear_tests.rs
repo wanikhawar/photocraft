@@ -31,7 +31,8 @@ fn app(mode: ObjectFinderMode) -> PhotocraftApp {
 fn hover(app: &mut PhotocraftApp, at: [f64; 2]) -> Update {
     let mut t = 100.0;
     loop {
-        let u = update(app, Some(at), false, t);
+        let ctx = app.ctx().clone();
+        let u = update(app, Some(at), false, t, &ctx);
         if !u.busy || t > 130.0 {
             return u;
         }
@@ -84,7 +85,8 @@ fn reset_tool_restores_them() {
 fn assert_idle(app: &mut PhotocraftApp) {
     let u = hover(app, DISC);
     assert!(u.shown.is_none() && !u.busy);
-    let u = update(app, Some(DISC), false, 500.0);
+    let ctx = app.ctx().clone();
+    let u = update(app, Some(DISC), false, 500.0, &ctx);
     assert!(u.shown.is_none() && !u.busy);
 }
 
@@ -128,7 +130,8 @@ fn manual_refresh_survives_selection_changes_and_leaving() {
     let mut app = app(ObjectFinderMode::Manual);
     refresh(&mut app);
     assert!(hover(&mut app, DISC).shown.is_some());
-    assert!(update(&mut app, None, false, 200.0).shown.is_none());
+    let ctx = app.ctx().clone();
+    assert!(update(&mut app, None, false, 200.0, &ctx).shown.is_none());
     app.run("select.all", json!({})).unwrap();
     app.run("select.deselect", json!({})).unwrap();
     assert!(hover(&mut app, DISC).shown.is_some());
