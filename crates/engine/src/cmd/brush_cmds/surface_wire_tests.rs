@@ -180,12 +180,12 @@ fn striped_with_planes() -> Session {
 fn the_cursor_shape_is_the_first_dab_and_absent_off_plane() {
     let mut s = striped_with_planes();
     // Off by default.
-    assert!(brush_cursor_shape(&mut s, 200.0, 270.0, 15.0).is_none());
+    assert!(brush_cursor_shape(&s, 200.0, 270.0, 15.0).is_none());
     s.execute("tools.setBrush", json!({"size": 30, "surface": {"perspective": true}})).unwrap();
-    assert!(brush_cursor_shape(&mut s, 10.0, 10.0, 15.0).is_none(), "off every plane");
-    assert!(brush_cursor_shape(&mut s, f64::NAN, 10.0, 15.0).is_none());
+    assert!(brush_cursor_shape(&s, 10.0, 10.0, 15.0).is_none(), "off every plane");
+    assert!(brush_cursor_shape(&s, f64::NAN, 10.0, 15.0).is_none());
     for (x, y) in [(200.0, 270.0), (200.0, 140.0), (60.0, 270.0)] {
-        let c = brush_cursor_shape(&mut s, x, y, 15.0).unwrap();
+        let c = brush_cursor_shape(&s, x, y, 15.0).unwrap();
         let (r, a, k) = (c.radius, c.proj_angle, c.proj_scale);
         // The first dab of a stroke that starts there.
         let map = super::surface_wire::plane_map(&s).unwrap() as Arc<dyn SurfaceMap>;
@@ -200,7 +200,7 @@ fn the_cursor_shape_is_the_first_dab_and_absent_off_plane() {
     }
     // No planes: nothing.
     s.execute("perspective.clearPlanes", json!({})).unwrap();
-    assert!(brush_cursor_shape(&mut s, 200.0, 270.0, 15.0).is_none());
+    assert!(brush_cursor_shape(&s, 200.0, 270.0, 15.0).is_none());
 }
 
 #[test]
@@ -351,7 +351,7 @@ fn the_shading_cursor_path_never_builds_either() {
     let mut s = folds_doc(200, 100);
     s.execute("tools.setBrush", json!({"size": 12, "surface": {"color": true}})).unwrap();
     for x in [10.0, 36.0, 150.0] {
-        assert!(brush_cursor_shape(&mut s, x, 50.0, 6.0).is_none());
+        assert!(brush_cursor_shape(&s, x, 50.0, 6.0).is_none());
     }
     assert_eq!(s.surface_cache.field_builds(), 0);
     folds_stroke(&mut s, 50);

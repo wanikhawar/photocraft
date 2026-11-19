@@ -320,7 +320,7 @@ pub struct CursorShape {
 /// `None` when it does not apply: the option is off, the document has no planes for this canvas, or
 /// the point is off every plane. The cursor then stays a plain round outline. The shading field is
 /// never built here.
-pub fn brush_cursor_shape(s: &mut Session, x: f64, y: f64, base_radius: f32) -> Option<CursorShape> {
+pub fn brush_cursor_shape(s: &Session, x: f64, y: f64, base_radius: f32) -> Option<CursorShape> {
     if !s.tools.brush.surface.perspective {
         return None;
     }
