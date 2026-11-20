@@ -366,7 +366,8 @@ fn set_draft(app: &mut PhotocraftApp, value: EditSubpath) {
 /// The Pen ended the draft. A draft whose commit failed waits for the user: Enter or Escape on it commits again.
 fn finish(app: &mut PhotocraftApp, end: PenEnd, committed: bool) {
     let waiting = app.ui.pen.as_ref().is_some_and(|p| p.commit_failed);
-    let has_draft = committed || waiting;
+    // A live draft holding anchors or handles its layer refused is saved by the end, as the edit that made them was not.
+    let has_draft = committed || waiting || pen::live_anchors_pending(app);
     match end {
         PenEnd::Submit if has_draft => submit(app),
         PenEnd::Escape if has_draft => end_keeping(app),
