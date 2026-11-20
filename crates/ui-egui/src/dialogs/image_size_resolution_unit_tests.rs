@@ -1,7 +1,7 @@
 //! #14782: the Image Size dialog's Resolution unit list (Pixels/Inch, Pixels/Centimetre). The dialog converts only
 //! the shown number; `image.imageSize` gets pixels per inch, and an untouched resolution stays the document's own.
 
-use craft::ui::dialog::DialogId;
+use craft::ui::dialog::{DialogId, StackDialog as _};
 use craft::ui::patterns::form_dialogs::HostedImageSize;
 use craft::ui::runtime::env::UnitKind;
 use serde_json::{Value, json};
