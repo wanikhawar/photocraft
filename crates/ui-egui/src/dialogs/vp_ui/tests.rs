@@ -285,7 +285,7 @@ fn ok_paints_the_layer_the_workspace_was_opened_on() {
 }
 
 /// The open workspace.
-fn workspace(h: &Harness<'static, Box<PhotocraftApp>>) -> &VanishingPointWorkspace {
+fn workspace<'a>(h: &'a Harness<'static, Box<PhotocraftApp>>) -> &'a VanishingPointWorkspace {
     let id = h.state().vanishing.as_ref().expect("Vanishing Point is open").dialog;
     h.state().framework.dialogs.get_by_id::<Hosted>(id).expect("the workspace").workspace()
 }

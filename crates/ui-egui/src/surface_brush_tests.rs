@@ -42,7 +42,7 @@ fn open_popover(app: Box<PhotocraftApp>) -> Option<Harness<'static, Box<Photocra
 }
 
 /// The popover's checkbox named `label`.
-fn checkbox<'a>(h: &'a Harness<'static, Box<PhotocraftApp>>, label: &str) -> egui_kittest::Node<'a> {
+fn checkbox<'a>(h: &'a Harness<'static, Box<PhotocraftApp>>, label: &'a str) -> egui_kittest::Node<'a> {
     h.get_all_by_label(label).find(|n| n.accesskit_node().role() == egui::accesskit::Role::CheckBox).unwrap_or_else(|| panic!("{label}"))
 }
 
