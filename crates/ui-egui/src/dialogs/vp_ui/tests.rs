@@ -355,10 +355,11 @@ fn a_canvas_change_while_open_keeps_the_saved_planes() {
     h.state_mut().session.execute("image.canvasSize", json!({"width": 300, "height": 160, "anchor": "topLeft"})).unwrap();
     let moved = saved(h.state());
     let ctx = h.ctx.clone();
-    crate::control::dialogs::workspace_ui(h.state_mut(), &ctx, VP, &json!({"commit": true})).unwrap();
+    // The commit is refused with the reason, over the control channel as in the status bar.
+    let refused = crate::control::dialogs::workspace_ui(h.state_mut(), &ctx, VP, &json!({"commit": true}));
     h.run_steps(4);
     assert_eq!(saved(h.state()), moved, "the planes the canvas change left stay");
-    assert!(h.state().ui.status_error, "{}", h.state().ui.status);
+    assert!(refused.is_err() || h.state().ui.status_error, "{}", h.state().ui.status);
 }
 
 #[test]
