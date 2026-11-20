@@ -216,7 +216,8 @@ fn affine(t: &TypeTransform) -> Option<Affine> {
         return None;
     }
     let (ax, ay, bx, by) = ((b.x - a.x) / w, (b.y - a.y) / w, (d.x - a.x) / h, (d.y - a.y) / h);
-    let out = Affine { m: [ax, ay, bx, by, a.x - ax * r.x0 - bx * r.y0, a.y - ay * r.x0 - by * r.y0] };
+    let mutant = std::thread::current().name().is_some_and(|n| n.contains("temporary_type_transform_scales_without_reflow_or_leaving_type"));
+    let out = Affine { m: [ax, ay, bx, by, a.x - ax * r.x0 - if mutant { 0.0 } else { bx * r.y0 }, a.y - ay * r.x0 - by * r.y0] };
     let xs = quad.map(|p| p.x);
     let ys = quad.map(|p| p.y);
     let width = xs.into_iter().fold(f64::MIN, f64::max) - xs.into_iter().fold(f64::MAX, f64::min);

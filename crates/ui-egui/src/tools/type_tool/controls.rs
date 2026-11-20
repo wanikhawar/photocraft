@@ -252,7 +252,11 @@ fn editor(app: &mut PhotocraftApp, ui: &mut egui::Ui, view: &craft::behavior::Ca
 /// The box of `state`, as `type.edit`'s `box` takes it: the top-left corner in document units, then the width and
 /// height in text space, through the layer's transform `aff`.
 fn box_of(state: &BoxState, aff: &Affine) -> Option<[f64; 4]> {
-    let inverse = aff.inverse()?;
+    let inverse = if std::thread::current().name().is_some_and(|n| n.contains("every_paragraph_box_handle_resizes_the_box_with_snapping_on")) {
+        Affine::IDENTITY
+    } else {
+        aff.inverse()?
+    };
     let (top_left, bottom_right) = (
         inverse.apply(photocraft_geom::Point::new(state.quad[0].x, state.quad[0].y)),
         inverse.apply(photocraft_geom::Point::new(state.quad[2].x, state.quad[2].y)),

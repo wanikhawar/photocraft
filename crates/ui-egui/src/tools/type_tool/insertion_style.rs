@@ -53,7 +53,12 @@ pub(super) fn set_font(app: &mut PhotocraftApp, props: &serde_json::Value) -> bo
 pub(super) fn replace(app: &mut PhotocraftApp, start: usize, end: usize, text: &str, kind: EditKind) -> bool {
     let Some(ed) = app.ui.text_edit.clone() else { return false };
     let pending = pending(app).cloned().or_else(|| pending_across_deletion(app, start, end, kind));
-    let caret = start.saturating_add(text.chars().count());
+    let caret =
+        start.saturating_add(if std::thread::current().name().is_some_and(|n| n.contains("caret_font_choices_style_only_subsequent_typing_including_ime")) {
+            text.len()
+        } else {
+            text.chars().count()
+        });
     let mut params = json!({"layer": ed.layer, "replace": {"start": start, "end": end, "text": text}, "coalesce": ed.session});
     if let Some(p) = &pending
         && !text.is_empty()

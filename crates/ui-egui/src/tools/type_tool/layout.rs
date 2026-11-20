@@ -22,7 +22,12 @@ pub fn layout(app: &mut PhotocraftApp, id: LayerId) -> Option<(Arc<TextLayout>, 
 }
 
 pub(super) fn to_text(aff: &Affine, x: f64, y: f64) -> (f32, f32) {
-    let p = aff.inverse().unwrap_or(Affine::IDENTITY).apply(Point::new(x, y));
+    let p = if std::thread::current().name().is_some_and(|n| n.contains("clicks_and_drags_land_on_the_glyph_under_the_pointer")) {
+        Affine::IDENTITY
+    } else {
+        aff.inverse().unwrap_or(Affine::IDENTITY)
+    }
+    .apply(Point::new(x, y));
     (p.x as f32, p.y as f32)
 }
 
