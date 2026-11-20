@@ -268,6 +268,23 @@ fn undo_takes_back_anchors_the_layer_refused_one_by_one_before_any_document_step
     assert_eq!(subpaths(&shapes(&app)[0].1), [(false, vec![[125.0, 25.0]])]);
 }
 
+/// The first anchor's handles, dragged out while the layer refuses edits, are saved by Enter once it takes them.
+#[test]
+fn enter_saves_the_handles_of_a_one_anchor_draft_the_layer_refused() {
+    let mut app = app();
+    refuse_edits(&mut app);
+    testing::press(&mut app, [125.0, 25.0], egui::Modifiers::NONE);
+    testing::move_to(&mut app, [150.0, 40.0], egui::Modifiers::NONE);
+    testing::release(&mut app, [150.0, 40.0], egui::Modifiers::NONE);
+    let knot = |app: &PhotocraftApp| shapes(app)[0].1.path.subpaths[0].knots[0];
+    assert_eq!(draft_len(&app), Some(1));
+    assert_eq!(knot(&app).out_ctrl, knot(&app).anchor, "the layer refused the handles");
+    app.session.authorize = None;
+    key(&mut app, egui::Key::Enter);
+    assert!(app.ui.pen.is_none());
+    assert_ne!(knot(&app).out_ctrl, knot(&app).anchor, "Enter saved the handles the draft held");
+}
+
 #[test]
 fn an_edit_elsewhere_keeps_the_anchors_the_layer_has_not_taken() {
     let mut app = app();
