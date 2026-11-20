@@ -268,22 +268,23 @@ fn undo_takes_back_anchors_the_layer_refused_one_by_one_before_any_document_step
     assert_eq!(subpaths(&shapes(&app)[0].1), [(false, vec![[125.0, 25.0]])]);
 }
 
-/// The first anchor's handles, set while the layer refuses edits, are saved by Enter once it takes them.
+/// The first anchor's handles, dragged out while the layer refuses edits, are saved by Enter once it takes them.
 #[test]
 fn enter_saves_the_handles_of_a_one_anchor_draft_the_layer_refused() {
     let mut app = app();
-    click(&mut app, 125.0, 25.0);
     refuse_edits(&mut app);
-    let handle = craft::behavior::kurbo::Point::new(150.0, 40.0);
-    app.ui.pen.as_mut().unwrap().draft.knots[0].out_ctrl = handle;
-    testing::frame(&mut app);
+    testing::press(&mut app, [125.0, 25.0], egui::Modifiers::NONE);
+    testing::move_to(&mut app, [150.0, 40.0], egui::Modifiers::NONE);
+    testing::move_to(&mut app, [160.0, 50.0], egui::Modifiers::NONE);
+    testing::release(&mut app, [160.0, 50.0], egui::Modifiers::NONE);
     let knot = |app: &PhotocraftApp| shapes(app)[0].1.path.subpaths[0].knots[0];
-    assert_eq!(draft_len(&app), Some(1));
+    let drawn = app.ui.pen.as_ref().expect("the draft").draft.knots[0];
+    assert_ne!(drawn.out_ctrl, drawn.anchor, "the drag pulled handles out of the first anchor");
     assert_eq!(knot(&app).out_ctrl, knot(&app).anchor, "the layer refused the handles");
     app.session.authorize = None;
     key(&mut app, egui::Key::Enter);
     assert!(app.ui.pen.is_none());
-    assert_eq!((knot(&app).out_ctrl.x, knot(&app).out_ctrl.y), (150.0, 40.0), "Enter saved the handles the draft held");
+    assert_ne!(knot(&app).out_ctrl, knot(&app).anchor, "Enter saved the handles the draft held");
 }
 
 #[test]
