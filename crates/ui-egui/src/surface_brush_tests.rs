@@ -138,11 +138,11 @@ fn ui_inspect_reports_the_cursor_shape() {
         let Reply::Done(v) = handle(app, &ctx, &req) else { panic!("ui.inspect replies at once") };
         v
     };
-    let before = inspect(&mut *app);
+    let before = inspect(&mut app);
     assert_eq!(before["ok"], true, "{before}");
     assert!(before["result"]["brushCursor"].is_null());
     app.surface_cursor = Some(photocraft_engine::brush_cmds::CursorShape { radius: 12.0, proj_angle: 0.5, proj_scale: 0.4 });
-    let v = inspect(&mut *app);
+    let v = inspect(&mut app);
     assert_eq!(v["result"]["brushCursor"]["projScale"], json!(0.4f32));
     assert_eq!(v["result"]["brushCursor"]["radius"], json!(12.0f32));
 }
