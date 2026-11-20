@@ -330,6 +330,7 @@ edit.profileInfo
 view.proofSetup
 view.proofColors
 view.gamutWarning
+brush.cursorShape
 brush.mixer.sample
 paint.pencil
 paint.mixerBrush
@@ -703,6 +704,9 @@ filter.adaptiveWideAngle
 filter.cameraRaw
 file.automate.lensCorrection
 filter.vanishingPoint
+perspective.clearPlanes
+perspective.setPlanes
+perspective.planes
 select.saveSelection
 select.loadSelection
 select.editInQuickMaskMode
