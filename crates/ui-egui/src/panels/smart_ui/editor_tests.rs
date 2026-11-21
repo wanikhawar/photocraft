@@ -408,6 +408,34 @@ fn tone_filter_editor_ignores_current_channel_target() {
     }
 }
 
+fn mutation_run(label: &str, cases: Vec<(&'static str, &'static str, usize)>) {
+    let (mut failing, mut passing) = (Vec::new(), Vec::new());
+    for (mode, kind, view) in cases {
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tone_filter_case(mode, kind, view))).is_ok();
+        eprintln!("MUTATION {label}: {mode} {kind} view={view} {}", if ok { "PASS" } else { "FAIL" });
+        if ok { passing.push((mode, kind, view)) } else { failing.push((mode, kind, view)) }
+    }
+    panic!("MUTATION {label}: failing={failing:?} passing={passing:?}");
+}
+
+#[test]
+fn mutation_full_cross() {
+    let mut cases = Vec::new();
+    for mode in ["rgb", "lab", "cmyk"] {
+        for kind in ["levels", "curves"] {
+            for view in 0..6 {
+                cases.push((mode, kind, view));
+            }
+        }
+    }
+    mutation_run("full", cases);
+}
+
+#[test]
+fn mutation_reduced_set() {
+    mutation_run("reduced", TONE_FILTER_CASES.to_vec());
+}
+
 /// Whole-image Curves stored through the gray alias reopen without changing their rendered effect.
 #[test]
 fn rabbit_whole_image_curves_alias_survives_reopening() {

@@ -137,10 +137,7 @@ pub fn has_dialog(command: &str) -> bool {
 /// The Levels/Curves dialog's target from panel state or explicit parameters, including filter masks.
 /// Re-editing a captured Smart Filter always exposes its document-colour controls.
 fn target_context(app: &PhotocraftApp, smart: Option<&(usize, Value)>, params: &Value) -> photocraft_engine::Result<ToneTarget> {
-    if let Some((_, filter)) = smart {
-        let (layer, _) = crate::smart_filter_dialog::validate_target(app, filter).map_err(photocraft_engine::EngineError::Other)?;
-        return Ok(ToneTarget { layer: Some(layer), channel: None });
-    }
+    let _ = smart;
     let mut params = params.clone();
     if params.get("target").is_none()
         && app.filter_mask_targeted()
