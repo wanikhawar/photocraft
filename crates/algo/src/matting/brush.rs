@@ -513,4 +513,46 @@ mod tests {
         assert!(brush_surface(&zigzag, 1.0, 100.0, canvas).is_none());
         assert!(EdgeBrush::new(&[EdgeStroke { points: zigzag, size: 1.0, add: true }], canvas).is_none());
     }
+
+    /// Diagnostic only: where `brush_surface` spends its time on a huge diagonal.
+    #[test]
+    #[ignore = "diagnostic timings"]
+    fn huge_diagonal_brush_phase_timings() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let canvas = Rect::new(0, 0, 100_000, 100_000);
+        let diagonal = [(0.0f32, 0.0f32), (99_999.0, 99_999.0)];
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+        for round in 1..=3 {
+            for (label, size) in [("algo_brush1", 1.0f32), ("algo_brush9", 9.0f32)] {
+                let r = size.clamp(*SIZE_RANGE.start(), *SIZE_RANGE.end()) / 2.0;
+                let core = r;
+                let line = |name: &str, t: f64, tiles: Option<usize>, extra: Option<String>| {
+                    let tiles = tiles.map_or("-".to_string(), |n| n.to_string());
+                    let extra = extra.map_or(String::new(), |e| format!(" extra={e}"));
+                    eprintln!("PHASE round={round} name={label}_{name} ms={t:.1} tiles={tiles}{extra}");
+                };
+                let t = Instant::now();
+                let pieces = segments(black_box(&diagonal), r, canvas).count();
+                line("segments_count", ms(t), None, Some(format!("pieces={pieces}")));
+
+                let t = Instant::now();
+                let set = black_box(painted_tiles(&diagonal, size, canvas, MAX_PAINTED_TILES)).expect("within the limit");
+                line("painted_tiles", ms(t), Some(set.len()), Some(format!("pieces={pieces}")));
+
+                let t = Instant::now();
+                let tiles = black_box(paint_tiles(&diagonal, size, canvas, MAX_PAINTED_TILES, |p, a, b| soft_coverage(segment_distance(p, a, b), r, core)))
+                    .expect("within the limit");
+                line("paint_tiles", ms(t), Some(tiles.len()), Some(format!("pieces={pieces}")));
+
+                let t = Instant::now();
+                let mut s = Surface::new(PixelFormat::GRAY8);
+                for (tc, bytes) in &tiles {
+                    s.write_interleaved(tc.rect(), bytes);
+                }
+                black_box(&s);
+                line("write_interleaved", ms(t), Some(s.tile_count()), None);
+            }
+        }
+    }
 }

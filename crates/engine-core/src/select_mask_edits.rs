@@ -470,4 +470,113 @@ mod tests {
         assert!(rows.iter().all(|e| check_size(std::slice::from_ref(e), canvas).is_ok()));
         assert!(check_size(&rows, canvas).is_err());
     }
+
+    /// Diagnostic only: per-phase timings of the huge-canvas selection test, in `PHASE` lines.
+    #[test]
+    #[ignore = "diagnostic timings; run with --ignored --nocapture"]
+    fn huge_canvas_phase_timings() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let doc = Document::new("huge", photocraft_doc::Size::new(100_000, 100_000), photocraft_doc::ColorMode::Rgb, photocraft_color::SampleType::U8);
+        let canvas = doc.bounds();
+        let mut small = Surface::new(photocraft_color::PixelFormat::GRAY8);
+        small.fill_rect(Rect::new(10, 60, 20, 70), &[1.0]);
+        let diagonal = vec![(0.0f32, 0.0f32), (99_999.0, 99_999.0)];
+        let brush = SelectionEdit::Brush { points: diagonal.clone(), size: 1.0, hardness: 100.0, add: true };
+        let brush9 = SelectionEdit::Brush { points: diagonal.clone(), size: 9.0, hardness: 100.0, add: false };
+        let lasso_pts = vec![(0.0f32, 0.0f32), (99_999.0, 99_999.0), (0.0, 1.5)];
+        let lasso = SelectionEdit::Lasso { points: lasso_pts.clone(), add: true };
+        let zigzag: Vec<(f32, f32)> = (0..20).map(|i| (if i % 2 == 0 { 0.0 } else { 99_999.0 }, i as f32 * 5000.0)).collect();
+        let rows: Vec<SelectionEdit> = (0..48)
+            .map(|i| SelectionEdit::Brush { points: vec![(0.0, i as f32 * 2000.0), (99_999.0, i as f32 * 2000.0)], size: 1.0, hardness: 100.0, add: true })
+            .collect();
+        eprintln!("ENV rayon_threads={} available_parallelism={:?}", rayon::current_num_threads(), std::thread::available_parallelism().map(|n| n.get()));
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+        for round in 1..=3 {
+            let mut total = 0.0f64;
+            let mut line = |name: &str, t: f64, tiles: Option<usize>| {
+                total += t;
+                let tiles = tiles.map_or("-".to_string(), |n| n.to_string());
+                eprintln!("PHASE round={round} name={name} ms={t:.1} tiles={tiles}");
+            };
+            let t = Instant::now();
+            black_box(check_size(&[brush.clone(), lasso.clone()], canvas).is_ok());
+            line("check_size_brush_lasso", ms(t), None);
+
+            let t = Instant::now();
+            let n = painted_tiles_len(&diagonal, canvas);
+            line("brush1_painted_tiles", ms(t), Some(n));
+
+            let t = Instant::now();
+            let shape1 = black_box(matting::brush_surface(&diagonal, 1.0, 100.0, canvas)).expect("painted");
+            line("brush1_surface", ms(t), Some(shape1.tile_count()));
+
+            let t = Instant::now();
+            let added = black_box(sel::combine_sparse(&small, &shape1, canvas, f32::max));
+            line("brush1_combine_add", ms(t), Some(added.tile_count()));
+
+            let t = Instant::now();
+            let r = black_box(apply(&doc, None, Some(small.clone()), std::slice::from_ref(&brush)));
+            line("brush1_apply", ms(t), r.map(|s| s.tile_count()));
+
+            let t = Instant::now();
+            let n = black_box(sel::polygon_edge_tiles(&lasso_pts, canvas, sel::MAX_PAINTED_TILES)).map(|s| s.len());
+            line("lasso_edge_tiles", ms(t), n);
+
+            let t = Instant::now();
+            let lshape = black_box(sel::polygon_surface(&lasso_pts, canvas)).expect("painted");
+            line("lasso_surface", ms(t), Some(lshape.tile_count()));
+
+            let t = Instant::now();
+            let ladded = black_box(sel::combine_sparse(&small, &lshape, canvas, f32::max));
+            line("lasso_combine_add", ms(t), Some(ladded.tile_count()));
+
+            let t = Instant::now();
+            let r = black_box(apply(&doc, None, Some(small.clone()), std::slice::from_ref(&lasso)));
+            line("lasso_apply", ms(t), r.map(|s| s.tile_count()));
+
+            let t = Instant::now();
+            let shape9 = black_box(matting::brush_surface(&diagonal, 9.0, 100.0, canvas)).expect("painted");
+            line("brush9_surface", ms(t), Some(shape9.tile_count()));
+
+            let t = Instant::now();
+            let sub = black_box(sel::combine_sparse(&added, &shape9, canvas, |a, b| (a - b).max(0.0)));
+            line("brush9_combine_subtract", ms(t), Some(sub.tile_count()));
+
+            let t = Instant::now();
+            let erased = black_box(apply(&doc, None, Some(small.clone()), &[brush.clone(), brush9.clone()]));
+            line("erase_apply", ms(t), erased.as_ref().map(|s| s.tile_count()));
+
+            let t = Instant::now();
+            if let Some(s) = &erased {
+                black_box((s.sample_channel(15, 65, 0), s.sample_channel(50_000, 50_000, 0)));
+            }
+            black_box((
+                shape1.sample_channel(15, 65, 0),
+                shape1.sample_channel(50_000, 50_000, 0),
+                shape1.sample_channel(50_000, 40_000, 0),
+                lshape.sample_channel(50_000, 50_000, 0),
+                lshape.sample_channel(50_000, 40_000, 0),
+            ));
+            line("samples", ms(t), None);
+
+            let t = Instant::now();
+            black_box(check_size(&[SelectionEdit::Brush { points: zigzag.clone(), size: 1.0, hardness: 100.0, add: true }], canvas).is_err());
+            black_box(check_size(&[SelectionEdit::Lasso { points: zigzag.clone(), add: true }], canvas).is_err());
+            line("zigzag_check_size", ms(t), None);
+
+            let t = Instant::now();
+            for e in &rows {
+                black_box(check_size(std::slice::from_ref(e), canvas).is_ok());
+            }
+            black_box(check_size(&rows, canvas).is_err());
+            line("rows_check_size", ms(t), None);
+
+            eprintln!("PHASE round={round} name=total ms={total:.1} tiles=-");
+        }
+    }
+
+    fn painted_tiles_len(points: &[(f32, f32)], canvas: Rect) -> usize {
+        std::hint::black_box(matting::painted_tiles(points, 1.0, canvas, sel::MAX_PAINTED_TILES)).map_or(0, |s| s.len())
+    }
 }
