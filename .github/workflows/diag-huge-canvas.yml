@@ -1,0 +1,87 @@
+name: Diag huge-canvas timings (scratch only)
+
+# Fork-only diagnostic for the storytold/photocraft#8783 follow-up. Never part of a PR.
+on:
+  push:
+    branches: ['diag/huge-canvas-phases']
+
+permissions:
+  contents: read
+
+jobs:
+  timings:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Free disk space
+        run: nohup sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL </dev/null >/dev/null 2>&1 &
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev \
+            libxi-dev libgtk-3-dev libfontconfig1-dev libfreetype-dev libasound2-dev libgl1-mesa-dev mesa-vulkan-drivers
+      - name: Install Rust, cargo-llvm-cov, nextest
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools-preview
+          rustup default stable
+      - uses: step-security/taiki-e-install-action@76747d22a7567cc4438546a84f11bdf18e670ab8 # v2.87.32
+        with:
+          tool: cargo-llvm-cov,cargo-nextest@0.9.150
+      - name: Machine
+        run: nproc; free -g; rustc -vV
+
+      # Instrumented exactly as the SonarCloud archive build: llvm-cov show-env + nextest, test profile.
+      - name: Build instrumented engine-core tests
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          cargo nextest run -p photocraft-engine-core --lib --no-run
+      - name: "A: instrumented harness, default threads"
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          cargo nextest run -p photocraft-engine-core --lib --run-ignored only -E 'test(huge_canvas_phase_timings)' --no-capture 2>&1 | grep -E '^(PHASE|ENV)|PASS|FAIL' | sed 's/^/A /'
+      - name: "B: instrumented harness, one rayon thread"
+        env:
+          RAYON_NUM_THREADS: "1"
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          cargo nextest run -p photocraft-engine-core --lib --run-ignored only -E 'test(huge_canvas_phase_timings)' --no-capture 2>&1 | grep -E '^(PHASE|ENV)|PASS|FAIL' | sed 's/^/B /'
+      - name: "C: instrumented original test alone, x3"
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          for i in 1 2 3; do
+            cargo nextest run -p photocraft-engine-core --lib -E 'test(thin_edits_across_a_huge_canvas_paint_only_their_tiles)' 2>&1 | grep -E 'PASS|FAIL|SLOW' | sed "s/^/C$i /"
+          done
+      - name: "D: instrumented original test beside content_aware_move (the failed run's neighbour), x2"
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          for i in 1 2; do
+            cargo nextest run -p photocraft-engine-core --lib --test-threads 4 \
+              -E 'test(thin_edits_across_a_huge_canvas_paint_only_their_tiles) | test(content_aware_move_previews_large_selections_coarse_then_exact)' 2>&1 \
+              | grep -E 'PASS|FAIL|SLOW' | sed "s/^/D$i /"
+          done
+      - name: "E: instrumented harness beside content_aware_move"
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          cargo nextest run -p photocraft-engine-core --lib --run-ignored all --test-threads 4 --no-capture \
+            -E 'test(huge_canvas_phase_timings) | test(content_aware_move_previews_large_selections_coarse_then_exact)' 2>&1 \
+            | grep -E '^(PHASE|ENV)|PASS|FAIL' | sed 's/^/E /'
+      - name: "F: instrumented harness, engine-core at opt-level 1, one rayon thread"
+        env:
+          RAYON_NUM_THREADS: "1"
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          cargo nextest run --config 'profile.test.package.photocraft-engine-core.opt-level=1' -p photocraft-engine-core --lib \
+            --run-ignored only -E 'test(huge_canvas_phase_timings)' --no-capture 2>&1 | grep -E '^(PHASE|ENV)|PASS|FAIL' | sed 's/^/F /'
+      - name: "G: uninstrumented harness and original test (regular test profile)"
+        env:
+          CARGO_TARGET_DIR: target-plain
+        run: |
+          cargo nextest run -p photocraft-engine-core --lib --run-ignored only -E 'test(huge_canvas_phase_timings)' --no-capture 2>&1 | grep -E '^(PHASE|ENV)|PASS|FAIL' | sed 's/^/G /'
+          RAYON_NUM_THREADS=1 cargo nextest run -p photocraft-engine-core --lib --run-ignored only -E 'test(huge_canvas_phase_timings)' --no-capture 2>&1 | grep -E '^(PHASE|ENV)|PASS|FAIL' | sed 's/^/G1 /'
+          cargo nextest run -p photocraft-engine-core --lib -E 'test(thin_edits_across_a_huge_canvas_paint_only_their_tiles)' 2>&1 | grep -E 'PASS|FAIL' | sed 's/^/Gt /'
