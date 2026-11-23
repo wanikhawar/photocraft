@@ -1,0 +1,52 @@
+name: P76 compare (fork scratch)
+
+# Fork-only scratch workflow: P76 ("set opacity on a layer with Advanced Blending + refresh") on
+# main, the knockout branch and the clipped-individually branch, one macOS runner, each build in
+# its own checkout and target directory.
+
+on:
+  push:
+    branches: ["perf/p76-compare"]
+
+permissions:
+  contents: read
+
+jobs:
+  p76:
+    runs-on: macos-15
+    timeout-minutes: 150
+    strategy:
+      max-parallel: 1
+      matrix:
+        include:
+          - { name: main, repo: storytold/photocraft, sha: 65fc546bba }
+          - { name: pr1-knockout, repo: wanikhawar/photocraft, sha: d61ea63b1186b1324b47715ad9db2c5359942f73 }
+          - { name: pr2-clipped, repo: wanikhawar/photocraft, sha: cf4c9258a8 }
+    name: P76 ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo }}
+          ref: ${{ matrix.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release -p photocraft-ui-egui --example perf_scenarios
+      - name: Run P76 (3 rounds of 30)
+        run: |
+          for r in 1 2 3; do
+            target/release/examples/perf_scenarios --group layered --only "Advanced Blending" --reps 30 --json "p76-${{ matrix.name }}-$r.json"
+          done
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, glob
+          for f in sorted(glob.glob("p76-*.json")):
+              d = json.load(open(f))
+              rows = d.get("rows") or d.get("results") or d
+              print(f"### {f}\n```\n{json.dumps(rows, indent=1)[:3000]}\n```")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: p76-${{ matrix.name }}
+          path: p76-*.json
