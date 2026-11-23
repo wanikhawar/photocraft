@@ -16,12 +16,13 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 150
     strategy:
+      fail-fast: false
       max-parallel: 1
       matrix:
         include:
-          - { name: main, repo: storytold/photocraft, sha: 65fc546bba }
+          - { name: main, repo: storytold/photocraft, sha: 65fc546bbab9659f920c38b8f373b251003d60d7 }
           - { name: pr1-knockout, repo: wanikhawar/photocraft, sha: d61ea63b1186b1324b47715ad9db2c5359942f73 }
-          - { name: pr2-clipped, repo: wanikhawar/photocraft, sha: cf4c9258a8 }
+          - { name: pr2-clipped, repo: wanikhawar/photocraft, sha: cf4c9258a893d4492ce3a5e8e24d884223101cf3 }
     name: P76 ${{ matrix.name }}
     steps:
       - uses: actions/checkout@v4
