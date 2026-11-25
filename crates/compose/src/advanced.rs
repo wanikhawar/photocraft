@@ -75,10 +75,11 @@ fn mix(a: [f32; 4], b: [f32; 4], k: f32) -> [f32; 4] {
 
 /// Whether any Advanced Blending option changes how `layer` (with its clipping group `clipped`)
 /// composites. This is the full set the CPU path implements. The GPU compositor runs knockout,
-/// clipped layers blended individually and Transparency Shapes Layer off itself and sends the
-/// rest (Blend Interior Effects as Group with effects, and masks hiding effects) to the CPU path,
-/// as it does Transparency Shapes Layer off on a clipped layer with effects or a special-eight
-/// blend and Hard Mix with it off in a 16/32-bit document; its own gates are `plan::lower::advanced_on_cpu` and `plan::lower::clipped_on_cpu`.
+/// clipped layers blended individually, Transparency Shapes Layer off and masks hiding effects
+/// itself and sends the rest (Blend Interior Effects as Group with effects) to the CPU path, as
+/// it does Transparency Shapes Layer off on a clipped layer with effects or a special-eight
+/// blend and Hard Mix with it off in a 16/32-bit document; its own gates are
+/// `plan::lower::advanced_on_cpu` and `plan::lower::clipped_on_cpu`.
 pub fn advanced_active(layer: &Layer, clipped: &[Layer]) -> bool {
     let a = &layer.advanced;
     if a.is_default() {
@@ -287,7 +288,7 @@ pub fn hides_effects(layer: &Layer) -> bool {
 /// The layer whose content and effect maps are composited: `layer` itself, or (when a mask hides
 /// its effects) a copy without that mask. Pixels are shared copy-on-write, so the copy costs a
 /// tile table, and its effect maps cache under their own key.
-pub(crate) fn effects_source(layer: &Layer) -> Cow<'_, Layer> {
+pub fn effects_source(layer: &Layer) -> Cow<'_, Layer> {
     if !hides_effects(layer) {
         return Cow::Borrowed(layer);
     }
