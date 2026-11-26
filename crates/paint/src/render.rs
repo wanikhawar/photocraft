@@ -1631,15 +1631,20 @@ impl StrokeRenderer {
     /// whose every unsettled tile has been left alone by the latest [`CALM_PUSHES`] pushes, and
     /// none of which meets `exclude`. One changed tile keeps its whole group back, so a surface
     /// tile is settled once, not once for each of its coverage tiles as they go calm.
-    fn settle_groups(&self, exclude: Rect) -> std::collections::BTreeMap<(i32, i32), Vec<(i32, i32)>> {
+    fn settle_groups(&self, exclude: Rect) -> Vec<Vec<(i32, i32)>> {
         let epoch = self.cov.epoch;
-        let mut groups: std::collections::BTreeMap<(i32, i32), (bool, Vec<(i32, i32)>)> = std::collections::BTreeMap::new();
+        /// The unsettled coverage tiles of one surface tile, and whether all may settle.
+        struct Group {
+            ready: bool,
+            keys: Vec<(i32, i32)>,
+        }
+        let mut groups: std::collections::BTreeMap<(i32, i32), Group> = std::collections::BTreeMap::new();
         let mut note = |k: (i32, i32)| {
             let tile = Rect::new(k.0 * COV_TILE, k.1 * COV_TILE, (k.0 + 1) * COV_TILE, (k.1 + 1) * COV_TILE);
             let ready = self.changed_at(k) + CALM_PUSHES <= epoch && tile.intersect(&exclude).is_empty();
-            let g = groups.entry((k.0.div_euclid(SETTLE_GROUP), k.1.div_euclid(SETTLE_GROUP))).or_insert((true, Vec::new()));
-            g.0 &= ready;
-            g.1.push(k);
+            let g = groups.entry((k.0.div_euclid(SETTLE_GROUP), k.1.div_euclid(SETTLE_GROUP))).or_insert(Group { ready: true, keys: Vec::new() });
+            g.ready &= ready;
+            g.keys.push(k);
         };
         for &k in self.cov.unsettled.keys() {
             note(k);
@@ -1652,11 +1657,11 @@ impl StrokeRenderer {
             }
         }
         groups
-            .into_iter()
-            .filter(|(_, (ready, _))| *ready)
-            .map(|(g, (_, mut keys))| {
-                keys.sort_unstable();
-                (g, keys)
+            .into_values()
+            .filter(|g| g.ready)
+            .map(|mut g| {
+                g.keys.sort_unstable();
+                g.keys
             })
             .collect()
     }
@@ -1682,7 +1687,7 @@ impl StrokeRenderer {
         let mut groups = self.settle_groups(exclude).into_iter();
         let mut keys = Vec::new();
         while keys.len() < max_tiles
-            && let Some((_, group)) = groups.next()
+            && let Some(group) = groups.next()
         {
             keys.extend(group);
         }
