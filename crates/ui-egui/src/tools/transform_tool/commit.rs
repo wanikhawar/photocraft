@@ -13,6 +13,9 @@ const STILL_APPLYING: &str = "Free Transform is still being applied";
 
 const STILL_WARPING: &str = "Warp is still being applied";
 
+/// A smart object's box that no longer maps its source anywhere.
+pub(super) const DEGENERATE_BOX: &str = "The transform box is degenerate";
+
 pub fn commit(app: &mut PhotocraftApp) {
     if committing(app).is_some() {
         return;
@@ -62,7 +65,7 @@ pub fn commit(app: &mut PhotocraftApp) {
             });
             ([b.x0, b.y0, b.x1, b.y1], mapped)
         }
-        (Some(_), None) if warp.is_none() => return keep_open(app, t, preview, "The transform box is degenerate".into()),
+        (Some(_), None) if warp.is_none() => return keep_open(app, t, preview, DEGENERATE_BOX.into()),
         _ => (rect, quad),
     };
     if t.selection {

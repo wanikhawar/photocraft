@@ -1,9 +1,9 @@
 use craft::behavior::geometry::{BoxAllow, BoxState};
-use craft::behavior::kurbo::{Point, Rect};
+use craft::behavior::kurbo::Rect;
 use craft::draw::ui::transform::{TransformEdit, TransformSession};
 use craft::imaging::ui::transform_preview::{PreviewPixels, PreviewTextures, StyledPreview};
 
-use super::commit::{cancel, commit};
+use super::commit::{DEGENERATE_BOX, cancel, commit};
 #[cfg(test)]
 use super::draw::texture_quad;
 use super::preview::{Above, AbovePlan, preview_image};
@@ -48,29 +48,6 @@ fn placed_of(doc: &Document, layer: &photocraft_doc::Layer, b: photocraft_geom::
 /// The session over a smart object's own bounds, starting on the box its placement gives them.
 fn placed_session(app: &PhotocraftApp, source: [f64; 4], quad: [[f64; 2]; 4], allow: BoxAllow) -> TransformSession<SessionWarp> {
     configured(app, TransformSession::with_state(frame_of(source), placed_state(quad)), allow, true)
-}
-
-/// A placed box goes back to the document-space box over the preview texture's rect, keeping where
-/// the box is: Warp works over document space (its mesh is made from the frame and the box).
-fn demote_placed(app: &mut PhotocraftApp) {
-    let Some(t) = app.ui.transform.as_ref() else { return };
-    let Some(p) = t.placed else { return };
-    // An untouched box is exactly the upright one again, not that box through a map that only
-    // rounds to it.
-    let map = if t.untouched() { None } else { t.doc_map() };
-    let (allow, mode) = (t.session.allows(), t.session.current_mode());
-    let b = p.frame;
-    let corners = [(b.x0, b.y0), (b.x1, b.y0), (b.x1, b.y1), (b.x0, b.y1)];
-    let to_box = |(x, y): (f64, f64)| {
-        let at = Point::new(x, y);
-        map.map_or(at, |m| m.apply(at))
-    };
-    let state = BoxState::new(corners.map(to_box), to_box(((b.x0 + b.x1) / 2.0, (b.y0 + b.y1) / 2.0)));
-    let session = configured(app, TransformSession::with_state(b, state).mode(mode), allow, true);
-    if let Some(t) = app.ui.transform.as_mut() {
-        t.session = session;
-        t.placed = None;
-    }
 }
 
 /// The Frame tool's entry: [`begin`] with the session marked to commit when the press that opened it is released.
@@ -756,7 +733,8 @@ pub fn begin_warp(app: &mut PhotocraftApp, ctx: &egui::Context) -> Result<(), St
 }
 
 /// Switch to Warp mode: a smart object's existing warp (when the box is untouched), else a
-/// custom mesh following the current box (so a transform made first carries over). Editable type
+/// custom mesh following the current box (so a transform made first carries over; a smart object's
+/// box over its source gives the mesh what it did in document space). Editable type
 /// gets its own Warp Text style instead ([`enter_type_warp`]). This answers
 /// `TransformRequest::NeedWarp` of the session's `WarpRequested`.
 pub fn enter_warp(app: &mut PhotocraftApp, ctx: &egui::Context) {
@@ -766,8 +744,6 @@ pub fn enter_warp(app: &mut PhotocraftApp, ctx: &egui::Context) {
     if !t.session.allows().warp || t.session.warp().is_some() {
         return;
     }
-    demote_placed(app);
-    let Some(t) = app.ui.transform.as_ref() else { return };
     let (layer, untouched) = (t.layer, t.untouched() && !t.selection && t.path.is_none());
     if warps_type(app) {
         return enter_type_warp(app, ctx);
@@ -794,13 +770,29 @@ pub fn enter_warp(app: &mut PhotocraftApp, ctx: &egui::Context) {
         return;
     }
     let Some(t) = app.ui.transform.as_ref() else { return };
-    let (rect, quad) = (t.rect_array(), t.quad_array());
+    // A smart object's box is over its source, Warp over document space: its mesh goes from the preview
+    // texture's rect to where the box carried that rect, and the session takes the rect as its frame
+    // (as for a stored warp), which Undo and leaving Warp give back.
+    let (rect, quad, over_source) = match t.placed {
+        None => (t.rect_array(), t.quad_array(), false),
+        Some(p) => {
+            let corners = BoxState::from_rect(p.frame).quad;
+            // An untouched box is exactly those corners, not those through a map that only rounds to them.
+            let moved = if t.untouched() { Some(corners) } else { t.doc_map().map(|m| corners.map(|c| m.apply(c))) };
+            let Some(moved) = moved else {
+                app.ui.status = DEGENERATE_BOX.into();
+                app.ui.status_error = true;
+                return;
+            };
+            ([p.frame.x0, p.frame.y0, p.frame.x1, p.frame.y1], moved.map(|c| [c.x, c.y]), true)
+        }
+    };
     let h = Homography::rect_to_quad(rect, quad).unwrap_or(Homography::IDENTITY);
     let mesh = BezierMesh::identity(rect, 1, 1).map_points(|p| {
         let (x, y) = h.apply(p[0], p[1]);
         [x, y]
     });
-    report_warp(app, Warp::custom(mesh, rect), false, false);
+    report_warp(app, Warp::custom(mesh, rect), false, over_source);
 }
 
 /// Whether the active layer is warped: a Warp box is open on it, or it is a smart object with a

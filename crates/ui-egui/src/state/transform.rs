@@ -1,5 +1,6 @@
 use super::{Deserialize, Serialize};
 
+use craft::behavior::Anchor9;
 use craft::behavior::geometry::TransformMode;
 use craft::behavior::geometry::quad::BoxState;
 use craft::behavior::kurbo::{Point, Rect};
@@ -40,8 +41,9 @@ pub struct SessionWarp {
     /// The warp is Warp Text on an editable type layer: committing it changes the style even when it is the
     /// identity warp (a Warp Text set back to None).
     pub on_type: bool,
-    /// The warp is a smart object's stored warp, edited over its unwarped source: the session's frame is the
-    /// warp's bounds, not the render's.
+    /// The session takes the warp's bounds as its frame while in Warp mode, and gives back the frame and box it
+    /// had on leaving: a smart object's stored warp, edited over its unwarped source (not the render's bounds),
+    /// or a warp from a smart object's [`Placed`] box, made in document space.
     pub stored: bool,
 }
 
@@ -57,7 +59,7 @@ impl SessionWarp {
 }
 
 impl SessionWarp {
-    /// This warp as a smart object's stored warp ([`stored`](Self::stored)).
+    /// This warp over its own bounds ([`stored`](Self::stored)).
     pub fn stored(mut self) -> Self {
         self.stored = true;
         self
@@ -75,18 +77,22 @@ impl TransformWarp for SessionWarp {
 }
 
 /// The box a smart object opens on: its corners where its placement puts the source's own rect,
-/// with the reference point at their centre (the image of the rect's centre). The Free Transform
+/// with the reference point where the placement puts that rect's centre (where the box's diagonals
+/// cross, which under perspective is not the corners' average). The Free Transform
 /// session and the Move tool's controls both start from it.
 pub fn placed_state(quad: [[f64; 2]; 4]) -> BoxState {
     let points = quad.map(|[x, y]| Point::new(x, y));
-    let centre = Point::new(points.iter().map(|p| p.x).sum::<f64>() / 4.0, points.iter().map(|p| p.y).sum::<f64>() / 4.0);
-    BoxState::new(points, centre)
+    let mut state = BoxState::new(points, points[0]);
+    state.pivot = state.point_at(Anchor9::Center);
+    state
 }
 
 /// A smart object's box that keeps referencing the object's own bounds (its source rect, as the
 /// session's frame), so it reopens aligned to a rotated object and its fields are relative to the
 /// original placement. The session's quad is then the placement of the source rect, in document
 /// space, while the preview texture still covers the document-space rect [`frame`](Self::frame).
+/// In Warp mode the session's frame is that rect instead, with the warp in document space; this stays,
+/// for the box Undo or leaving Warp returns to.
 #[derive(Clone, Copy, Debug)]
 pub struct Placed {
     /// Document to source: the placement the box opened with, inverted.
@@ -163,9 +169,13 @@ impl FreeTransform {
     }
 
     /// For a placed box, the document-space map of what the box did since it opened: the object's
-    /// source goes through the new placement, having come from the old one. `None` for any other box
-    /// and for a degenerate one.
+    /// source goes through the new placement, having come from the old one. `None` for any other box,
+    /// for a degenerate one, and in Warp mode, where the session's frame is in document space and the
+    /// warp maps it.
     pub fn doc_map(&self) -> Option<DocMap> {
+        if self.session.warp().is_some() {
+            return None;
+        }
         let p = self.placed.as_ref()?;
         let s = self.session.homography()?;
         let [a, b, c] = [s.row(0), s.row(1), s.row(2)];

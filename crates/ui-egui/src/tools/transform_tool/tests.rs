@@ -2283,3 +2283,56 @@ fn scaling_a_reopened_smart_object_box_keeps_its_rotation() {
         assert!((got.0 - want[0]).abs() < 1e-6 && (got.1 - want[1]).abs() < 1e-6, "{corner:?} lands on {got:?}, not {want:?}");
     }
 }
+
+/// Entering Warp from a smart object's box keeps the session's undo steps: the mesh starts where the box had
+/// carried the layer, Undo leaves Warp for the box as it was and then takes back the scale made before it, and
+/// leaving Warp returns to that box too.
+#[test]
+fn entering_warp_keeps_a_smart_object_box_edits_to_undo() {
+    let mut app = turned_smart_object();
+    let ctx = app.ctx().clone();
+    begin(&mut app, &ctx).unwrap();
+    let (source, opened) = (rect_of(open(&app)), quad_of(open(&app)));
+    scale_box(&mut app, 2.0, 2.0);
+    settle(&mut app);
+    let scaled = quad_of(open(&app));
+    let (frame, map) = (open(&app).placed.unwrap().frame, open(&app).doc_map().unwrap());
+    enter_warp(&mut app, &ctx);
+    settle(&mut app);
+    for at in BoxState::from_rect(frame).quad {
+        let (got, want) = (session_warp(&app).warp.map(at.x, at.y), map.apply(at));
+        assert!((got.0 - want.x).abs() < 1e-6 && (got.1 - want.y).abs() < 1e-6, "the mesh follows the scaled box: {got:?} vs {want:?}");
+    }
+    let _ = intercept(&mut app, "edit.undo");
+    let t = open(&app);
+    assert!(t.session.warp().is_none(), "Undo left Warp");
+    assert_eq!((rect_of(t), quad_of(t)), (source, scaled), "the scaled box over the object");
+    let _ = intercept(&mut app, "edit.undo");
+    assert_eq!(quad_of(open(&app)), opened, "the scale is taken back");
+    assert!(open(&app).untouched());
+    let _ = intercept(&mut app, "edit.redo");
+    let _ = intercept(&mut app, "edit.redo");
+    assert!(open(&app).session.warp().is_some(), "Redo reaches Warp again");
+    leave_warp(&mut app);
+    let t = open(&app);
+    assert_eq!((rect_of(t), quad_of(t)), (source, scaled), "leaving Warp gives back the turned box");
+    assert!(t.doc_map().is_some());
+}
+
+/// Under a perspective placement the reopened box's reference point is where the contents' centre lands, not
+/// the average of the box's corners.
+#[test]
+fn a_perspective_smart_object_box_pivots_on_its_mapped_centre() {
+    let mut app = app_with_square(64, photocraft_geom::Rect::new(8, 8, 24, 24));
+    app.session.execute("layer.smartObjects.convertToSmartObject", json!({})).unwrap();
+    app.session.execute("edit.transform", json!({"quad": [[8, 8], [40, 16], [40, 32], [8, 40]]})).unwrap();
+    app.sync_views();
+    let ctx = app.ctx().clone();
+    begin(&mut app, &ctx).unwrap();
+    let t = open(&app);
+    let (s, pivot, q) = (rect_of(t), t.session.pivot(), quad_of(t));
+    let centre = photocraft_engine::smart_cmds::placement(&active_smart(&app)).apply((s[0] + s[2]) / 2.0, (s[1] + s[3]) / 2.0);
+    assert!((pivot.x - centre.0).abs() < 1e-6 && (pivot.y - centre.1).abs() < 1e-6, "{pivot:?} vs {centre:?}");
+    let average = q.iter().map(|p| p[0] / 4.0).sum::<f64>();
+    assert!((pivot.x - average).abs() > 1.0, "the placement is in perspective, so the corners' average is elsewhere");
+}
