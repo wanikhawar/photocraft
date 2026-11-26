@@ -90,27 +90,37 @@ fn push_and_settle(r: &mut StrokeRenderer, pre: &Surface, shadow: &mut Surface, 
     r.settle(pre, shadow, None, false, 1000, exclude).keys
 }
 
+fn group_of(key: &(i32, i32)) -> i32 {
+    key.0.div_euclid(SETTLE_GROUP)
+}
+
+/// Whether `a` and `b` read the same over `r`.
+fn same_in(a: &Surface, b: &Surface, r: Rect) -> bool {
+    (r.y0..r.y1).all(|y| (r.x0..r.x1).all(|x| a.rgba(x, y).map(f32::to_bits) == b.rgba(x, y).map(f32::to_bits)))
+}
+
 #[test]
 fn settle_waits_for_a_tile_to_be_calm_and_takes_its_whole_surface_tile() {
     let pre = pre();
     let mut shadow = pre.clone();
     let mut r = StrokeRenderer::new(&brush(json!({})), Some(pre.format()), 1.0);
-    // A stroke in the first surface tile, then the pen moves on into the third.
+    // A stroke in the first surface tile, then the pen moves on (its line crosses the second tile
+    // and ends in the third, where it stays).
     r.push(&[StrokePoint::new(60.0, 60.0, 1.0), StrokePoint::new(200.0, 60.0, 1.0)]);
     assert!(r.settle(&pre, &mut shadow, None, false, 1000, Rect::EMPTY).keys.is_empty(), "everything was touched by the only push");
+    assert!(push_and_settle(&mut r, &pre, &mut shadow, 700.0, Rect::EMPTY).is_empty(), "the push that drew the line just touched its tiles");
     let mut pushes = 0;
     let settled = loop {
         pushes += 1;
-        assert!(pushes <= CALM_PUSHES + 1, "the first tile never settled");
+        assert!(pushes <= CALM_PUSHES + 1, "the first tiles never settled");
         let keys = push_and_settle(&mut r, &pre, &mut shadow, 700.0 + f64::from(pushes as i32), Rect::EMPTY);
         if !keys.is_empty() {
             break keys;
         }
     };
     assert_eq!(pushes, CALM_PUSHES, "a tile settles once the latest pushes left it alone, not before");
-    assert!(settled.iter().all(|k| k.0.div_euclid(SETTLE_GROUP) == 0), "only the first surface tile's coverage settled");
-    let left = r.unsettled_keys();
-    assert!(left.iter().all(|k| k.0.div_euclid(SETTLE_GROUP) != 0), "a surface tile settles whole");
+    assert!(settled.iter().any(|k| group_of(k) == 0) && settled.iter().all(|k| group_of(k) < 2), "the tiles the pen left settled");
+    assert!(r.unsettled_keys().iter().all(|k| group_of(k) >= 2), "a surface tile settles whole");
     assert!(!same(&shadow, &pre), "the first tiles settled");
     assert_eq!(shadow.rgba(700, 60), pre.rgba(700, 60), "the head's did not");
 }
@@ -127,12 +137,14 @@ fn a_tile_that_is_still_changing_keeps_its_surface_tile_back() {
         assert!(keys.is_empty(), "the surface tile still changes");
     }
     assert!(same(&shadow, &pre));
-    // The tile the tail covers is kept back too, however calm.
+    // The tiles the tail covers are kept back too, however calm: the pen leaves for the far end.
+    let tail = Rect::new(0, 0, 256, 140);
+    push_and_settle(&mut r, &pre, &mut shadow, 700.0, tail);
     for i in 0..=CALM_PUSHES + 1 {
-        let keys = push_and_settle(&mut r, &pre, &mut shadow, 700.0 + f64::from(i as i32), Rect::new(0, 0, 256, 140));
-        assert!(keys.is_empty(), "an excluded tile settled");
+        let keys = push_and_settle(&mut r, &pre, &mut shadow, 701.0 + f64::from(i as i32), tail);
+        assert!(keys.iter().all(|k| group_of(k) != 0), "an excluded tile settled");
     }
-    assert!(same(&shadow, &pre));
+    assert!(same_in(&shadow, &pre, tail), "the excluded surface tile changed");
     let keys = push_and_settle(&mut r, &pre, &mut shadow, 710.0, Rect::EMPTY);
-    assert!(!keys.is_empty() && !same(&shadow, &pre), "it settles once nothing keeps it back");
+    assert!(keys.iter().any(|k| group_of(k) == 0) && !same_in(&shadow, &pre, tail), "it settles once nothing keeps it back");
 }
