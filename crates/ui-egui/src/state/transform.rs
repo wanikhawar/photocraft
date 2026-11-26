@@ -83,7 +83,7 @@ impl TransformWarp for SessionWarp {
 pub fn placed_state(quad: [[f64; 2]; 4]) -> BoxState {
     let points = quad.map(|[x, y]| Point::new(x, y));
     let mut state = BoxState::new(points, points[0]);
-    state.pivot = state.point_at(Anchor9::Center);
+    state.pivot = state.point_at(Anchor9::Centre);
     state
 }
 
