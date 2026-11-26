@@ -2293,9 +2293,12 @@ fn entering_warp_keeps_a_smart_object_box_edits_to_undo() {
     let ctx = app.ctx().clone();
     begin(&mut app, &ctx).unwrap();
     let (source, opened) = (rect_of(open(&app)), quad_of(open(&app)));
-    scale_box(&mut app, 2.0, 2.0);
+    // Scaled by a drag, its own undo step.
+    let target = open(&app).session.state().scaled_about_pivot(2.0, 2.0);
+    box_events(&mut app, 1, &[target]);
     settle(&mut app);
     let scaled = quad_of(open(&app));
+    assert_ne!(scaled, opened);
     let (frame, map) = (open(&app).placed.unwrap().frame, open(&app).doc_map().unwrap());
     enter_warp(&mut app, &ctx);
     settle(&mut app);
