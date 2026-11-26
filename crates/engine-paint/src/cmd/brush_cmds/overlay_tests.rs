@@ -29,13 +29,18 @@ fn same_pixels(a: &Surface, b: &Surface, r: Rect) -> bool {
 
 /// A white canvas with a textured, partly transparent layer on top, then `setup`.
 fn scene(depth: u64, setup: &dyn Fn(&mut Session)) -> Session {
+    scene_of(W, depth, setup)
+}
+
+/// [`scene`] `width` pixels wide.
+fn scene_of(width: i32, depth: u64, setup: &dyn Fn(&mut Session)) -> Session {
     let mut s = crate::session();
-    s.execute("file.new", json!({"width": W, "height": H, "depth": depth, "background": "white"})).unwrap();
+    s.execute("file.new", json!({"width": width, "height": H, "depth": depth, "background": "white"})).unwrap();
     s.execute("layer.new.layer", json!({})).unwrap();
     s.edit("texture", |doc, active| {
         let surf = doc.layer_mut(active.unwrap()).unwrap().surface_mut().unwrap();
         let fmt = surf.format();
-        let r = Rect::new(8, 8, 90, 64);
+        let r = Rect::new(8, 8, width - 30, 64);
         let mut data = Vec::new();
         for y in r.y0..r.y1 {
             for x in r.x0..r.x1 {
@@ -370,7 +375,6 @@ fn a_stroke_settled_along_the_way_commits_the_pixels_paint_stroke_renders() {
         ("erase", brush(json!({"erase": true}))),
         ("selection and lock", brush(json!({}))),
     ];
-    let mut backlog = false;
     for (name, mut p) in cases {
         let setup = |s: &mut Session| {
             if name == "selection and lock" {
@@ -390,7 +394,7 @@ fn a_stroke_settled_along_the_way_commits_the_pixels_paint_stroke_renders() {
             for (n, pt) in pts[1..].iter().enumerate() {
                 live.push(&points(std::slice::from_ref(pt))).unwrap();
                 if n % every == 0 {
-                    backlog |= live.settle(max);
+                    live.settle(max);
                 }
             }
             let seed = live.seed;
@@ -408,7 +412,6 @@ fn a_stroke_settled_along_the_way_commits_the_pixels_paint_stroke_renders() {
             );
         }
     }
-    assert!(backlog, "settle never left a tile for later, so the test did not settle partway");
 }
 
 #[test]
@@ -419,4 +422,117 @@ fn a_stroke_that_is_not_an_overlay_has_nothing_to_settle() {
     let mut live = LiveStroke::begin_overlay(&s, "paint.stroke", &p).unwrap();
     assert!(!live.is_overlay());
     assert!(!live.settle(16));
+}
+
+/// Draws a stroke that goes right across a wide document and back over its settled tiles, settling
+/// after every push, then checks the live doc against the commit.
+struct Settling {
+    live: LiveStroke,
+    p: Value,
+    pts: Vec<[f64; 3]>,
+    /// The most coverage tiles that were settled at once.
+    most_settled: usize,
+    /// A push took a settled tile back.
+    reopened: bool,
+}
+
+const WIDE: i32 = 1500;
+
+type Build = Box<dyn Fn() -> Session>;
+
+/// The wide scene, then `setup`.
+fn wide(setup: Tweak) -> Build {
+    Box::new(move || scene_of(WIDE, 8, &*setup))
+}
+
+/// A zigzag that crosses the wide document, comes back over its settled tiles and goes forward
+/// again, ending short of the far side.
+fn zigzag() -> Vec<[f64; 3]> {
+    let x = |i: i32| match i {
+        0..=66 => 12.0 + 22.2 * f64::from(i),
+        67..=100 => 1478.0 - 22.0 * f64::from(i - 66),
+        _ => 730.0 + 10.7 * f64::from(i - 100),
+    };
+    (0..131).map(|i| [x(i), 38.0 + 22.0 * (f64::from(i) / 3.0).sin(), 0.5 + 0.5 * f64::from((i * 3) % 5) / 4.0]).collect()
+}
+
+fn settling(build: &dyn Fn() -> Session, mut p: Value) -> Settling {
+    let pts = zigzag();
+    p["points"] = json!([pts[0]]);
+    let live = LiveStroke::begin_overlay(&build(), "paint.stroke", &p).unwrap();
+    assert!(live.is_overlay());
+    Settling { live, p, pts, most_settled: 0, reopened: false }
+}
+
+impl Settling {
+    /// Pushes point `k`, then settles what is ready.
+    fn step(&mut self, k: usize) {
+        let before = self.live.settled.len();
+        self.live.push(&points(&self.pts[k..=k])).unwrap();
+        self.reopened |= self.live.settled.len() < before;
+        for _ in 0..64 {
+            if !self.live.settle(16) {
+                break;
+            }
+        }
+        self.most_settled = self.most_settled.max(self.live.settled.len());
+    }
+
+    /// What committing the first `n` points on a fresh scene gives.
+    fn committed(&self, build: &dyn Fn() -> Session, n: usize) -> Session {
+        let mut c = build();
+        let mut q = self.p.clone();
+        q["points"] = json!(&self.pts[..n]);
+        q["seed"] = json!(self.live.seed);
+        c.execute("paint.stroke", q).unwrap();
+        c
+    }
+}
+
+#[test]
+fn the_overlay_shows_what_the_commit_writes_with_settling_interleaved() {
+    let size = json!({"size": 22, "hardness": 0.3, "flow": 0.6});
+    let dual = json!({"size": 22, "hardness": 0.3, "flow": 0.6, "dualBrush": {"enabled": true, "size": 9, "spacing": 0.4}});
+    let cases: Vec<(&str, Build, Value)> = vec![
+        ("plain", wide(t(|_| ())), brush(json!({"brush": size.clone()}))),
+        ("smoothing", wide(t(|_| ())), brush(json!({"brush": size.clone(), "smoothing": 0.7}))),
+        ("dual brush", wide(t(|_| ())), brush(json!({"brush": dual}))),
+        ("erase", wide(t(|_| ())), brush(json!({"brush": size.clone(), "erase": true}))),
+        (
+            "selection and lock",
+            wide(t(|s| {
+                s.execute("select.rect", json!({"x": 100, "y": 10, "width": 600, "height": 50})).unwrap();
+                tweak(s, |l| l.locks.transparency = true);
+            })),
+            brush(json!({"brush": size.clone()})),
+        ),
+        ("group", wide(t(|s| tweak(s, |l| l.opacity = 0.6))), brush(json!({"brush": size.clone()}))),
+        ("group, erase", wide(t(|s| tweak(s, |l| l.fill_opacity = 0.6))), brush(json!({"brush": size, "erase": true}))),
+    ];
+    for (name, build, p) in cases {
+        let mut run = settling(&*build, p);
+        let n = run.pts.len();
+        for k in 1..n {
+            run.step(k);
+            if k % 26 == 0 || k == n - 1 {
+                let c = run.committed(&*build, k + 1);
+                let d = worst(&flat(&run.live.doc), &flat(&c.active().unwrap().doc));
+                assert!(d <= TOLERANCE, "{name}: after {} points the preview differs from a commit by {d}", k + 1);
+            }
+        }
+        assert!(run.most_settled > 0, "{name}: nothing was settled while drawing");
+        assert!(run.reopened, "{name}: the stroke never went back over a settled tile");
+        // The commit is what `paint.stroke` renders, and shares the settled tiles with the doc.
+        let fresh = run.committed(&*build, n);
+        let id = run.live.layer.unwrap();
+        let shown = run.live.doc.layer(id).unwrap().surface().unwrap().clone();
+        let pre = run.live.pre.clone();
+        let commit = run.live.into_commit().unwrap();
+        let all = Rect::new(0, 0, WIDE, H);
+        assert!(same_pixels(&commit.surface, &surface(&fresh), all), "{name}: settling changed the commit's pixels");
+        let changed: Vec<_> = all.tiles().filter(|&c| commit.surface.tile(c).zip(pre.tile(c)).is_some_and(|(a, b)| !std::sync::Arc::ptr_eq(a, b))).collect();
+        let shared = changed.iter().filter(|&&c| commit.surface.tile(c).zip(shown.tile(c)).is_some_and(|(a, b)| std::sync::Arc::ptr_eq(a, b))).count();
+        assert!(!changed.is_empty(), "{name}: the stroke changed no tile");
+        assert!(shared * 2 > changed.len(), "{name}: only {shared} of {} stroke tiles were on show before the commit", changed.len());
+    }
 }

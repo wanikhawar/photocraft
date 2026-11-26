@@ -11,7 +11,9 @@ use photocraft_geom::Rect;
 use photocraft_paint::mixer::MixerSettings;
 use photocraft_paint::replace::{Limits, ReplaceMode, ReplaceSettings, Sampling, apply_color_replacement, color_replacement_effect};
 use photocraft_paint::tile::PREVIEW_SIDE;
-use photocraft_paint::{BrushPreset, BrushSettings, Pattern, PresetCaptures, StoredTile, Stroke, StrokePoint, StrokeRenderer, TipShape, render_stroke_clipped};
+use photocraft_paint::{
+    BrushPreset, BrushSettings, COV_TILE, Pattern, PresetCaptures, StoredTile, Stroke, StrokePoint, StrokeRenderer, TipShape, render_stroke_clipped,
+};
 // The sampled-tip tile type, which the tests build tips from.
 #[cfg(test)]
 use photocraft_paint::GrayTile;
@@ -627,8 +629,16 @@ pub struct LiveStroke {
     overlay: Option<Overlay>,
     /// An overlay stroke's pixels as far as they are composited: `pre` with the coverage tiles
     /// that [`settle`](Self::settle) has blended in, which the commit completes (see
-    /// [`into_commit`](Self::into_commit)).
+    /// [`into_commit`](Self::into_commit)). The doc's target layer holds these pixels (the same
+    /// tiles), so a renderer that keeps the tiles it has seen takes the commit's pixels as it has
+    /// them already.
+    ///
+    /// Kept after every `push` and `settle`: the shadow is `pre` plus exactly the coverage tiles
+    /// in `settled`, and the mask holds the "no stroke" value over those tiles, so the doc shows
+    /// the stroke once everywhere: the settled tiles as pixels, the rest through the mask.
     shadow: Option<Surface>,
+    /// The coverage tiles (`COV_TILE` squares) composited into `shadow`.
+    settled: std::collections::HashSet<(i32, i32)>,
 }
 
 /// Where a live stroke that is shown as a masked layer keeps its mask.
@@ -639,6 +649,9 @@ struct Overlay {
     mask_layer: Vec<usize>,
     /// The mask holds what stays (1 minus the stroke), as the eraser's does.
     invert: bool,
+    /// Path of the target layer in `LiveStroke::doc` (inside the group that replaces it, when
+    /// there is one).
+    target: Vec<usize>,
 }
 
 pub use photocraft_engine_core::LiveCommit;
@@ -801,6 +814,7 @@ impl LiveStroke {
             base,
             overlay: None,
             shadow: None,
+            settled: std::collections::HashSet::new(),
         };
         if let Some(path) = overlay_at {
             live.enter_overlay(&path, paint, erase, fmt);
@@ -832,17 +846,40 @@ impl LiveStroke {
         Ok(LiveCommit { mixer: None, cmd: self.cmd, base: self.base, params: self.params, seed: Some(self.seed), points: self.points, surface, bounds })
     }
 
-    /// Composite up to `max_tiles` of what the stroke has drawn into the pixels the commit will
-    /// take, so [`into_commit`](Self::into_commit) has little left to do on release: work for a
-    /// moment when no points are waiting. It leaves the tiles the latest `push` touched, which
-    /// the next push is likely to change again, and never changes the doc. Returns whether
-    /// more is left to settle. A stroke that is not an overlay has nothing to settle (its doc
-    /// already holds the pixels).
+    /// Composite what the stroke has drawn into the pixels the commit will take, whole surface
+    /// tiles at a time up to about `max_tiles` coverage tiles, and show those pixels in the doc in
+    /// place of the mask's strength, so release has little left to do and a GPU has the tiles
+    /// already: work for a moment when no points are waiting. It leaves the tiles the latest
+    /// pushes touched, which the next push is likely to change again, and the smoothing tail.
+    /// Returns whether more is ready to settle. A stroke that is not an overlay has nothing to
+    /// settle (its doc already holds the pixels).
     pub fn settle(&mut self, max_tiles: usize) -> bool {
-        let Some(shadow) = self.shadow.as_mut() else { return false };
+        let (Some(shadow), Some(overlay)) = (self.shadow.as_mut(), self.overlay.as_ref()) else { return false };
         let cmyk = self.cmyk.clone();
-        let (renderer, pre, sel, lock) = (&mut self.renderer, &self.pre, self.sel.as_ref(), self.lock);
-        photocraft_color::convert::with_cmyk_space(cmyk.as_ref(), || renderer.settle(pre, shadow, sel, lock, max_tiles)) > 0
+        let (renderer, pre, sel, lock, tail) = (&mut self.renderer, &self.pre, self.sel.as_ref(), self.lock, self.tail);
+        let batch = photocraft_color::convert::with_cmyk_space(cmyk.as_ref(), || renderer.settle(pre, shadow, sel, lock, max_tiles, tail));
+        if batch.keys.is_empty() {
+            return batch.more;
+        }
+        let doc = std::sync::Arc::make_mut(&mut self.doc);
+        if let Some(mask) = doc.layer_at_mut(&overlay.mask_layer).and_then(|l| l.mask.as_mut()) {
+            let (base, bounds) = (if overlay.invert { 1.0 } else { 0.0 }, renderer.bounds());
+            for &(tx, ty) in &batch.keys {
+                let tile = Rect::new(tx * COV_TILE, ty * COV_TILE, (tx + 1) * COV_TILE, (ty + 1) * COV_TILE);
+                mask.surface.fill_rect(tile.intersect(&bounds), &[base]);
+            }
+        }
+        self.settled.extend(batch.keys);
+        self.show_shadow();
+        batch.more
+    }
+
+    /// Make the doc's target layer hold the shadow's pixels (see `shadow`).
+    fn show_shadow(&mut self) {
+        let (Some(shadow), Some(overlay)) = (self.shadow.as_ref(), self.overlay.as_ref()) else { return };
+        if let Some(surf) = std::sync::Arc::make_mut(&mut self.doc).layer_at_mut(&overlay.target).and_then(|l| l.surface_mut()) {
+            *surf = shadow.clone();
+        }
     }
 
     /// Whether the doc shows the stroke as a masked colour layer ([`begin_overlay`](Self::begin_overlay))
@@ -890,14 +927,14 @@ impl LiveStroke {
         if plain {
             if erase {
                 target.mask = Some(mask(1.0));
-                self.overlay = Some(Overlay { mask_layer: path.to_vec(), invert: true });
+                self.overlay = Some(Overlay { mask_layer: path.to_vec(), invert: true, target: path.to_vec() });
             } else {
                 let (id, visible) = (target.id, target.visible);
                 let Some((&at, parent)) = path.split_last() else { return };
                 let mut mask_layer = parent.to_vec();
                 mask_layer.push(at + 1);
                 doc.insert_above(Some(id), stroke_layer(visible, self.lock));
-                self.overlay = Some(Overlay { mask_layer, invert: false });
+                self.overlay = Some(Overlay { mask_layer, invert: false, target: path.to_vec() });
             }
             return;
         }
@@ -908,6 +945,8 @@ impl LiveStroke {
         inner.fill_opacity = 1.0;
         inner.mask = None;
         let mut mask_layer = path.to_vec();
+        let mut inner_path = path.to_vec();
+        inner_path.push(0);
         let children = if erase {
             inner.mask = Some(mask(1.0));
             mask_layer.push(0);
@@ -923,7 +962,7 @@ impl LiveStroke {
         group.label = original.label;
         group.mask = original.mask;
         *target = group;
-        self.overlay = Some(Overlay { mask_layer, invert: erase });
+        self.overlay = Some(Overlay { mask_layer, invert: erase, target: inner_path });
     }
 
     /// What an overlay stroke has touched, for a canvas that must redraw it from the committed
@@ -972,8 +1011,21 @@ impl LiveStroke {
                 let Some(mask) = std::sync::Arc::make_mut(&mut self.doc).layer_at_mut(&overlay.mask_layer).and_then(|l| l.mask.as_mut()) else {
                     return Err(EngineError::Other("the live stroke's mask is gone".into()));
                 };
-                let (dmg, tail) = self.renderer.composite_live_mask(old, self.sel.as_ref(), &mut mask.surface, overlay.invert);
+                let (dmg, tail, reopened) = self.renderer.composite_live_mask_settled(old, self.sel.as_ref(), &mut mask.surface, overlay.invert, &self.settled);
                 self.tail = tail;
+                if !reopened.is_empty() {
+                    // The mask shows these tiles again (it was just rewritten there): take their
+                    // pixels back to the pre-stroke ones, so the stroke shows once.
+                    let bounds = self.renderer.bounds();
+                    if let Some(shadow) = self.shadow.as_mut() {
+                        for &(tx, ty) in &reopened {
+                            let tile = Rect::new(tx * COV_TILE, ty * COV_TILE, (tx + 1) * COV_TILE, (ty + 1) * COV_TILE).intersect(&bounds);
+                            shadow.write_region(tile, &self.pre.read_region(tile));
+                            self.settled.remove(&(tx, ty));
+                        }
+                    }
+                    self.show_shadow();
+                }
                 return Ok(dmg);
             }
             let (surf, _) = crate::channel_cmds::target_surface(std::sync::Arc::make_mut(&mut self.doc), self.layer, &self.params)?;

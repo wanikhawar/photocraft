@@ -291,7 +291,7 @@ impl EngineStroke {
     }
     /// Composite up to `max_tiles` of what the stroke has drawn ahead of its commit (see
     /// `LiveStroke::settle`); whether more is left. Only the Brush's overlay has anything to
-    /// settle. It changes nothing the canvas shows.
+    /// settle. It changes nothing the canvas shows; the canvas takes the settled pixels with the next step.
     pub(super) fn settle(&mut self, max_tiles: usize) -> bool {
         match self {
             Self::Brush(s) => s.settle(max_tiles),

@@ -4,7 +4,7 @@
 use super::*;
 use serde_json::json;
 
-const W: i32 = 320;
+const W: i32 = 800;
 const H: i32 = 140;
 
 fn brush(extra: serde_json::Value) -> BrushSettings {
@@ -28,7 +28,7 @@ fn pre() -> Surface {
 }
 
 fn path() -> Vec<StrokePoint> {
-    (0..48).map(|i| StrokePoint::new(30.0 + 5.6 * f64::from(i), 70.0 + 30.0 * (f64::from(i) / 7.0).sin(), 0.4 + 0.6 * ((i * 5) % 7) as f32 / 6.0)).collect()
+    (0..80).map(|i| StrokePoint::new(30.0 + 9.4 * f64::from(i), 70.0 + 30.0 * (f64::from(i) / 7.0).sin(), 0.4 + 0.6 * ((i * 5) % 7) as f32 / 6.0)).collect()
 }
 
 fn same(a: &Surface, b: &Surface) -> bool {
@@ -45,10 +45,10 @@ fn check(name: &str, b: &BrushSettings, every: usize, max: usize, lock: bool, se
     for (i, p) in path().iter().enumerate() {
         r.push(std::slice::from_ref(p));
         if i % every == 0 {
-            let before = r.unsettled_keys(false).len();
-            let left = r.settle(&pre, &mut shadow, selection, lock, max);
-            early += before - left;
-            assert!(before - left <= max, "{name}: settled {} tiles for a limit of {max}", before - left);
+            let batch = r.settle(&pre, &mut shadow, selection, lock, max, Rect::EMPTY);
+            early += batch.keys.len();
+            // A surface tile's coverage tiles go together, so the last one may pass the limit.
+            assert!(batch.keys.len() < max + (SETTLE_GROUP * SETTLE_GROUP) as usize, "{name}: settled {} tiles for a limit of {max}", batch.keys.len());
         }
     }
     let mut whole = StrokeRenderer::new(b, Some(pre.format()), 1.0);
@@ -59,7 +59,7 @@ fn check(name: &str, b: &BrushSettings, every: usize, max: usize, lock: bool, se
     r.finish();
     r.settle_all(&pre, &mut shadow, selection, lock);
     assert!(same(&shadow, &expected), "{name}: the settled stroke differs from one composite");
-    assert!(r.unsettled_keys(true).is_empty(), "{name}: tiles left unsettled");
+    assert!(r.unsettled_keys().is_empty(), "{name}: tiles left unsettled");
     early
 }
 
@@ -84,19 +84,55 @@ fn a_stroke_settled_along_the_way_equals_one_composite() {
     }
 }
 
+/// Pushes a point at (`x`, 60) and settles, giving the tiles settled.
+fn push_and_settle(r: &mut StrokeRenderer, pre: &Surface, shadow: &mut Surface, x: f64, exclude: Rect) -> Vec<(i32, i32)> {
+    r.push(&[StrokePoint::new(x, 60.0, 1.0)]);
+    r.settle(pre, shadow, None, false, 1000, exclude).keys
+}
+
 #[test]
-fn settle_leaves_the_tiles_the_latest_push_touched() {
+fn settle_waits_for_a_tile_to_be_calm_and_takes_its_whole_surface_tile() {
     let pre = pre();
     let mut shadow = pre.clone();
-    let b = brush(json!({}));
-    let mut r = StrokeRenderer::new(&b, Some(pre.format()), 1.0);
-    r.push(&[StrokePoint::new(60.0, 60.0, 1.0), StrokePoint::new(110.0, 60.0, 1.0)]);
-    assert_eq!(r.settle(&pre, &mut shadow, None, false, 1000), 0);
-    assert!(same(&shadow, &pre), "everything was touched by the only push");
-    r.push(&[StrokePoint::new(240.0, 100.0, 1.0)]);
-    let left = r.settle(&pre, &mut shadow, None, false, 1);
-    assert!(left > 0, "more than one tile was left from the first push");
-    r.settle(&pre, &mut shadow, None, false, 1000);
-    assert!(!same(&shadow, &pre), "the first push's tiles settled");
-    assert_eq!(shadow.rgba(240, 100), pre.rgba(240, 100), "the latest push's tiles did not");
+    let mut r = StrokeRenderer::new(&brush(json!({})), Some(pre.format()), 1.0);
+    // A stroke in the first surface tile, then the pen moves on into the third.
+    r.push(&[StrokePoint::new(60.0, 60.0, 1.0), StrokePoint::new(200.0, 60.0, 1.0)]);
+    assert!(r.settle(&pre, &mut shadow, None, false, 1000, Rect::EMPTY).keys.is_empty(), "everything was touched by the only push");
+    let mut pushes = 0;
+    let settled = loop {
+        pushes += 1;
+        assert!(pushes <= CALM_PUSHES + 1, "the first tile never settled");
+        let keys = push_and_settle(&mut r, &pre, &mut shadow, 700.0 + f64::from(pushes as i32), Rect::EMPTY);
+        if !keys.is_empty() {
+            break keys;
+        }
+    };
+    assert_eq!(pushes, CALM_PUSHES, "a tile settles once the latest pushes left it alone, not before");
+    assert!(settled.iter().all(|k| k.0.div_euclid(SETTLE_GROUP) == 0), "only the first surface tile's coverage settled");
+    let left = r.unsettled_keys();
+    assert!(left.iter().all(|k| k.0.div_euclid(SETTLE_GROUP) != 0), "a surface tile settles whole");
+    assert!(!same(&shadow, &pre), "the first tiles settled");
+    assert_eq!(shadow.rgba(700, 60), pre.rgba(700, 60), "the head's did not");
+}
+
+#[test]
+fn a_tile_that_is_still_changing_keeps_its_surface_tile_back() {
+    let pre = pre();
+    let mut shadow = pre.clone();
+    let mut r = StrokeRenderer::new(&brush(json!({})), Some(pre.format()), 1.0);
+    r.push(&[StrokePoint::new(60.0, 60.0, 1.0)]);
+    // The pen stays in the same surface tile, a coverage tile or two on.
+    for i in 0..=CALM_PUSHES + 1 {
+        let keys = push_and_settle(&mut r, &pre, &mut shadow, 200.0 + f64::from(i as i32), Rect::EMPTY);
+        assert!(keys.is_empty(), "the surface tile still changes");
+    }
+    assert!(same(&shadow, &pre));
+    // The tile the tail covers is kept back too, however calm.
+    for i in 0..=CALM_PUSHES + 1 {
+        let keys = push_and_settle(&mut r, &pre, &mut shadow, 700.0 + f64::from(i as i32), Rect::new(0, 0, 256, 140));
+        assert!(keys.is_empty(), "an excluded tile settled");
+    }
+    assert!(same(&shadow, &pre));
+    let keys = push_and_settle(&mut r, &pre, &mut shadow, 710.0, Rect::EMPTY);
+    assert!(!keys.is_empty() && !same(&shadow, &pre), "it settles once nothing keeps it back");
 }

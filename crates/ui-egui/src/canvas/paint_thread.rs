@@ -5,8 +5,10 @@
 //!
 //! While no points are waiting, the thread also settles the stroke (`EngineStroke::settle`): it
 //! composites what the stroke has drawn into the pixels the commit will take, a few tiles at a
-//! time, so that releasing the pen has little left to do. Settling shows nothing and is never
-//! work for the canvas; new points always go first.
+//! time, so that releasing the pen has little left to do. Settled pixels replace the stroke's mask
+//! in the stroke's own copy of the document (`LiveStroke::settle`), which the canvas takes with the
+//! next step: settling draws nothing new and is never work for the canvas; new points always go
+//! first.
 //!
 //! Each step is the stroke's own copy of the document, as when it painted on the UI thread, so the
 //! canvas shows and refreshes it the same way (`LiveStroke::since`).

@@ -69,8 +69,13 @@ fn points(v: &[[f64; 3]]) -> Vec<StrokePoint> {
     v.iter().map(|q| StrokePoint::new(q[0], q[1], q[2] as f32)).collect()
 }
 
-fn overlay_doc(build: &dyn Fn() -> Session, extra: Value) -> (std::sync::Arc<Document>, Session) {
+/// The overlay document of `PTS` drawn as the canvas draws it, and the committed document. With
+/// `settle`, the stroke is calmed and settled after its last step, so most of its pixels are in
+/// the target layer, as they are mid-stroke once the pen has moved on.
+fn overlay_doc(build: &dyn Fn() -> Session, extra: Value, settle: bool) -> (std::sync::Arc<Document>, Session) {
     let s = build();
+    let target = s.active().unwrap().active_layer.unwrap();
+    let before = s.active().unwrap().doc.layer(target).unwrap().surface().unwrap().clone();
     let mut p = json!({"brush": {"size": 22, "hardness": 0.3, "flow": 0.6}, "color": "#d02060", "opacity": 0.8, "smoothing": 0.0, "target": "pixels", "points": [PTS[0]]});
     for (k, v) in extra.as_object().unwrap() {
         p[k] = v.clone();
@@ -79,6 +84,17 @@ fn overlay_doc(build: &dyn Fn() -> Session, extra: Value) -> (std::sync::Arc<Doc
     assert!(live.is_overlay());
     for c in PTS[1..].chunks(2) {
         live.push(&points(c)).unwrap();
+    }
+    if settle {
+        // Steps without points leave every tile calm.
+        for _ in 0..8 {
+            live.push(&[]).unwrap();
+        }
+        while live.settle(16) {}
+        let shown = live.doc.layer(target).unwrap().surface().unwrap();
+        let rewritten =
+            Rect::new(0, 0, W, H).tiles().filter(|&c| shown.tile(c).zip(before.tile(c)).is_some_and(|(a, b)| !std::sync::Arc::ptr_eq(a, b))).count();
+        assert!(rewritten > 0, "settling put no stroke pixels in the target");
     }
     let mut committed = build();
     p["points"] = json!(PTS);
@@ -144,17 +160,24 @@ fn the_gpu_draws_the_overlay_as_the_committed_stroke() {
         ("Multiply, lock transparency", 8, multiply(), json!({})),
     ];
     for (name, depth, setup, extra) in cases {
-        let (live, committed) = overlay_doc(&|| scene(depth, &*setup), extra);
-        let grouped = live.walk().iter().any(|(_, _, l)| l.is_group());
-        assert_eq!(
-            grouped,
-            !matches!(name, "plain Normal" | "plain Normal, 16-bit" | "lock transparency" | "lock transparency, 16-bit" | "erase" | "erase, 16-bit"),
-            "{name}: the overlay's shape"
-        );
-        let cpu = photocraft_compose::flatten(&committed.active().unwrap().doc);
-        let gpu = photocraft_gpu::render_to_vec(&mut comp, ctx.device(), ctx.queue(), &live, live.bounds()).unwrap_or_else(|e| panic!("{name}: {e:?}"));
-        let d = worst(&cpu.px, &gpu);
-        eprintln!("overlay GPU vs committed CPU, {name}: worst difference {:.2}/255", d * 255.0);
-        assert!(d <= TOLERANCE, "{name}: the GPU and the committed CPU flatten differ by {:.2}/255", d * 255.0);
+        for settle in [false, true] {
+            let label = if settle { format!("{name}, settled") } else { name.to_string() };
+            let name = label.as_str();
+            let (live, committed) = overlay_doc(&|| scene(depth, &*setup), extra.clone(), settle);
+            let grouped = live.walk().iter().any(|(_, _, l)| l.is_group());
+            assert_eq!(
+                grouped,
+                !matches!(
+                    name.trim_end_matches(", settled"),
+                    "plain Normal" | "plain Normal, 16-bit" | "lock transparency" | "lock transparency, 16-bit" | "erase" | "erase, 16-bit"
+                ),
+                "{name}: the overlay's shape"
+            );
+            let cpu = photocraft_compose::flatten(&committed.active().unwrap().doc);
+            let gpu = photocraft_gpu::render_to_vec(&mut comp, ctx.device(), ctx.queue(), &live, live.bounds()).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let d = worst(&cpu.px, &gpu);
+            eprintln!("overlay GPU vs committed CPU, {name}: worst difference {:.2}/255", d * 255.0);
+            assert!(d <= TOLERANCE, "{name}: the GPU and the committed CPU flatten differ by {:.2}/255", d * 255.0);
+        }
     }
 }
