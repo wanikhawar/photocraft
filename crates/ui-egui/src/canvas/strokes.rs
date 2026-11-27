@@ -297,6 +297,16 @@ impl EngineStroke {
             Self::Mixer(s) => s.push(pts),
         }
     }
+    /// Composites up to `max_tiles` tiles of the stroke that went calm ahead of the commit (see
+    /// `LiveStroke::settle`). Only the brush engine's overlay strokes
+    /// settle. It changes nothing the canvas shows. `true` when the batch was full, so more calm
+    /// tiles may be waiting; `false` when no tile is calm now (that changes only with more points).
+    pub(super) fn settle(&mut self, max_tiles: usize) -> bool {
+        match self {
+            Self::Brush(s) => s.settle(photocraft_engine::brush_cmds::SETTLE_CALM_PUSHES, max_tiles) >= max_tiles,
+            Self::Retouch(_) | Self::Dab(_) | Self::Mixer(_) => false,
+        }
+    }
     /// The jitter seed the commit must reuse (the Clone Stamp's comes from the session brush).
     fn seed(&self) -> Option<u64> {
         match self {

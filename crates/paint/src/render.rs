@@ -785,6 +785,22 @@ pub struct StrokeRenderer {
     dual_area_left: u64,
     /// A dab was left out for want of budget.
     refused: bool,
+    /// Settle tracking ([`track_settling`](StrokeRenderer::track_settling)); `None` when off.
+    settle: Option<SettleState>,
+}
+
+/// The coverage and Dual Brush dirty sets set aside during one push (see
+/// [`StrokeRenderer::note_unsettled`]).
+type HeldDirty = (HashSet<(i32, i32)>, HashSet<(i32, i32)>);
+
+/// Which coverage tiles changed since they were last composited ahead (see
+/// [`StrokeRenderer::settle`]). Time is counted in pushes.
+#[derive(Clone, Debug, Default)]
+struct SettleState {
+    /// Pushes (and the finish) so far.
+    epoch: u64,
+    /// Coverage tiles changed since they were last settled, with the epoch of their latest change.
+    unsettled: FxHashMap<(i32, i32), u64>,
 }
 
 /// Most dab-rectangle pixels one stroke rasterizes: past it the stroke stops painting, so a very
@@ -941,6 +957,7 @@ impl StrokeRenderer {
                         area_left: p.area_left,
                         dual_area_left: p.dual_area_left,
                         refused: p.refused,
+                        settle: None,
                     })
                 }
                 Some(m) => {
@@ -997,6 +1014,7 @@ impl StrokeRenderer {
             area_left: MAX_STROKE_DAB_AREA,
             dual_area_left: MAX_STROKE_DAB_AREA,
             refused: false,
+            settle: None,
         }
     }
 
@@ -1094,14 +1112,101 @@ impl StrokeRenderer {
 
     /// Feed input points (any chunking gives the same result).
     pub fn push(&mut self, pts: &[StrokePoint]) {
+        self.next_settle_epoch();
+        let held = self.hold_dirty();
         self.generator.push(pts, &mut self.dab_buf, &mut self.dual_buf);
         self.raster_pending();
+        self.note_unsettled(held);
     }
 
     /// End of stroke (smoothing catch-up, a lone first point).
     pub fn finish(&mut self) {
+        self.next_settle_epoch();
+        let held = self.hold_dirty();
         self.generator.finish(&mut self.dab_buf, &mut self.dual_buf);
         self.raster_pending();
+        self.note_unsettled(held);
+    }
+
+    /// Keep track of which coverage tiles changed since they were last composited ahead, for
+    /// [`settle`](Self::settle) and [`settle_all`](Self::settle_all).
+    pub fn track_settling(&mut self) {
+        self.settle = Some(SettleState::default());
+    }
+
+    fn next_settle_epoch(&mut self) {
+        if let Some(s) = self.settle.as_mut() {
+            s.epoch += 1;
+        }
+    }
+
+    /// Sets the changed-tile sets aside while tracking settling, so that after the rasterising
+    /// that follows they hold just the tiles it changed ([`note_unsettled`](Self::note_unsettled)).
+    fn hold_dirty(&mut self) -> Option<HeldDirty> {
+        self.settle.as_ref()?;
+        let dual = self.dual.as_mut().map(|d| std::mem::take(&mut d.dirty)).unwrap_or_default();
+        Some((std::mem::take(&mut self.cov.dirty), dual))
+    }
+
+    /// Notes every tile the last rasterising changed as unsettled, at the current epoch, and gives
+    /// back the sets `held` took. The live preview drains the dirty sets on its own.
+    fn note_unsettled(&mut self, held: Option<HeldDirty>) {
+        let (Some(s), Some((cov, dual))) = (self.settle.as_mut(), held) else { return };
+        let epoch = s.epoch;
+        for &k in &self.cov.dirty {
+            s.unsettled.insert(k, epoch);
+        }
+        if let Some(d) = self.dual.as_mut() {
+            for &k in &d.dirty {
+                if self.cov.tiles.contains_key(&tile_key(k)) {
+                    s.unsettled.insert(k, epoch);
+                }
+            }
+            d.dirty.extend(dual);
+        }
+        self.cov.dirty.extend(cov);
+    }
+
+    /// How many coverage tiles changed since they were last settled.
+    pub fn unsettled_count(&self) -> usize {
+        self.settle.as_ref().map_or(0, |s| s.unsettled.len())
+    }
+
+    /// Composites onto `target` (which starts as `pre`) up to `max_tiles` coverage tiles that have
+    /// not changed for the last `calm` pushes, so that the end of the stroke has fewer left
+    /// ([`settle_all`](Self::settle_all)). A tile counts as calm once `calm` pushes have passed
+    /// without changing it: a tile under the moving brush changes again at once, so compositing it
+    /// early is wasted work. The pixels are those of [`composite`](Self::composite), as each tile
+    /// composites on its own from `pre` and its coverage. Returns how many tiles it composited; 0
+    /// when not tracking.
+    pub fn settle(&mut self, pre: &Surface, target: &mut Surface, selection: Option<&Surface>, lock_transparency: bool, calm: u64, max_tiles: usize) -> usize {
+        let Some(s) = self.settle.as_mut() else { return 0 };
+        let epoch = s.epoch;
+        let mut keys: Vec<(i32, i32)> = s.unsettled.iter().filter(|&(_, &e)| e.saturating_add(calm) <= epoch).map(|(&k, _)| k).collect();
+        keys.sort_unstable();
+        keys.truncate(max_tiles);
+        for k in &keys {
+            s.unsettled.remove(k);
+        }
+        if keys.is_empty() {
+            return 0;
+        }
+        self.composite_keys(&keys, pre, target, selection, lock_transparency);
+        keys.len()
+    }
+
+    /// Composites every tile still unsettled onto `target` and forgets the changed tiles, as
+    /// [`composite`](Self::composite) with `all` does. Returns how many tiles it composited.
+    pub fn settle_all(&mut self, pre: &Surface, target: &mut Surface, selection: Option<&Surface>, lock_transparency: bool) -> usize {
+        let Some(s) = self.settle.as_mut() else { return 0 };
+        let mut keys: Vec<(i32, i32)> = s.unsettled.drain().map(|(k, _)| k).collect();
+        keys.sort_unstable();
+        self.cov.dirty.clear();
+        if let Some(d) = self.dual.as_mut() {
+            d.dirty.clear();
+        }
+        self.composite_keys(&keys, pre, target, selection, lock_transparency);
+        keys.len()
     }
 
     /// The primary dabs finishing the stroke now would add, without finishing it: for live
@@ -1159,6 +1264,7 @@ impl StrokeRenderer {
             area_left: self.area_left,
             dual_area_left: self.dual_area_left,
             refused: self.refused,
+            settle: None,
         };
         t.raster_pending();
         // Tiles whose coverage the tail doesn't change still composite the same: redraw them all.
@@ -1873,6 +1979,9 @@ mod budget_tests;
 
 #[cfg(test)]
 mod mask_tests;
+
+#[cfg(test)]
+mod settle_tests;
 
 #[cfg(test)]
 #[path = "mip_cache_render_tests.rs"]

@@ -455,8 +455,9 @@ fn an_overlay_commit_matches_paint_stroke_across_brush_features() {
         };
         let mut fresh: Option<Session> = None;
         p["points"] = json!(pts);
-        // Pushed a point at a time, or in chunks of five.
-        for size in [1, 5] {
+        // Pushed a point at a time, or in chunks of five; and with tiles that went calm composited
+        // ahead of the commit along the way.
+        for (size, calm) in [(1, None), (5, None), (1, Some(2)), (3, Some(1))] {
             let s = scene(8, &setup);
             let mut q = p.clone();
             q["points"] = json!([pts[0]]);
@@ -464,6 +465,12 @@ fn an_overlay_commit_matches_paint_stroke_across_brush_features() {
             assert!(live.is_overlay(), "{name}");
             for chunk in pts[1..].chunks(size) {
                 live.push(&points(chunk)).unwrap();
+                if let Some(calm) = calm {
+                    live.settle(calm, 2);
+                }
+            }
+            if calm.is_some() {
+                assert!(live.settle_stats().0 > 0, "{name}: nothing settled before the commit (pushing {size} at a time)");
             }
             let seed = live.seed;
             let commit = live.into_commit().unwrap();
@@ -477,7 +484,7 @@ fn an_overlay_commit_matches_paint_stroke_across_brush_features() {
             let fresh_surface = surface(fresh);
             // Past the canvas too: the layer's tiles outside it must match.
             let all = Rect::new(0, 0, W, H).union(&commit.surface.tile_bounds()).union(&fresh_surface.tile_bounds());
-            assert!(same_pixels(&commit.surface, &fresh_surface, all), "{name}: pushing {size} points at a time changed the commit");
+            assert!(same_pixels(&commit.surface, &fresh_surface, all), "{name}: pushing {size} points at a time (settling {calm:?}) changed the commit");
         }
     }
 }

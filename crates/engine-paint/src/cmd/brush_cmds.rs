@@ -599,6 +599,12 @@ impl LiveStrokeExt for Session {
     }
 }
 
+/// The pushes a tile must have gone unchanged for before the canvas settles it
+/// ([`LiveStroke::settle`]). Measured on a 4928x3280 zigzag: with 4 pushes each tile was
+/// composited again about 10 times at 300 px (more work than the commit it saves), while 64
+/// kept it under 2 times and left about 11 ms for the commit.
+pub const SETTLE_CALM_PUSHES: u64 = 64;
+
 /// A `paint.stroke` rendered while it is drawn, onto a copy of the active document, so the canvas
 /// shows the real dabs before the stroke commits. Committing the same params and points with
 /// `"seed": live.seed` gives the same pixels.
@@ -633,6 +639,11 @@ pub struct LiveStroke {
     /// Set when the doc shows the stroke as a masked colour layer instead of blended pixels (see
     /// [`overlay_path`]).
     overlay: Option<Overlay>,
+    /// An overlay stroke's commit pixels as far as [`settle`](Self::settle) has composited them:
+    /// `pre` with the tiles settled so far; `None` for any other stroke.
+    shadow: Option<Surface>,
+    /// Tiles composited ahead of the commit, in all.
+    settled_tiles: usize,
 }
 
 /// Where a live stroke that is shown as a masked layer keeps its mask.
@@ -842,25 +853,61 @@ impl LiveStroke {
             points: Vec::new(),
             base,
             overlay: None,
+            shadow: None,
+            settled_tiles: 0,
         };
         if let Some(path) = overlay_at {
             live.enter_overlay(&path, paint, erase, fmt);
         }
+        if live.overlay.is_some() {
+            // The commit's pixels start as the pre-stroke ones; calm tiles are composited into them
+            // while the stroke goes on (a clone shares the surface's tiles until one is written).
+            live.shadow = Some(live.pre.clone());
+            live.renderer.track_settling();
+        }
         live.push(&pts)?;
         Ok(live)
+    }
+
+    /// Composites up to `max_tiles` tiles of an overlay stroke ahead of the commit, into a shadow
+    /// copy of the pre-stroke pixels that [`into_commit`](Self::into_commit) then only finishes:
+    /// the tiles that have not changed for the last `calm` pushes (a tile under the moving brush
+    /// changes again at once, so compositing it early is wasted). The commit's pixels are the same
+    /// as one composite of the whole stroke. Returns how many tiles it composited (0 when the
+    /// stroke has no shadow, i.e. is not an overlay).
+    pub fn settle(&mut self, calm: u64, max_tiles: usize) -> usize {
+        let Some(shadow) = self.shadow.as_mut() else { return 0 };
+        let cmyk = self.cmyk.clone();
+        let (renderer, pre, sel, lock) = (&mut self.renderer, &self.pre, self.sel.as_ref(), self.lock);
+        let n = photocraft_color::convert::with_cmyk_space(cmyk.as_ref(), || renderer.settle(pre, shadow, sel, lock, calm, max_tiles));
+        self.settled_tiles += n;
+        n
+    }
+
+    /// `(tiles settled so far, tiles not settled now)`.
+    pub fn settle_stats(&self) -> (usize, usize) {
+        (self.settled_tiles, self.renderer.unsettled_count())
     }
 
     /// The stroke as its commit would take it over (see [`LiveCommit`]).
     pub fn into_commit(mut self) -> Result<LiveCommit> {
         let (surface, bounds) = if self.overlay.is_some() {
             // The doc holds no stroke pixels: blend the stroke into the pre-stroke ones as
-            // `paint.stroke` does: one composite of every tile of the finished stroke.
-            let mut surf = self.pre.clone();
+            // `paint.stroke` does. With a shadow ([`settle`](Self::settle)) only the tiles not
+            // settled yet composite now; otherwise one composite of every tile of the finished
+            // stroke.
+            let shadow = self.shadow.take();
+            let shadowed = shadow.is_some();
+            let mut surf = shadow.unwrap_or_else(|| self.pre.clone());
             let cmyk = self.cmyk.clone();
             let (renderer, pre, sel, lock) = (&mut self.renderer, &self.pre, self.sel.as_ref(), self.lock);
             photocraft_color::convert::with_cmyk_space(cmyk.as_ref(), || {
                 renderer.finish();
-                renderer.composite(pre, &mut surf, sel, lock, true);
+                if shadowed {
+                    renderer.settle_all(pre, &mut surf, sel, lock);
+                } else {
+                    renderer.composite(pre, &mut surf, sel, lock, true);
+                }
             });
             (surf, self.bounds())
         } else {
