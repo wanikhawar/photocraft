@@ -37,9 +37,13 @@ document, or without effects on an adapter with half-float accumulation (their F
 by a quantity that reaches 0 at full Fill, so the alpha precision half floats lose shows). So does
 Blend Clipped Layers as Group off in a 32-bit float document when the base takes more than one pass
 (a group, or a pattern fill without cached pixels), since its coverage would go through an
-accumulator slot, which may be half float, or wears a 16-bit, vector or feathered mask, which
-uploads as half floats. A one-pass 32-bit base has its coverage read from a full-precision copy of
-its pixels (16 bytes a pixel on the GPU). A later GPU implementation of any of them preserves the
+accumulator slot, which may be half float, is a gradient fill without cached pixels, which the GPU
+looks up in a table, or wears a 16-bit, vector or feathered mask, which uploads as half floats. A
+one-pass 32-bit base has its coverage read from a full-precision copy of its pixels (16 bytes a
+pixel on the GPU). So does a layer in a 32-bit document whose unfeathered vector mask hides its
+effects: the CPU multiplies such masks as 32-bit values, while the GPU reads them combined into a
+16-bit surface. In both places the compositors must agree on whether coverage is full or none, which
+decides whether values above 1 survive. A later GPU implementation of any of them preserves the
 boundary invariant.
 
 ## Invalidation

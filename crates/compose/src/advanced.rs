@@ -80,8 +80,9 @@ fn mix(a: [f32; 4], b: [f32; 4], k: f32) -> [f32; 4] {
 /// off with effects or a special-eight blend on a layer drawn atop its clipping base (Blend Clipped
 /// Layers as Group on; `plan::lower::clipped_on_cpu`), Color Burn, Color Dodge, Vivid Light or Hard
 /// Mix with it off in a 16/32-bit document (`plan::lower::dividing_shapeless_on_cpu`) or, without
-/// effects, on half-float accumulation, and individually blended clipped layers on a 32-bit base
-/// that takes several passes or wears a 16-bit, vector or feathered mask.
+/// effects, on half-float accumulation, and, in a 32-bit document, individually blended clipped
+/// layers on a base that takes several passes, is a gradient fill without cached pixels or wears a
+/// 16-bit, vector or feathered mask, and layers whose unfeathered vector mask hides their effects.
 pub fn advanced_active(layer: &Layer, clipped: &[Layer]) -> bool {
     let a = &layer.advanced;
     if a.is_default() {

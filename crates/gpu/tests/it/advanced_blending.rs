@@ -1175,6 +1175,48 @@ fn individually_clipped_near_full_coverage_keeps_its_weight_on_half_floats() {
     check_with(&g, &mut half, &d, 3.0 / 255.0, what);
 }
 
+/// The GPU looks a gradient fill up in a table, which can call a pixel partly covered where the
+/// CPU reads exactly full coverage: a 32-bit gradient fill base keeps Blend Clipped Layers as
+/// Group off on the CPU; at 8 bits it renders on the GPU.
+#[test]
+fn individually_clipped_32_bit_gradient_bases_stay_on_the_cpu() {
+    let Some(mut g) = gpu() else { return };
+    for depth in [SampleType::U8, SampleType::F32] {
+        let mut d = doc(depth, true);
+        d.layers.push(underlay(&d, 2));
+        let white = Color::rgb(1.0, 1.0, 1.0);
+        // Opaque from the middle of the canvas on.
+        let gradient = Fill::Gradient {
+            stops: vec![(0.0, white), (1.0, white)],
+            opacity_stops: vec![(0.0, 0.0), (0.5, 1.0), (1.0, 1.0)],
+            angle: 0.0,
+            scale: 1.0,
+            style: GradientStyle::Linear,
+            reverse: false,
+            midpoints: Vec::new(),
+            offset: (0.0, 0.0),
+            dither: false,
+            align: true,
+        };
+        let mut base = Layer::new("gradient base", LayerContent::Fill(gradient));
+        base.advanced.blend_clipped = false;
+        let mut c = Layer::raster("hdr clip", d.pixel_format());
+        c.surface_mut().unwrap().fill_rect(d.bounds(), &[2.0, 0.4, 0.6, 1.0]);
+        c.clipped = true;
+        d.layers.extend([base, c]);
+        if depth == SampleType::F32 {
+            let red = photocraft_compose::render(&d, d.bounds()).px[20 * 48 + 24][0];
+            assert!(red > 1.0, "the CPU keeps the clipped value where the gradient is first opaque: red {red}");
+            let e = photocraft_gpu::render_to_vec_stats(&mut g.comp, &g.device, &g.queue, &d, d.bounds())
+                .expect_err("the GPU must refuse a 32-bit gradient fill base");
+            assert!(e.to_string().contains("Blend Clipped Layers as Group off"), "{e}");
+            assert!(g.comp.supports(&d).is_err());
+        } else {
+            check(&mut g, &d, "gradient base at 8 bits");
+        }
+    }
+}
+
 /// A 16-bit, vector or feathered mask uploads as half floats, which can't tell near-full coverage
 /// from full: a 32-bit base wearing one keeps Blend Clipped Layers as Group off on the CPU; at 8
 /// bits it renders on the GPU.
@@ -1364,16 +1406,48 @@ fn masks_hiding_effects_in_every_depth() {
     let effects = hidden_effects();
     for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
         for hides in HIDES {
-            let mut d = doc(depth, true);
-            d.layers.push(underlay(&d, 2));
-            let mut l = noise_layer("fx", d.pixel_format(), Rect::new(8, 7, 40, 33), 3, 0.3);
-            l.effects.items.extend([effects[0].1.clone(), effects[3].1.clone()]);
-            l.opacity = 0.9;
-            l.fill_opacity = 0.7;
-            hide_with(&mut l, hides);
-            d.layers.push(l);
+            // An unfeathered vector mask hiding effects stays on the CPU in a 32-bit document
+            // (`unfeathered_vector_masks_hiding_effects_stay_on_the_cpu_at_32_bits`).
+            if depth == SampleType::F32 && !matches!(hides, Hides::LayerMask) {
+                continue;
+            }
+            let d = hiding_doc(depth, &effects, hides, 0.0);
             check(&mut g, &d, &format!("{depth:?}, {hides:?} hiding"));
         }
+    }
+}
+
+/// A layer with a drop shadow and an inside stroke over an underlay, with `hides` of its masks
+/// hiding them and its vector mask feathered by `feather`.
+fn hiding_doc(depth: SampleType, effects: &[(&str, Effect)], hides: Hides, feather: f32) -> Document {
+    let mut d = doc(depth, true);
+    d.layers.push(underlay(&d, 2));
+    let mut l = noise_layer("fx", d.pixel_format(), Rect::new(8, 7, 40, 33), 3, 0.3);
+    l.effects.items.extend([effects[0].1.clone(), effects[3].1.clone()]);
+    l.opacity = 0.9;
+    l.fill_opacity = 0.7;
+    hide_with(&mut l, hides);
+    l.vector_mask.as_mut().unwrap().feather = feather;
+    d.layers.push(l);
+    d
+}
+
+/// The CPU multiplies unfeathered vector masks as 32-bit values and the GPU reads them combined
+/// into a 16-bit surface, which can call coverage full or none where the CPU mixes: a 32-bit
+/// document whose unfeathered vector mask hides effects stays on the CPU. Feathered, both read
+/// that surface, and it renders on the GPU.
+#[test]
+fn unfeathered_vector_masks_hiding_effects_stay_on_the_cpu_at_32_bits() {
+    let Some(mut g) = gpu() else { return };
+    let effects = hidden_effects();
+    for hides in [Hides::VectorMask, Hides::Both] {
+        let d = hiding_doc(SampleType::F32, &effects, hides, 0.0);
+        let e = photocraft_gpu::render_to_vec_stats(&mut g.comp, &g.device, &g.queue, &d, d.bounds())
+            .expect_err("the GPU must refuse an unfeathered vector mask hiding effects at 32 bits");
+        assert!(e.to_string().contains("Vector Mask Hides Effects"), "{hides:?}: {e}");
+        assert!(g.comp.supports(&d).is_err(), "{hides:?}");
+        let feathered = hiding_doc(SampleType::F32, &effects, hides, 2.0);
+        check(&mut g, &feathered, &format!("32-bit, feathered, {hides:?} hiding"));
     }
 }
 
@@ -1576,7 +1650,7 @@ fn faint_full_density_hiding_mask_mixes_hdr_values() {
     l.mask = Some(LayerMask { surface, ..LayerMask::reveal_all() });
     l.advanced.layer_mask_hides_effects = true;
     d.layers.extend([bottom, l]);
-    let red = photocraft_compose::render(&d, d.bounds()).px[(20 * 48 + 20) as usize][0];
+    let red = photocraft_compose::render(&d, d.bounds()).px[20 * 48 + 20][0];
     assert!(red <= 1.0, "the CPU mixes the HDR backdrop under the layer: red {red}");
     check(&mut g, &d, "HDR under a faint full-density hiding mask");
 }

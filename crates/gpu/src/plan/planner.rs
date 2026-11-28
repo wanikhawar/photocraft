@@ -5,6 +5,7 @@ use super::lower::{
 use super::types::{Checkpoint, DocCtx, FxLayer, Kernel, MapRef, MaskUse, Pass, Role, SurfaceRef, TexUse, Unsupported};
 use crate::textures::TexKind;
 use photocraft_compose::advanced::Scope;
+use photocraft_compose::masks::feather_sigma;
 use photocraft_doc::Knockout;
 
 use super::{Adjustment, BlendMode, Effect, Fill, FxPaint, Glow, Layer, LayerContent, LayerId, Plan, Rect, Slot, Surface, bounds, has_effects};
@@ -614,8 +615,8 @@ impl<'a> Planner<'a> {
     /// knockout stops at the backdrop beneath the base, which lives only for this clipping group.
     /// A base of one Content pass gives its shape as an `F_COVER` record, in a 32-bit document
     /// read from a full-precision copy of its pixels (`Role::Coverage`). A base that takes more
-    /// passes goes through a slot, which may be half float, and a 16-bit, vector or feathered
-    /// mask uploads as half floats: in a 32-bit document both stay on the CPU. Consumes
+    /// passes goes through a slot, which may be half float, so in a 32-bit document it stays on
+    /// the CPU, as does one whose record the GPU can't match (`check_exact_cover`). Consumes
     /// `backdrop` and `ko`.
     fn clipped_individually(&mut self, layer: &'a Layer, clipped: &'a [Layer], backdrop: Slot, ko: Option<Slot>) -> Result<Slot, Unsupported> {
         let single = single_content_pass(layer);
@@ -626,17 +627,12 @@ impl<'a> Planner<'a> {
                 layer.name
             )));
         }
-        if float && self.mask_use(layer).is_some_and(|m| TexKind::for_surface(Role::Mask, m.surface.get().format()) == TexKind::R16F) {
-            return Err(Unsupported(format!(
-                "Blend Clipped Layers as Group off on `{}`, a 32-bit base with a 16-bit, vector or feathered mask (composited on the CPU)",
-                layer.name
-            )));
-        }
         let floor = if clipped.iter().any(|c| c.visible && c.advanced.knockout == Knockout::Shallow) { Some(self.retain(backdrop)) } else { None };
         let mut b = self.layer(layer, &[], backdrop, ko)?;
         let opacity = layer.opacity.clamp(0.0, 1.0);
         let clip = if single {
             let mut p = self.content_pass(layer)?;
+            self.check_exact_cover(layer, Masks::All, &p)?;
             // Half floats round an alpha near 1 to 1: the record reads a full-precision copy.
             if float && let Some(t) = p.tex.as_mut().filter(|t| TexKind::for_surface(Role::Content, t.surface.get().format()) == TexKind::Rgba16F) {
                 t.role = Role::Coverage;
@@ -666,6 +662,36 @@ impl<'a> Planner<'a> {
             self.release(floor);
         }
         Ok(b)
+    }
+
+    /// In a 32-bit document an `F_COVER` record (`p`, applying the masks `which` of `layer`) is
+    /// planned only where the GPU reads the values the CPU does, combined as the CPU combines
+    /// them: elsewhere the two could disagree on whether coverage is full or none. The GPU looks a
+    /// gradient fill up in a table, uploads a clipping base's 16-bit, vector or feathered mask as
+    /// half floats, and combines unfeathered vector masks that hide effects into a 16-bit surface
+    /// where the CPU multiplies 32-bit values. Each of those stays on the CPU.
+    fn check_exact_cover(&self, layer: &Layer, which: Masks, p: &Pass<'_>) -> Result<(), Unsupported> {
+        if self.cx.depth != photocraft_color::SampleType::F32 {
+            return Ok(());
+        }
+        let name = &layer.name;
+        let why = if which == Masks::Hiding {
+            let a = &layer.advanced;
+            let vector = layer.vector_mask.as_ref().filter(|v| a.vector_mask_hides_effects && v.enabled);
+            let pixel = layer.mask.as_ref().filter(|m| a.layer_mask_hides_effects && m.enabled);
+            // With either one feathered the CPU reads the same combined 16-bit surface.
+            let feathered = vector.is_some_and(|v| feather_sigma(v.feather) > 0.0) || pixel.is_some_and(|m| feather_sigma(m.feather) > 0.0);
+            (vector.is_some() && !feathered)
+                .then(|| format!("Vector Mask Hides Effects on `{name}`, an unfeathered vector mask in a 32-bit document (composited on the CPU)"))
+        } else if p.gradient {
+            Some(format!("Blend Clipped Layers as Group off on `{name}`, a 32-bit gradient fill base (composited on the CPU)"))
+        } else {
+            let half = p.mask.as_ref().is_some_and(|m| TexKind::for_surface(Role::Mask, m.surface.get().format()) == TexKind::R16F);
+            half.then(|| {
+                format!("Blend Clipped Layers as Group off on `{name}`, a 32-bit base with a 16-bit, vector or feathered mask (composited on the CPU)")
+            })
+        };
+        why.map_or(Ok(()), |why| Err(Unsupported(why)))
     }
 
     /// `compose::restore_channels`: `after` with the channels a layer leaves out taken from
@@ -1119,8 +1145,10 @@ impl<'a> Planner<'a> {
     /// `k >= 1` and A where `k <= 0`, so HDR values survive: `p0.z` and `p0.w`). `k` comes as an
     /// `F_COVER` record (`p0.x`), so a half-float slot can't make partial coverage full or none.
     /// The mix runs only within the layer's reach (`photocraft_compose::effects_reach`), as on the
-    /// CPU. Drawn atop a clipping base the same mix works on the base's own alpha, which both sides
-    /// share: the CPU's opaque copies of the base give the same colours. Consumes `backdrop`.
+    /// CPU. A 32-bit document whose hiding masks the GPU can't match stays on the CPU
+    /// (`check_exact_cover`). Drawn atop a clipping base the same mix works on the base's own
+    /// alpha, which both sides share: the CPU's opaque copies of the base give the same colours.
+    /// Consumes `backdrop`.
     fn effects_hiding(&mut self, layer: &'a Layer, clipped: &[&'a Layer], backdrop: Slot, atop: bool) -> Result<Slot, Unsupported> {
         if !photocraft_compose::advanced::hides_effects(layer) {
             return self.effects(layer, clipped, backdrop, atop);
@@ -1142,6 +1170,7 @@ impl<'a> Planner<'a> {
         p.color = [1.0; 4];
         p.mask = Some(hide);
         p.flags = F_COVER;
+        self.check_exact_cover(layer, Masks::Hiding, &p)?;
         let shape = self.emit(p);
         let mut p = Pass::new(Kernel::Lerp, 0);
         p.a = Some(before);
