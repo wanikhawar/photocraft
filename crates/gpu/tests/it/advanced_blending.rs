@@ -1038,9 +1038,20 @@ fn individually_clipped_shallow_knockout_reaches_beneath_an_opaque_fill() {
 fn individually_clipped_hdr_values_match_the_cpu() {
     let Some(mut g) = gpu() else { return };
     let mut half = half_float_compositor(&g);
-    // The base's alpha at every third pixel, and its mask there (sample depth, value, density).
-    let cases = [(1.0, None), (0.4, None), (0.9999, None), (1.0, Some((SampleType::U8, 254.0 / 255.0, 0.01))), (1.0, Some((SampleType::F32, 0.9999, 1.0)))];
-    for (base_alpha, masked) in cases {
+    // The base's alpha at every third pixel, its mask there (sample depth, value, density), and
+    // whether the two cover such a pixel fully. 1 − density × (1 − 0.25) rounds to exactly 1 at
+    // the near-zero density when the product is rounded first, as on the CPU.
+    let faint = f32::from_bits(0x332a_aaab);
+    let cases = [
+        (1.0, None, true),
+        (0.4, None, false),
+        (0.9999, None, false),
+        (1.0, Some((SampleType::U8, 254.0 / 255.0, 0.01)), false),
+        (1.0, Some((SampleType::F32, 0.9999, 1.0)), false),
+        (1.0, Some((SampleType::F32, 0.25, faint)), true),
+        (1.0, Some((SampleType::F32, 0.25, 0.0)), true),
+    ];
+    for (base_alpha, masked, covers) in cases {
         for opacity in [1.0, 0.7] {
             let what = format!("HDR clipped layer, base alpha {base_alpha}, mask {masked:?}, opacity {opacity}");
             let mut d = doc(SampleType::F32, true);
@@ -1067,8 +1078,7 @@ fn individually_clipped_hdr_values_match_the_cpu() {
             d.layers.extend([base, c]);
             // Where the base covers fully (opaque pixels at opacity 1) the CPU keeps the clipped
             // value; below full coverage it mixes, which clamps.
-            let partial = base_alpha < 1.0 || masked.is_some();
-            let full = |x: i32, y: i32| opacity >= 1.0 && !(partial && ((y - rect.y0) * rect.width() as i32 + x - rect.x0) % 3 == 0);
+            let full = |x: i32, y: i32| opacity >= 1.0 && (covers || ((y - rect.y0) * rect.width() as i32 + x - rect.x0) % 3 != 0);
             let classify = |px: &[[f32; 4]], backend: &str| {
                 for y in crect.y0..crect.y1 {
                     for x in crect.x0..crect.x1 {
@@ -1549,6 +1559,26 @@ fn masks_hiding_effects_tell_near_full_coverage_from_full() {
         check(&mut g, &d, &what);
         classify(&check_with(&g, &mut half, &d, 3.0 / 255.0, &what), "half-float GPU");
     }
+}
+
+/// A full-density mask value too small to survive `1 − (1 − value)` still hides the effects only
+/// partly, so the backdrop's 32-bit values above 1 take the clamped mix, as on the CPU.
+#[test]
+fn faint_full_density_hiding_mask_mixes_hdr_values() {
+    let Some(mut g) = gpu() else { return };
+    let mut d = doc(SampleType::F32, false);
+    let mut bottom = Layer::raster("hdr", d.pixel_format());
+    bottom.surface_mut().unwrap().fill_rect(d.bounds(), &[2.0, 1.5, 0.25, 1.0]);
+    let mut l = Layer::raster("fx", d.pixel_format());
+    l.surface_mut().unwrap().fill_rect(Rect::new(6, 5, 42, 35), &[0.5, 0.4, 0.6, 1.0]);
+    l.effects.items.push(Effect::default_drop_shadow());
+    let surface = Surface::with_default(PixelFormat { sample: SampleType::F32, ..PixelFormat::GRAY8 }, &[2f32.powi(-30)]);
+    l.mask = Some(LayerMask { surface, ..LayerMask::reveal_all() });
+    l.advanced.layer_mask_hides_effects = true;
+    d.layers.extend([bottom, l]);
+    let red = photocraft_compose::render(&d, d.bounds()).px[(20 * 48 + 20) as usize][0];
+    assert!(red <= 1.0, "the CPU mixes the HDR backdrop under the layer: red {red}");
+    check(&mut g, &d, "HDR under a faint full-density hiding mask");
 }
 
 /// A mask that hides a layer's effects completely leaves the backdrop as it was, even for 32-bit

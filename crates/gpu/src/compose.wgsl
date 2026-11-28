@@ -103,7 +103,12 @@ fn mask_value(d: vec2<i32>) -> f32 {
             v = textureLoad(mask_tex, m, 0).r;
         }
     }
-    return 1.0 - op.mask_density * (1.0 - v);
+    // LayerMask::values_into: full density leaves the value as it is. Below it, 1 − p rounds to
+    // exactly 1 when the rounded product p is in [0, 2^-25]; deciding that from p keeps a backend
+    // that fuses 1 − density·(1 − v) from calling such coverage partial.
+    if (op.mask_density >= 1.0) { return v; }
+    let k = op.mask_density * (1.0 - v);
+    return select(1.0 - k, 1.0, k >= 0.0 && k <= 2.9802322387695312e-8);
 }
 
 fn lut(row: i32, v: f32) -> f32 {
