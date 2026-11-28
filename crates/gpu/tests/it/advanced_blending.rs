@@ -535,7 +535,6 @@ fn interior_effects_as_group_on_a_clipped_layer_match_the_cpu() {
                 "{what}: grouping the interior effects must show"
             );
             assert!(cpu.px.iter().zip(&base_alone.px).all(|(a, b)| (a[3] - b[3]).abs() <= 1e-6), "{what}: the clipped layer keeps the base's alpha");
-            photocraft_gpu::render_to_vec_stats(&mut g.comp, &g.device, &g.queue, &d, d.bounds()).expect("renders on the GPU");
             check(&mut g, &d, &what);
         }
     }
