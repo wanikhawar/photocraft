@@ -104,10 +104,12 @@ fn mask_value(d: vec2<i32>) -> f32 {
         }
     }
     // LayerMask::values_into: full density leaves the value as it is. Below it, 1 − p rounds to
-    // exactly 1 when the rounded product p is in [0, 2^-25]; deciding that from p keeps a backend
-    // that fuses 1 − density·(1 − v) from calling such coverage partial.
+    // exactly 1 when the rounded product p is in [0, 2^-25] and is 0 or less when p is 1 or more;
+    // deciding both from p keeps a backend that fuses 1 − density·(1 − v) from calling such
+    // coverage partial.
     if (op.mask_density >= 1.0) { return v; }
     let k = op.mask_density * (1.0 - v);
+    if (k >= 1.0) { return min(1.0 - k, 0.0); }
     return select(1.0 - k, 1.0, k >= 0.0 && k <= 2.9802322387695312e-8);
 }
 
