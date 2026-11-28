@@ -82,7 +82,8 @@ fn mix(a: [f32; 4], b: [f32; 4], k: f32) -> [f32; 4] {
 /// Mix with it off in a 16/32-bit document (`plan::lower::dividing_shapeless_on_cpu`) or, without
 /// effects, on half-float accumulation, and, in a 32-bit document, individually blended clipped
 /// layers on a base that takes several passes, is a gradient fill without cached pixels or wears a
-/// 16-bit, vector or feathered mask, and layers whose unfeathered vector mask hides their effects.
+/// 16-bit, vector or feathered mask, and layers whose vector mask hides their effects with no hiding
+/// mask feathered.
 pub fn advanced_active(layer: &Layer, clipped: &[Layer]) -> bool {
     let a = &layer.advanced;
     if a.is_default() {
