@@ -33,7 +33,11 @@ fn batch_rejects_a_non_path_input_before_writing() {
     for (cmd, format) in [("file.automate.batch", "png"), ("file.scripts.imageProcessor", "jpg")] {
         let output = dir.path().join(format);
         let mut s = crate::session();
-        let err = s.execute(cmd, json!({"steps": [], "input": [&input, 17], "output": &output, "format": format})).unwrap_err();
+        let mut params = json!({"input": [&input, 17], "output": &output, "format": format});
+        if cmd == "file.automate.batch" {
+            params["steps"] = json!([]);
+        }
+        let err = s.execute(cmd, params).unwrap_err();
         assert!(matches!(&err, EngineError::BadParams { cmd: name, msg } if name == cmd && msg == "input file 2 must be a path string"), "{err}");
         assert!(!output.exists());
     }
@@ -1026,6 +1030,8 @@ pub(super) fn batch(s: &mut Session, p: &Value) -> Result<Value> {
     let authorize = s.authorize;
     let raw_ppi = super::open::raw_open_resolution(s);
     let action_prefs = s.prefs().actions.clone();
+    // An empty recorded Content-Aware Fill step plays with the remembered workspace settings.
+    let caf_workspace = s.prefs().dialogs.get(crate::atn_cmds::CAF_WORKSPACE_PREFS).cloned();
     let prefs = s.prefs.clone();
     let color_settings = s.color().settings.clone();
     let raw_settings = s.batch_raw_open.as_ref().unwrap_or(&s.prefs().raw_defaults).clone();
@@ -1161,7 +1167,13 @@ pub(super) fn batch(s: &mut Session, p: &Value) -> Result<Value> {
                 scratch.recording = run.clone();
                 scratch.recording.playback_steps = carried.get();
                 scratch.recording.script_steps = script_steps.get();
-                scratch.prefs.edit(|prefs| prefs.actions = action_prefs.clone());
+                scratch.prefs.edit(|prefs| {
+                    prefs.actions = action_prefs.clone();
+                    // Only this entry: the scratch session keeps every other remembered dialog value at its default.
+                    if let Some(workspace) = &caf_workspace {
+                        prefs.dialogs.insert(crate::atn_cmds::CAF_WORKSPACE_PREFS.into(), workspace.clone());
+                    }
+                });
                 let owns_history = scratch.action_history.is_none() && scratch.prefs().actions.create_single_history_state;
                 if owns_history {
                     crate::actions_cmds::begin_document_history(scratch, &action_name);
